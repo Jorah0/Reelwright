@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from . import ai, config, covers, learn, log, media, platforms, store
+from . import ai, assets, config, covers, learn, log, media, platforms, schedule, store, track
 from .config import PROJECTS
 
 _heavy = queue.Queue()    # GPU/CPU-bound work (analysis, renders), one at a time
@@ -189,8 +189,10 @@ def replaceable(clip: dict) -> bool:
 def creator_context(prof: dict) -> str:
     t = prof.get("trained") or {}
     answers = "\n".join(f"- {k}: {v}" for k, v in (prof.get("answers") or {}).items() if str(v).strip())
+    tz = datetime.now().astimezone()
     return (f"Profile: {prof['name']}\nNotes: {prof.get('notes') or '(none)'}\nInterview:\n{answers or '(none)'}\n"
-            f"Learned style: {t.get('summary', '(not trained yet)')}\nWinning topics: {', '.join(t.get('winning_topics', []))}")
+            f"Learned style: {t.get('summary', '(not trained yet)')}\nWinning topics: {', '.join(t.get('winning_topics', []))}\n"
+            f"Creator's local time zone: {tz.tzname()} (UTC{tz.strftime('%z')})")
 
 
 # ---------- job plumbing ----------
@@ -444,8 +446,9 @@ def _render_clip(clip: dict, prog) -> str:
     pid = clip["project_id"]
     proj = store.get("project", pid)
     s = config.load()
-    e = {**media.DEFAULT_EDIT, **clip["edit"]}
+    e = assets.resolve_fonts({**media.DEFAULT_EDIT, **clip["edit"]})  # a missing font falls back instead of failing
     words = [w for seg in load_json(pid, "transcript.json", {"segments": []})["segments"] for w in seg.get("words", [])]
+    cap_words = e["words"] or words  # the creator's caption edits; filler cuts still go by what was actually said
     keeps = None
     if e["remove_silence"]:
         keeps = media.keep_segments(load_json(pid, "signals.json", {}).get("silences", []), clip["start"], clip["end"])
@@ -455,16 +458,25 @@ def _render_clip(clip: dict, prog) -> str:
         keeps = None
     size = media.output_size(e["aspect"], proj["meta"]["width"], proj["meta"]["height"])
     ass = None
-    if (e["captions"] and words) or e["title_text"] or e["sticker_text"]:
-        ass = media.build_ass(words, clip["start"], clip["end"], float(e["speed"]), size, e["title_text"], s["caption_uppercase"],
+    overlays = e["overlays"] or []
+    texts = [o for o in overlays if o["kind"] in ("text", "emoji")]
+    placed = []  # media overlays resolved to library files (a deleted asset just drops out of the render)
+    for o in overlays:
+        a = store.get("asset", o.get("asset_id") or "") if o["kind"] not in ("text", "emoji") else None
+        if a and assets.path(a).exists():
+            placed.append({**o, "path": str(assets.path(a))})
+    if (e["captions"] and cap_words) or e["title_text"] or e["sticker_text"] or texts:
+        ass = media.build_ass(cap_words, clip["start"], clip["end"], float(e["speed"]), size, e["title_text"], s["caption_uppercase"],
                               s["caption_color"], bool(e["captions"]), e["caption_style"], e["caption_pos"], e["sticker_text"],
-                              e["sticker_pos"], keeps, float(e["split"]) if e["layout"] == "split" and e["aspect"] != "source" else None)
+                              e["sticker_pos"], keeps, float(e["split"]) if e["layout"] == "split" and e["aspect"] != "source" else None,
+                              overlays=texts, text_style=e)
     music = (pdir(pid) / e["music"]).resolve() if e["music"] else None
     if music and (not music.is_file() or (pdir(pid) / "music").resolve() not in music.parents):
         music = None
     (pdir(pid) / "exports").mkdir(exist_ok=True)
     rel = f"exports/{clip['id']}.mp4"
-    media.render(pdir(pid) / proj["source"], pdir(pid) / rel, clip["start"], clip["end"], e, proj["meta"], ass, prog, keeps, music)
+    media.render(pdir(pid) / proj["source"], pdir(pid) / rel, clip["start"], clip["end"], e, proj["meta"], ass, prog, keeps, music,
+                 placed, assets.uploaded_font_files())
     return rel
 
 
@@ -518,6 +530,32 @@ def _export_failed(job, err):
         store.update("upload", u["id"], {"status": "failed", "error": f"Render failed: {err}"})
 
 
+def _track(job):
+    clip = store.get("clip", job["clip_id"])
+    if not clip:
+        raise RuntimeError("Clip was deleted.")
+    pid, e = clip["project_id"], {**media.DEFAULT_EDIT, **clip["edit"]}
+    proj = store.get("project", pid)
+    meta = proj["meta"]
+    W, H = media.output_size(e["aspect"], meta["width"], meta["height"])
+    cuts = [t - clip["start"] for t in load_json(pid, "signals.json", {}).get("scenes", []) if clip["start"] < t < clip["end"]]
+    mode, target = job.get("mode") or "auto", job.get("target")
+    res = track.track(pdir(pid) / proj["source"], clip["start"], clip["end"], meta, cuts, W / H, float(e["zoom"]),
+                      lambda f: _progress(job["id"], f, "Tracking subject"), mode, target)
+
+    def apply(c):  # keep the creator's manual keyframes; points made for older trims are simply replaced
+        manual = (c["edit"].get("track") or {}).get("manual") or []
+        c["edit"] = {**c["edit"], "follow": True, "track": {**res, "mode": mode, "target": target, "manual": manual}}
+        c["rev"] += 1
+        c["track_error"] = ""
+
+    store.update("clip", clip["id"], fn=apply)
+
+
+def _track_failed(job, err):
+    store.update("clip", job["clip_id"], {"track_error": err})
+
+
 def request_export(clip_id: str) -> dict:
     rev = (store.get("clip", clip_id) or {}).get("rev")
     running = [j for j in store.find("job", clip_id=clip_id, kind="export")
@@ -556,6 +594,7 @@ def request_upload(clip_id: str, spec: dict) -> dict:
         "category_id": spec.get("category_id", "22"), "privacy": spec.get("privacy") or config.load()["default_privacy"],
         "publish_at": publish_at, "upload_at": upload_at, "made_for_kids": bool(spec.get("made_for_kids")),
         "status": "waiting_render", "progress": 0.0, "error": "", "video_id": None, "url": None,
+        "auto": bool(spec.get("auto")), "tiktok": _tiktok_opts(spec.get("tiktok")) if platform == "tiktok" else None,
     })
     if clip_export_current(clip):
         _release_uploads(clip_id)
@@ -573,7 +612,23 @@ def _due(u: dict) -> bool:
     return not u.get("upload_at") or datetime.fromisoformat(u["upload_at"].replace("Z", "+00:00")) <= datetime.now(timezone.utc)
 
 
+def paused() -> bool:
+    return bool(config.load()["autopilot_paused"])
+
+
+def _tiktok_opts(o) -> dict | None:
+    """The TikTok choices the user made in the publish dialog (TikTok requires an explicit pick, no defaults)."""
+    if not isinstance(o, dict):
+        return None
+    levels = ("PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS", "FOLLOWER_OF_CREATOR", "SELF_ONLY")
+    return {"privacy_level": o.get("privacy_level") if o.get("privacy_level") in levels else "SELF_ONLY",
+            **{k: bool(o.get(k)) for k in ("allow_comment", "allow_duet", "allow_stitch", "brand_organic", "brand_content")}}
+
+
 def _queue_or_schedule(u: dict):
+    if u.get("auto") and paused():  # Autopilot is paused: keep it, post nothing, release on resume
+        store.update("upload", u["id"], {"status": "held"})
+        return
     if _due(u):
         store.update("upload", u["id"], {"status": "queued", "error": ""})
         submit("upload", upload_id=u["id"], clip_id=u["clip_id"], platform=u.get("platform", "youtube"))
@@ -583,7 +638,10 @@ def _queue_or_schedule(u: dict):
 
 def _upload(job):
     u = store.get("upload", job["upload_id"])
-    if not u or u["status"] == "canceled":
+    if not u or u["status"] not in ("queued", "scheduled", "waiting_render", "held"):
+        return  # canceled, already uploading, or already posted: a duplicate job must never post twice
+    if (u.get("auto") and paused()) or not _due(u):  # paused, or moved later after this job was queued
+        _queue_or_schedule(u)
         return
     platform = u.get("platform", "youtube")
     clip = store.get("clip", u["clip_id"])
@@ -631,6 +689,50 @@ def requeue_needs_auth():
         retry_upload(u["id"])
 
 
+def reschedule(upload_id: str, when: str | None = "keep", platform: str | None = None) -> dict:
+    """Move a post: new time (None = as soon as possible) and/or another platform. A YouTube video that is already
+    uploaded and waiting for its publish time is moved on YouTube itself."""
+    u = store.get("upload", upload_id)
+    if not u:
+        raise RuntimeError("That post no longer exists.")
+    if u["status"] == "uploading":
+        raise RuntimeError("This post is uploading right now; wait for it to finish.")
+    if when not in ("keep", None):
+        datetime.fromisoformat(when.replace("Z", "+00:00"))  # validates
+    if u["status"] == "done":
+        future = u.get("publish_at") and not _due({"upload_at": u["publish_at"]})
+        if u.get("platform") == "youtube" and future and u.get("video_id") and when not in ("keep", None) and not platform:
+            from . import youtube
+            return store.update("upload", upload_id, {"publish_at": youtube.set_publish_at(u["video_id"], when)})
+        raise RuntimeError("Already posted: it can't be moved (delete it on the platform and post again instead).")
+    plat = platform or u.get("platform", "youtube")
+    if plat not in platforms.PLATFORMS:
+        raise RuntimeError(f"Unknown platform {plat}")
+    t = (u.get("publish_at") or u.get("upload_at")) if when == "keep" else when
+    patch = {"platform": plat, "publish_at": t if plat == "youtube" else None, "upload_at": None if plat == "youtube" else t,
+             "error": "", "auto": False}  # a post the user moves by hand is theirs now: the Autopilot pause no longer holds it
+    if plat == "tiktok" and not u.get("tiktok"):  # never choose a public audience for the user (TikTok guideline)
+        patch["tiktok"] = _tiktok_opts({"privacy_level": "SELF_ONLY"})
+
+    def apply(doc):
+        if doc["status"] in ("uploading", "done"):  # the worker got there first
+            raise RuntimeError("This post started uploading just now; it can't be moved.")
+        doc.update(patch)
+
+    u = store.update("upload", upload_id, fn=apply)
+    log.event("schedule", f"upload {upload_id} -> {plat} at {t or 'asap'}")
+    clip = store.get("clip", u["clip_id"])
+    if u["status"] == "queued":
+        return u  # its job is already waiting; the job re-checks the new time before posting
+    if u["status"] in ("scheduled", "held", "failed", "needs_auth"):
+        if clip and clip_export_current(clip):
+            _queue_or_schedule(u)
+        elif clip:
+            store.update("upload", upload_id, {"status": "waiting_render"})
+            request_export(clip["id"])
+    return store.get("upload", upload_id)
+
+
 def stagger(first_iso: str, interval_hours: float, n: int) -> list[str]:
     t = datetime.fromisoformat(first_iso.replace("Z", "+00:00"))
     if t.tzinfo is None:
@@ -656,6 +758,10 @@ def _autopilot(pid: str):
     ap = (store.get("project", pid) or {}).get("autopilot") or {}
     if not ap.get("enabled"):
         return
+    if paused():
+        log.event("autopilot", f"paused: nothing scheduled for project {pid}")
+        return
+    smart = ap.get("timing") == "best"  # best times per platform; "fixed" honours the user's own start + interval
     clips = sorted([c for c in store.find("clip", project_id=pid) if not c.get("parts")], key=lambda c: -c["score"])[: int(ap.get("top_n", 3))]
     times = stagger(next_slot(ap.get("first_publish")), float(ap.get("interval_hours", 24)), len(clips))
     segs = load_json(pid, "transcript.json", {"segments": []})["segments"]
@@ -673,10 +779,11 @@ def _autopilot(pid: str):
                 pass
         mode = ap.get("mode", "publish_at")  # publish_at: upload now, YouTube publishes later | upload_at: post at that time
         for platform in targets:
+            at = (schedule.suggest(platform, 1, category=meta.get("category_id")) or [when])[0] if smart else when
             request_upload(clip["id"], {**meta, "platform": platform, "caption": meta.get("social_caption"),
-                                        "privacy": ap.get("privacy", "public"),
-                                        "publish_at": when if mode == "publish_at" else None,
-                                        "upload_at": when if mode == "upload_at" else None})
+                                        "privacy": ap.get("privacy", "public"), "auto": True,
+                                        "publish_at": at if mode == "publish_at" else None,
+                                        "upload_at": at if mode == "upload_at" else None})
 
 
 # ---------- streaming-channel sources (Twitch, Kick, YouTube, any yt-dlp URL) ----------
@@ -886,6 +993,9 @@ def _scheduler_tick():
     for u in store.find("upload", status="scheduled"):
         if _due(u):
             _queue_or_schedule(u)
+    if not paused():  # resumed: everything Autopilot held goes back on its schedule
+        for u in store.find("upload", status="held"):
+            _queue_or_schedule(u)
     if time.time() - _last_source_check > 60:
         _last_source_check = time.time()
         for src in store.find("source", auto_import=True):
@@ -957,9 +1067,10 @@ def _ingest_file(job):
 
 HANDLERS = {"import_url": _import_url, "analyze": _analyze, "find": _find_job, "export": _export, "upload": _upload,
             "scan_source": _scan_source, "virality": _virality, "train": _train, "research": _research,
-            "results": _results, "ingest_file": _ingest_file}
+            "results": _results, "ingest_file": _ingest_file, "track": _track}
 FAIL_HOOKS = {"import_url": _analyze_failed, "analyze": _analyze_failed, "export": _export_failed, "upload": _upload_failed,
-              "scan_source": _scan_failed, "train": _train_failed, "research": _train_failed, "ingest_file": _analyze_failed}
+              "scan_source": _scan_failed, "train": _train_failed, "research": _train_failed, "ingest_file": _analyze_failed,
+              "track": _track_failed}
 
 
 def start():

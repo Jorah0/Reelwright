@@ -22,6 +22,7 @@ def main():
         "--add-data", f"{ROOT / 'reelwright' / 'static'}{SEP}reelwright/static",
         "--collect-all", "faster_whisper", "--collect-all", "ctranslate2", "--collect-all", "webview",
         "--collect-data", "googleapiclient", "--collect-submodules", "uvicorn", "--collect-submodules", "yt_dlp",
+        "--collect-submodules", "websockets",  # OBS link: websockets loads its sync client lazily
         "--hidden-import", "clr", "--hidden-import", "google_auth_oauthlib.flow",
         # ML stacks pulled in transitively that Reelwright never imports (keeps the build lean)
         *[a for m in ("torch", "torchvision", "torchaudio", "tensorflow", "keras", "jax", "transformers", "diffusers",

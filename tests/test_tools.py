@@ -115,6 +115,78 @@ def test_filler_cut_with_no_fillers_is_a_noop():
     assert media.cut_spans(keeps, [(30.0, 31.0)]) is keeps  # nothing overlaps: the exact input comes back
 
 
+def test_privacy_policy_discloses_every_service_the_code_contacts():
+    """Adding a new outside service without updating the privacy policy fails here."""
+    import re
+    from pathlib import Path
+    root = Path(media.__file__).parent
+    code = "\n".join(p.read_text("utf-8") for p in root.glob("*.py"))
+    policy = (root / "static" / "legal" / "privacy.html").read_text("utf-8").lower()
+    disclosed = {"api.anthropic.com": "anthropic", "anthropic": "anthropic", "googleapiclient": "google", "open.tiktokapis.com": "tiktok",
+                 "graph.facebook.com": "instagram", "github.com": "github", "kick.com": "kick", "yt_dlp": "yt-dlp",
+                 "127.0.0.1": "your own computer", "0.0.0.0": "obs", "www.twitch.tv": "twitch", "youtu.be": "youtube",
+                 "www.youtube.com": "youtube", "www.googleapis.com": "google", "rupload.facebook.com": "instagram", "graph.instagram.com": "instagram",
+                 "raw.githubusercontent.com": "raw.githubusercontent.com"}
+    hosts = set(re.findall(r"https?://([a-z0-9.-]+\.[a-z]{2,})", code)) | {k for k in ("googleapiclient", "yt_dlp", "anthropic") if k in code}
+    hosts -= {"localhost", "console.anthropic.com", "www.python.org"}  # links shown to the user, not data flows
+    missing = [h for h in hosts if disclosed.get(h, h) not in policy]
+    assert not missing, f"privacy.html doesn't disclose: {missing}"
+    terms = (root / "static" / "legal" / "terms.html").read_text("utf-8")
+    assert "privacy.html" in terms and "terms.html" in (root / "static" / "legal" / "privacy.html").read_text("utf-8")
+
+
+def test_connection_guide_lists_every_permission_the_code_requests():
+    """If the code starts asking for a new scope, the setup guide must say so (and why), or verify fails."""
+    from pathlib import Path
+    from reelwright import platforms, youtube
+    guide = (Path(media.__file__).parent / "static" / "guide" / "connect.html").read_text("utf-8")
+    wanted = [*youtube.SCOPES, *platforms.TT_SCOPES.split(","), "instagram_business_basic", "instagram_business_content_publish",
+              "instagram_basic", "instagram_content_publish", "pages_read_engagement", platforms.tiktok_redirect_uri(8765)]
+    assert [w for w in wanted if w not in guide] == []
+
+
+def test_old_youtube_sign_ins_are_asked_to_reconnect_for_new_permissions(tmp_path, monkeypatch):
+    import json
+    from reelwright import youtube
+    tok = tmp_path / "t.json"
+    tok.write_text(json.dumps({"scopes": youtube.SCOPES[:2]}), "utf-8")
+    monkeypatch.setattr(youtube, "YT_TOKEN", tok)
+    assert youtube.missing_scopes() == ["https://www.googleapis.com/auth/youtube.force-ssl"]
+    with pytest.raises(RuntimeError, match="reconnect YouTube"):
+        youtube.set_publish_at("vid", "2031-01-01T10:00:00+00:00")
+    tok.write_text(json.dumps({"scopes": youtube.SCOPES}), "utf-8")
+    assert youtube.missing_scopes() == []
+
+
+def test_update_exe_rebuilds_only_when_the_source_is_newer(tmp_path):
+    import importlib.util
+    import time
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("update_exe", Path(media.__file__).parent.parent / "scripts" / "update_exe.py")
+    up = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(up)
+    src, exe = tmp_path / "src", tmp_path / "Reelwright.exe"
+    src.mkdir()
+    (src / "a.py").write_text("x")
+    assert up.outdated(exe, [src])  # never built
+    exe.write_text("exe")
+    now = time.time()
+    os.utime(src / "a.py", (now - 100, now - 100))
+    os.utime(exe, (now, now))
+    assert not up.outdated(exe, [src])  # built after the last change
+    os.utime(src / "a.py", (now + 50, now + 50))
+    assert up.outdated(exe, [src])  # source changed since the build
+
+
+def test_ui_scale_is_saved_and_clamped():
+    from fastapi.testclient import TestClient
+    from reelwright.server import app
+    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    r = c.put("/api/settings", json={"ui_scale": {"app": 1.25, "text": 9, "timeline": 0.1, "evil": 2, "preview": "big", "panels": True}})
+    assert r.json()["ui_scale"] == {"app": 1.25, "text": 2.0, "timeline": 0.6}
+    assert c.get("/api/settings").json()["ui_scale"]["app"] == 1.25  # persisted
+
+
 def test_event_log_rotates_and_tails(tmp_path):
     log.setup(tmp_path / "events.log", max_bytes=2000, backups=1)
     for i in range(200):

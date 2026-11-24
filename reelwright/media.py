@@ -46,6 +46,13 @@ DEFAULT_EDIT = {
     "remove_silence": False,  # AI jump cuts
     "remove_fillers": False,  # cut "um", "uh"… (word timestamps)
     "music": "", "music_volume": 0.15,
+    "follow": False,          # crop follows the tracked subject (edit["track"], see track.py) instead of crop_x/crop_y
+    "words": None,            # caption words override [{s, e, w}] (absolute source seconds); None = the transcript's
+    "framing": None,          # follow framing {"offset_y": headroom, "zoom": base zoom}; see track.crop_filter
+    "overlays": None,         # [{id, kind, asset_id|text, t, d, x, y, w, anim, volume, layer, cutaway}], clip time
+    # text styling per element; None keeps the caption_style look (size is px at 1080 wide, colours #RRGGBB)
+    **{f"{who}_{f}": None for who in ("caption", "title", "sticker")
+       for f in ("font", "size", "weight", "color", "outline", "outline_color", "shadow", "spacing")},
 }
 
 
@@ -142,22 +149,28 @@ def silences(src: Path, noise_db: int = -35, min_dur: float = 0.7) -> list[list[
     return [[round(s, 2), round(e, 2)] for s, e in zip(starts, ends)]
 
 
-def face_detector(w: int, h: int):
-    """YuNet DNN face detector for w×h frames (model ~230 KB, fetched once into the data folder)."""
+def fetch_model(name: str, url: str) -> Path:
+    """A small model file in the data folder, downloaded once."""
     import urllib.request
-
-    import cv2
 
     from .config import DATA
 
-    model = DATA / "models" / "face_detection_yunet_2023mar.onnx"
+    model = DATA / "models" / name
     if not model.exists():  # download to .part then rename: an interrupted fetch never leaves a corrupt model behind
         model.parent.mkdir(exist_ok=True)
         part = model.with_suffix(".part")
-        with urllib.request.urlopen("https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/"
-                                    "face_detection_yunet_2023mar.onnx", timeout=20) as r:
+        with urllib.request.urlopen(url, timeout=20) as r:
             part.write_bytes(r.read())
         os.replace(part, model)
+    return model
+
+
+def face_detector(w: int, h: int):
+    """YuNet DNN face detector for w×h frames (model ~230 KB, fetched once into the data folder)."""
+    import cv2
+
+    model = fetch_model("face_detection_yunet_2023mar.onnx", "https://github.com/opencv/opencv_zoo/raw/main/models/"
+                        "face_detection_yunet/face_detection_yunet_2023mar.onnx")
     try:
         return cv2.FaceDetectorYN.create(str(model), "", (w, h), 0.7)
     except cv2.error:
@@ -308,8 +321,39 @@ def _between(keeps_rel) -> str:
     return "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in keeps_rel)
 
 
+def overlay_window(t: float, d: float, start: float, keeps, speed: float) -> tuple[float, float]:
+    """An overlay's [t, t+d] in clip time -> its window in the output (through jump cuts and speed, like captions)."""
+    m = (lambda x: remap(start + x, keeps)) if keeps else (lambda x: x)
+    a, b = m(t) / speed, m(t + d) / speed
+    return a, max(b, a + 0.04)
+
+
+def _overlay_chain(o: dict, i: int, W: int, H: int) -> str:
+    """[b{i}] + overlay input -> [b{i+1}]: sized, shifted to its window, animated with per-frame expressions."""
+    a, b = o["a"], o["b"]
+    if o.get("cutaway"):
+        size, X, Y = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H}", "0", "0"
+    else:
+        cx, cy = float(o.get("x", 0.5)) * W, float(o.get("y", 0.5)) * H
+        size, X, Y = f"scale={_even(W * float(o.get('w', 0.3)))}:-2", f"{cx:.1f}-w/2", f"{cy:.1f}-h/2"
+    chain = f"[{o['input']}:v]{size},format=rgba,setpts=PTS-STARTPTS+{a:.3f}/TB"
+    anim, since = o.get("anim", "none"), f"(t-{a:.3f})"
+    if anim == "fade":
+        chain += f",fade=t=in:st={a:.3f}:d=0.25:alpha=1,fade=t=out:st={max(a, b - 0.25):.3f}:d=0.25:alpha=1"
+    elif anim == "pop":  # drops in with a damped bounce
+        Y += f"-{H * 0.05:.0f}*exp(-{since}*9)*cos({since}*28)"
+        chain += f",fade=t=in:st={a:.3f}:d=0.12:alpha=1"
+    elif anim == "shake":
+        X, Y = X + f"+{W * 0.012:.0f}*sin(t*63)", Y + f"+{H * 0.008:.0f}*cos(t*47)"
+    elif anim == "slide":  # in from the left over 0.3 s
+        X = f"({X})-({X}+w)*max(0,1-{since}/0.3)"
+    return (f"{chain}[o{i}];[b{i}][o{i}]overlay=x='{X}':y='{Y}':eof_action=pass:"
+            f"enable='between(t,{a:.3f},{b:.3f})'[b{i + 1}]")
+
+
 def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, keeps_rel=None,
-                  has_audio: bool = True, music: bool = False) -> tuple[str, tuple[int, int]]:
+                  has_audio: bool = True, music: bool = False, fps: float = 30, overlays=None,
+                  fontsdir: bool = False) -> tuple[str, tuple[int, int]]:
     """One filter_complex producing [v] (and [a] when there is any audio). keeps_rel = jump-cut ranges relative to the clip."""
     e = {**DEFAULT_EDIT, **edit}
     speed = float(e["speed"])
@@ -320,7 +364,7 @@ def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, 
     if abs(speed - 1) > 1e-3:
         pre.append(f"setpts=PTS/{speed:g}")
     reframed = e["aspect"] != "source"
-    if reframed and e["layout"] == "split":
+    if reframed and e["layout"] == "split":  # ponytail: split keeps its static crops; follow applies to single layout only
         th = _even(H * float(e["split"]))
         bh = H - th
         cw, ch = _even(sw * float(e["cam_w"])), _even(sh * float(e["cam_h"]))
@@ -336,7 +380,13 @@ def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, 
              f"[b]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2")
     else:
         chain = list(pre)
-        if reframed or float(e["zoom"]) > 1:
+        follow = None
+        if reframed and e["follow"]:
+            from . import track
+            follow = track.crop_filter(e, sw, sh, W / H, (W, H), fps or 30)
+        if follow:
+            chain.insert(0, follow)  # before jump cuts / speed, so the expression's t is still clip time
+        elif reframed or float(e["zoom"]) > 1:
             cw, ch, cx, cy = crop_box(sw, sh, W / H, float(e["crop_x"]), float(e["crop_y"]), float(e["zoom"]))
             chain.append(f"crop={cw}:{ch}:{cx}:{cy}")
         chain.append(f"scale={W}:{H}")
@@ -347,15 +397,24 @@ def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, 
         post.append(f"eq=brightness={b:.3f}:contrast={c:.3f}:saturation={s:.3f}:gamma={gm:.3f}")
     if e["sharpen"]:
         post.append("unsharp=5:5:0.8")
+    look, post = post, []  # overlays go on the finished picture, under fades and captions
     fi, fo = float(e["fade_in"]), float(e["fade_out"])
     if fi > 0:
         post.append(f"fade=t=in:st=0:d={fi:.2f}")
     if fo > 0:
         post.append(f"fade=t=out:st={max(out_dur - fo, 0):.2f}:d={fo:.2f}")
     if has_subs:
-        post.append("subtitles=captions.ass")  # relative path: ffmpeg runs with cwd=workdir (avoids Windows path escaping)
+        # relative paths: ffmpeg runs with cwd=workdir (avoids Windows path escaping); fonts/ holds uploaded fonts
+        post.append("subtitles=captions.ass" + (":fontsdir=fonts" if fontsdir else ""))
     post.append("format=yuv420p")
-    g += "," + ",".join(post) + "[v]"
+    vis = sorted((o for o in overlays or [] if o["kind"] in ("image", "gif", "video")), key=lambda o: o.get("layer", 0))
+    if vis:
+        g += "," + ",".join(look) + "[b0]"
+        for i, o in enumerate(vis):
+            g += ";" + _overlay_chain(o, i, W, H)
+        g += f";[b{len(vis)}]" + ",".join(post) + "[v]"
+    else:
+        g += "," + ",".join(look + post) + "[v]"
 
     af = []
     if keeps_rel:
@@ -365,6 +424,7 @@ def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, 
         af.append(f"volume={float(e['volume']):.3f}")
     if e["denoise"]:
         af.append("afftdn=nf=-25")
+    pre_af = list(af)
     if e["loudnorm"]:
         af.append("loudnorm=I=-14:TP=-1.5:LRA=11")  # YouTube/TikTok playback loudness target
     if fi > 0:
@@ -373,7 +433,23 @@ def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, 
         af.append(f"afade=t=out:st={max(out_dur - fo, 0):.2f}:d={fo:.2f}")
     bed = f"[1:a]volume={float(e['music_volume']):.3f},atrim=0:{out_dur:.3f},asetpts=PTS-STARTPTS"
     chain = ",".join(af) or "anull"
-    if has_audio and music:
+    sfx = [o for o in overlays or [] if o["kind"] == "sound" or o["kind"] == "video" and o.get("audio") and o.get("volume", 1) > 0]
+    if sfx:  # each effect delayed to its start, mixed under the dialogue, then the usual loudness/fades over the whole mix
+        stereo = "aresample=48000,aformat=channel_layouts=stereo"
+        base = f"[0:a]{','.join(pre_af + [stereo])}" if has_audio else f"anullsrc=r=48000:cl=stereo,atrim=0:{out_dur:.3f}"
+        g += f";{base}[a0]"
+        for i, o in enumerate(sfx):
+            ms = int(round(o["a"] * 1000))
+            g += (f";[{o['input']}:a]atrim=0:{float(o['d']):.3f},asetpts=PTS-STARTPTS,{stereo},"
+                  f"volume={float(o.get('volume', 1)):.2f},adelay={ms}:all=1[s{i}]")
+        tail = ",".join(af[len(pre_af):]) or "anull"
+        g += f";[a0]{''.join(f'[s{i}]' for i in range(len(sfx)))}amix=inputs={len(sfx) + 1}:duration=first:" \
+             f"dropout_transition=0:normalize=0,{tail}"
+        if music:
+            g += f"[a1];{bed}[m];[a1][m]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
+        else:
+            g += "[a]"
+    elif has_audio and music:
         g += f";[0:a]{chain}[a0];{bed}[m];[a0][m]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
     elif has_audio:
         g += f";[0:a]{chain}[a]"
@@ -413,12 +489,40 @@ def caption_chunks(words: list[dict], start: float, end: float, max_words: int, 
 
 
 CAPTION_POS = {"low": (0.24, 0.08), "middle": (0.42, 0.40), "high": (0.68, 0.72)}  # fraction of height from bottom (vertical, landscape)
+TEXT_FIELDS = ("font", "size", "weight", "color", "outline", "outline_color", "shadow", "spacing")
+
+
+def _restyle(line: str, st: dict, W: int) -> str:
+    """Apply the set text-style fields to one ASS "Style:" line (unset fields keep the caption_style look)."""
+    f = line.split(",")
+    for key, idx, val in (("font", [1], str), ("size", [2], lambda v: str(round(float(v) * W / 1080))),
+                          ("color", [3, 4], _ass_color), ("outline_color", [5], _ass_color),
+                          ("weight", [7], lambda v: "-1" if v == "bold" else "0"), ("spacing", [13], lambda v: f"{float(v):g}"),
+                          ("outline", [16], lambda v: f"{float(v):g}"), ("shadow", [17], lambda v: f"{float(v):g}")):
+        if st.get(key) is not None:
+            for i in idx:
+                f[i] = val(st[key])
+    return ",".join(f)
+
+
+def _text_tags(o: dict, W: int) -> str:
+    """Inline ASS overrides for a styled text/emoji overlay."""
+    tags = {"font": lambda v: f"\\fn{v}", "size": lambda v: f"\\fs{round(float(v) * W / 1080)}",
+            "weight": lambda v: f"\\b{1 if v == 'bold' else 0}", "color": lambda v: f"\\c{_ass_color(v)}",
+            "outline": lambda v: f"\\bord{float(v):g}", "outline_color": lambda v: f"\\3c{_ass_color(v)}",
+            "shadow": lambda v: f"\\shad{float(v):g}", "spacing": lambda v: f"\\fsp{float(v):g}"}
+    return "".join(fn(o[k]) for k, fn in tags.items() if o.get(k) is not None)
+
+
+OVER_ANIM = {"pop": "\\fscx30\\fscy30\\t(0,150,\\fscx115\\fscy115)\\t(150,260,\\fscx100\\fscy100)", "fade": "\\fad(200,200)",
+             "shake": "\\t(0,70,\\frz6)\\t(70,140,\\frz-6)\\t(140,210,\\frz3)\\t(210,280,\\frz0)"}  # ASS tags per text anim
 STICKER_ALIGN = {"top-left": 7, "top-center": 8, "top-right": 9, "bottom-left": 1, "bottom-right": 3}
 
 
 def build_ass(words: list[dict], start: float, end: float, speed: float, size: tuple[int, int], title: str = "",
               uppercase: bool = True, highlight: str = "#FFD400", captions: bool = True, style: str = "bold",
-              pos: str = "low", sticker: str = "", sticker_pos: str = "top-right", keeps=None, split: float | None = None) -> str:
+              pos: str = "low", sticker: str = "", sticker_pos: str = "top-right", keeps=None, split: float | None = None,
+              overlays=None, text_style: dict | None = None) -> str:
     W, H = size
     vertical = H > W
     fs = round(min(W, H) * (0.078 if vertical else 0.06))
@@ -443,14 +547,33 @@ def build_ass(words: list[dict], start: float, end: float, speed: float, size: t
         f"Style: Title,Arial Black,{round(fs * 0.8)},&H00FFFFFF,&H00FFFFFF,&H00111111,&H28111111,-1,0,0,0,100,100,0,0,3,{max(fs // 6, 8)},0,8,60,60,{round(H * 0.09)},1",
         f"Style: Sticker,Arial Black,{round(fs * 0.55)},&H00111111,&H00111111,{hl},&H00000000,-1,0,0,0,100,100,0,0,3,{max(fs // 7, 6)},0,"
         f"{STICKER_ALIGN.get(sticker_pos, 9)},50,50,{round(H * 0.05)},1",
+        f"Style: Over,Arial Black,{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,{max(fs // 12, 3)},2,5,0,0,0,1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    for who, name in (("caption", "Cap"), ("title", "Title"), ("sticker", "Sticker")):
+        i = next(n for n, line in enumerate(lines) if line.startswith(f"Style: {name},"))
+        lines[i] = _restyle(lines[i], {f: (text_style or {}).get(f"{who}_{f}") for f in TEXT_FIELDS}, W)
     rel = (lambda t: remap(t, keeps) / speed) if keeps else (lambda t: (t - start) / speed)
     clip_len = rel(end)
     if title.strip():
         lines.append(f"Dialogue: 1,{_ass_time(0)},{_ass_time(clip_len)},Title,,0,0,0,,{_ass_text(title)}")
     if sticker.strip():
         lines.append(f"Dialogue: 2,{_ass_time(0)},{_ass_time(clip_len)},Sticker,,0,0,0,,{_ass_text(sticker)}")
+    for o in overlays or []:  # text / emoji overlays (clip time, like the captions)
+        text = str(o.get("text") or "")
+        if o.get("kind") not in ("text", "emoji") or not text.strip():
+            continue
+        t0, t1 = rel(start + float(o["t"])), rel(start + float(o["t"]) + float(o["d"]))
+        ox, oy, ow = round(float(o.get("x", 0.5)) * W), round(float(o.get("y", 0.5)) * H), float(o.get("w", 0.3)) * W
+        emoji = o["kind"] == "emoji"
+        fsz = round(min(ow * 0.8 if emoji else ow / max(len(text), 1) * 1.7, H * 0.2))
+        tags = f"\\an5\\fs{fsz}" + ("\\fnSegoe UI Emoji" if emoji else "") + _text_tags(o, W)
+        if o.get("anim") == "slide":  # in from the left over 0.3 s
+            tags += f"\\move({round(-ow / 2)},{oy},{ox},{oy},0,300)"
+        else:
+            tags += f"\\pos({ox},{oy})" + OVER_ANIM.get(o.get("anim", "none"), "")
+        lines.append(f"Dialogue: {max(0, 3 + int(o.get('layer', 0)))},{_ass_time(t0)},{_ass_time(max(t1, t0 + 0.05))},Over,,0,0,0,,"
+                     f"{{{tags}}}{_ass_text(text)}")
     if captions:
         glow = "{\\blur3}" if style == "neon" else ""
         for chunk in caption_chunks(words, start, end, 3 if vertical else 6, keeps):
@@ -500,24 +623,42 @@ def _encode(args: list, out: Path, cwd: Path, out_dur: float, progress) -> None:
 
 
 def render(src: Path, out: Path, start: float, end: float, edit: dict, meta: dict, ass: str | None, progress=None,
-           keeps: list | None = None, music: Path | None = None) -> None:
+           keeps: list | None = None, music: Path | None = None, overlays: list | None = None, fonts: list | None = None) -> None:
+    """overlays = media overlays ({kind image|gif|video|sound, path, t, d, ...} in clip time); text/emoji ride in `ass`."""
     e = {**DEFAULT_EDIT, **edit}
     dur = end - start
     kept = sum(b - a for a, b in keeps) if keeps else dur
     out_dur = kept / float(e["speed"])
     keeps_rel = [(a - start, b - start) for a, b in keeps] if keeps else None
-    graph, _ = build_filters(e, meta["width"], meta["height"], out_dur, bool(ass), keeps_rel, bool(meta.get("has_audio")), bool(music))
+    extra: list[str] = []
+    placed: list[dict] = []
+    for o in overlays or []:
+        a, b = overlay_window(float(o["t"]), float(o["d"]), start, keeps, float(e["speed"]))
+        if a >= out_dur:
+            continue
+        span = f"{b - a + 0.1:.3f}"
+        loop = {"image": ["-loop", "1", "-framerate", "30", "-t", span], "gif": ["-ignore_loop", "0", "-t", span],
+                "video": ["-t", span]}.get(o["kind"], [])
+        placed.append({**o, "a": a, "b": b, "input": 1 + bool(music) + len(placed),
+                       "audio": o["kind"] == "video" and probe(Path(o["path"]))["has_audio"]})
+        extra += loop + ["-i", str(Path(o["path"]).resolve())]
+    graph, _ = build_filters(e, meta["width"], meta["height"], out_dur, bool(ass), keeps_rel, bool(meta.get("has_audio")),
+                             bool(music), meta.get("fps") or 30, placed, bool(ass and fonts))
     work = out.parent / f".work_{out.stem}"
     work.mkdir(parents=True, exist_ok=True)
     try:
         if ass:
             (work / "captions.ass").write_text(ass, "utf-8")
+            if fonts:  # uploaded fonts, copied next to the captions for libass
+                (work / "fonts").mkdir(exist_ok=True)
+                for f in fonts:
+                    shutil.copy(f, work / "fonts" / Path(f).name)
         args = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(src.resolve())]
         if music:
             args += ["-stream_loop", "-1", "-i", str(music.resolve())]
-        args += ["-filter_complex", graph, "-map", "[v]"]
-        if meta.get("has_audio") or music:
-            args += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+        args += extra + ["-filter_complex", graph, "-map", "[v]"]
+        if meta.get("has_audio") or music or any(o["kind"] == "sound" or o["audio"] for o in placed):
+            args += ["-map", "[a]", "-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
         _encode(args, out, work, out_dur, progress)
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -543,5 +684,5 @@ def concat(files: list[Path], out: Path, size: tuple[int, int], progress=None) -
     g = ";".join(f"[{v}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}];"
                  f"{a}aresample=48000,aformat=channel_layouts=stereo[a{i}]" for i, (v, a) in enumerate(parts))
     g += ";" + "".join(f"[v{i}][a{i}]" for i in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=1[v][a]"
-    _encode(args + ["-filter_complex", g, "-map", "[v]", "-map", "[a]", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"],
+    _encode(args + ["-filter_complex", g, "-map", "[v]", "-map", "[a]", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"],
             out, out.parent, total, progress)

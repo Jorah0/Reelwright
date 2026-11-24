@@ -61,6 +61,13 @@ The packaged app stores data in `%LOCALAPPDATA%\Reelwright`; from source it uses
 
 TikTok and Instagram APIs have no native scheduling, so scheduled posts to them are held locally and posted at the time — Reelwright must be running then. YouTube schedules natively (`publishAt`).
 
+## Privacy policy and terms
+
+`reelwright/static/legal/privacy.html` and `terms.html` are shown in the app (Settings → Legal, or `/legal/privacy.html`). Before
+submitting TikTok, Meta or Google apps for review, fill in the highlighted placeholders (provider name, contact email, governing law)
+and publish both files at a public URL (any static host, e.g. GitHub Pages): the review forms ask for those URLs. A test fails if the code
+starts contacting a service the privacy policy doesn't mention.
+
 ## Develop
 
 ```

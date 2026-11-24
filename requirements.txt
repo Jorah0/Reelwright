@@ -1,17 +1,38 @@
-fastapi
-uvicorn
-python-multipart
-anthropic
-faster-whisper
-numpy
-opencv-python-headless
-yt-dlp
-httpx
-websockets  # OBS link (obs-websocket v5)
-google-api-python-client
-google-auth-oauthlib
-pywebview
-# build / test only
-pyinstaller
-pillow
-pytest
+# Reelwright — Python 3.12+ (tested on 3.14). Install: pip install -r requirements.txt
+# Floors are the versions the test suite passes on; caps stop the next major release (where breaking changes land)
+# from installing silently. Raise a cap only after `python scripts/verify.py` passes on the new version.
+# Also needed on PATH: ffmpeg + ffprobe (the packaged .exe bundles them).
+
+# --- app server & UI ---
+fastapi>=0.136,<1
+uvicorn>=0.49,<1
+python-multipart>=0.0.32        # file uploads (videos, music, learning imports)
+pydantic>=2.13,<3
+pywebview>=6.2,<7               # desktop window (WebView2 on Windows)
+
+# --- AI ---
+anthropic>=0.109,<1             # 1.x moves to httpx2 and drops deprecated params: upgrade deliberately
+faster-whisper>=1.2,<2          # transcription (pulls ctranslate2)
+numpy>=2.4,<3
+opencv-contrib-python-headless>=5.0,<6  # face (YuNet) + anime/VTuber (cascade) detection, saliency, object tracking, covers
+# (contrib replaces opencv-python-headless: uninstall that one first — both provide the same cv2 module)
+
+# --- import & publish ---
+yt-dlp>=2026.6.9                # no cap: sites change often, keep it current (pip install -U yt-dlp)
+httpx>=0.28,<1                  # TikTok / Instagram / Kick APIs
+google-api-python-client>=2.202,<3
+google-auth>=2.53,<3
+google-auth-oauthlib>=1.5,<2
+
+# --- OBS link ---
+websockets>=16.0,<17            # obs-websocket v5 client (sync API) — also the only extra the standalone Relay needs
+
+# --- optional: NVIDIA GPU transcription when running from source (the .exe bundles them) ---
+# nvidia-cublas-cu12
+# nvidia-cudnn-cu12
+
+# --- build / test / lint only ---
+pyinstaller>=6.22,<7
+pillow>=12.2,<13
+pytest>=9.1,<10
+ruff>=0.15,<1                   # used by scripts/verify.py's lint step

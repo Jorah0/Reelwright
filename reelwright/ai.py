@@ -374,6 +374,81 @@ def assist(instruction: str, clip: dict, edit: dict, segments: list[dict], durat
     return patch.model_dump(exclude_none=True)
 
 
+class PlanEdit(BaseModel):
+    speed: Optional[float] = None
+    brightness: Optional[float] = None
+    contrast: Optional[float] = None
+    saturation: Optional[float] = None
+    gamma: Optional[float] = None
+    sharpen: Optional[bool] = None
+    volume: Optional[float] = None
+    loudnorm: Optional[bool] = None
+    denoise: Optional[bool] = None
+    fade_in: Optional[float] = None
+    fade_out: Optional[float] = None
+    zoom: Optional[float] = Field(default=None, description="punch-in 1-4")
+    remove_silence: Optional[bool] = None
+    remove_fillers: Optional[bool] = None
+    title_text: Optional[str] = None
+    sticker_text: Optional[str] = None
+    aspect: Optional[Literal["source", "9:16", "1:1", "4:5", "16:9"]] = None
+    fit: Optional[Literal["crop", "blur"]] = None
+
+
+class PlanOverlay(BaseModel):
+    kind: Literal["image", "gif", "video", "sound", "text", "emoji"]
+    asset_id: Optional[str] = Field(default=None, description="an id from the asset list, for media kinds; never invent one")
+    text: Optional[str] = Field(default=None, description="for text/emoji: at most 80 characters")
+    t: float = Field(description="start, seconds from the clip start")
+    d: Optional[float] = Field(default=None, description="seconds on screen; omit for sounds to play the whole effect")
+    x: Optional[float] = Field(default=None, description="centre 0..1 of the output width")
+    y: Optional[float] = Field(default=None, description="centre 0..1 of the output height")
+    w: Optional[float] = Field(default=None, description="width as a fraction of the output width")
+    anim: Optional[Literal["none", "pop", "fade", "shake", "slide"]] = None
+    volume: Optional[float] = Field(default=None, description="0-2, sounds and video snippets")
+    cutaway: Optional[bool] = Field(default=None, description="video only: full-screen cutaway")
+
+
+class PlanTrack(BaseModel):
+    mode: Optional[Literal["auto", "face"]] = Field(default=None, description="re-run subject tracking in this mode")
+    offset_y: Optional[float] = Field(default=None, description="headroom -0.4..0.4 of the crop height (+ = subject higher)")
+    zoom: Optional[float] = Field(default=None, description="follow-crop zoom 1-4")
+
+
+class PlanCaptions(BaseModel):
+    captions: Optional[bool] = None
+    caption_style: Optional[Literal["bold", "clean", "boxed", "neon"]] = None
+    caption_pos: Optional[Literal["low", "middle", "high"]] = None
+
+
+class PlanItem(BaseModel):
+    kind: Literal["edit", "overlay", "track", "captions"]
+    title: str = Field(description="short label for the checkbox, e.g. 'Boom on the punchline'")
+    why: str = Field(description="one sentence: why this makes the clip better")
+    edit: Optional[PlanEdit] = Field(default=None, description="for kind edit")
+    overlay: Optional[PlanOverlay] = Field(default=None, description="for kind overlay: exactly one overlay")
+    track: Optional[PlanTrack] = Field(default=None, description="for kind track")
+    captions: Optional[PlanCaptions] = Field(default=None, description="for kind captions")
+
+
+class Plan(BaseModel):
+    summary: str = Field(description="one or two sentences on the overall direction")
+    items: list[PlanItem] = Field(description="independent suggestions the creator can tick individually, best first")
+
+
+PLAN_SYSTEM = """You are the senior short-form editor inside Reelwright. Propose a concrete edit plan for ONE clip as a list of
+independent items the creator can approve one by one. Use timing from the transcript (seconds from the clip start): sound
+effects land on punchlines and reveals, text pops on the hook in the first 2 seconds, cutaways only where they add context.
+Only reference assets by an id from the provided list; if nothing fits, use text or emoji instead. Prefer a few strong,
+tasteful items over many. Respect the creator's style guidance. If the creator gave no instruction, make smart suggestions."""
+
+
+def plan(context: str, prompt: str) -> Plan:
+    """An edit plan for one clip. context = clip, transcript, signals, edit, library (cached); prompt = the request."""
+    task = f"Creator's request: {prompt.strip()}" if prompt.strip() else "No specific request: suggest the best improvements."
+    return _ask(PLAN_SYSTEM, (context, task), Plan, effort="medium")
+
+
 class YouTubeMeta(BaseModel):
     title: str = Field(description="max 95 characters, compelling, no clickbait lies")
     description: str = Field(description="2-4 short paragraphs + relevant hashtags at the end")
@@ -585,6 +660,11 @@ def research(prompt: str, max_uses: int = 8) -> tuple[str, list[dict]]:
     return text, sources[:25]
 
 
+class PostingSlot(BaseModel):
+    weekday: int = Field(description="0 = Monday … 6 = Sunday")
+    hour: int = Field(description="0-23, creator's local time")
+
+
 class PlatformPlaybook(BaseModel):
     summary: str = Field(description="2-3 sentences: what is working on this platform right now for this creator's niche")
     algorithm_signals: list[str] = Field(description="what the ranking system currently rewards (watch time, rewatches, shares, saves...)")
@@ -594,6 +674,8 @@ class PlatformPlaybook(BaseModel):
     caption_rules: list[str] = Field(description="how to write the on-platform title/caption")
     hashtag_strategy: str
     best_posting_times: str
+    posting_slots: list[PostingSlot] = Field(default_factory=list, description="5-12 best weekly posting slots for this "
+                                             "creator's audience, converted to the creator's local time zone given in the prompt")
     format_specs: str = Field(description="resolution, aspect, max length, caption limits")
     avoid: list[str]
 

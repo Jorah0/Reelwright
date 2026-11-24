@@ -170,13 +170,22 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "project_id": p["id"]})
 
 
-def _udp_loop(port: int, stop: threading.Event):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:  # no SO_REUSEADDR: nobody else may answer for us
-        try:
-            s.bind(("", port))
-        except OSError:
-            return  # discovery is a convenience; --server still works
-        s.settimeout(1.0)
+def _udp_socket(port: int):
+    """Bound before the receiver reports itself running, so no discovery request can arrive before anyone listens."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # no SO_REUSEADDR: nobody else may answer for us
+    try:
+        s.bind(("", port))
+    except OSError:
+        s.close()
+        return None  # discovery is a convenience; --server still works
+    s.settimeout(1.0)
+    return s
+
+
+def _udp_loop(s, port: int, stop: threading.Event):
+    if s is None:
+        return
+    with s:
         reply = json.dumps({"app": "reelwright", "port": port}).encode()  # no hostname: say as little as possible
         last: dict[str, float] = {}
         while not stop.is_set():
@@ -216,7 +225,7 @@ def apply() -> dict:
             srv.daemon_threads = True
             stop = threading.Event()
             threading.Thread(target=srv.serve_forever, daemon=True).start()
-            threading.Thread(target=_udp_loop, args=(want, stop), daemon=True).start()
+            threading.Thread(target=_udp_loop, args=(_udp_socket(want), want, stop), daemon=True).start()
             _state.update(http=srv, port=want, stop=stop, error="")
         if not want:
             _state["error"] = ""

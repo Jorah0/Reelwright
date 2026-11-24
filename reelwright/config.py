@@ -30,11 +30,13 @@ DEFAULTS = {
     "caption_uppercase": True,
     "caption_color": "#FFD400",
     "results_at": "",           # last time published-post view counts were pulled into the learning memory
+    "autopilot_paused": False,  # stops Autopilot everywhere; its queued posts are held, not deleted
     # OBS over the network: an optional receiver other PCs' Reelwright Relay pushes clips to (token-protected)
     "lan_receive": False,
     "lan_port": 8766,
     "lan_token": "",
     "obs_autopilot": {"enabled": False},  # Autopilot settings applied to clips arriving from OBS
+    "ui_scale": {},             # per-component interface scale, e.g. {"app": 1.1, "text": 1.2} (kept across restarts/updates)
 }
 
 _lock = threading.Lock()

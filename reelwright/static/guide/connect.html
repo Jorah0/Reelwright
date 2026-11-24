@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reelwright Connection Guide</title>
+<style>
+  :root { --bg: #ffffff; --text: #1c1d22; --muted: #5d6170; --line: #e3e5ec; --accent: #c43a24; --fill: #f4f5f9; --warn: #8a5a00; --warnbg: #fff6df; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #0b0c10; --text: #eceef6; --muted: #a3a7b7; --line: #262a36; --accent: #ff7a5c; --fill: #161821; --warn: #ffc247; --warnbg: #2a2412; } }
+  body { background: var(--bg); color: var(--text); font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; }
+  main { max-width: 820px; margin: 0 auto; padding: 40px 16px 80px; }
+  h1 { font-size: 30px; margin: 0 0 4px; } h2 { font-size: 22px; margin: 40px 0 8px; border-top: 1px solid var(--line); padding-top: 24px; }
+  h3 { font-size: 16px; margin: 20px 0 6px; } a { color: var(--accent); } .meta { color: var(--muted); font-size: 14px; }
+  code { background: var(--fill); padding: 1px 5px; border-radius: 4px; font-size: 13.5px; word-break: break-all; }
+  .table { overflow-x: auto; } table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 8px 0 12px; }
+  td, th { border: 1px solid var(--line); padding: 7px 8px; text-align: left; vertical-align: top; }
+  .note { background: var(--warnbg); color: var(--text); border-left: 3px solid var(--warn); padding: 8px 12px; border-radius: 4px; font-size: 14.5px; margin: 10px 0; }
+  ol, ul { padding-left: 22px; } li { margin: 4px 0; } nav a { margin-right: 14px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Connecting your accounts</h1>
+<p class="meta">Every permission Reelwright asks for, why, and how to set each developer portal up. Reelwright runs on your computer and
+uses developer apps that you create, so each platform's permissions are granted to <b>your</b> app.</p>
+<nav><a href="#claude">Claude</a><a href="#youtube">YouTube</a><a href="#tiktok">TikTok</a><a href="#instagram">Instagram</a><a href="#obs">OBS</a><a href="#urls">Policy URLs</a></nav>
+
+<h2 id="claude">Claude (Anthropic)</h2>
+<p>No permissions to configure: an API key is all it needs.</p>
+<ol>
+  <li>Sign in at <a href="https://console.anthropic.com" target="_blank">console.anthropic.com</a> and add billing.</li>
+  <li><b>API keys → Create key</b>, copy it.</li>
+  <li>Reelwright → <b>Settings → Claude AI</b> → paste the key → Save. <b>Settings → Diagnostics → Deep check</b> confirms it works.</li>
+</ol>
+
+<h2 id="youtube">YouTube (Google Cloud)</h2>
+<h3>Permissions (OAuth scopes) Reelwright requests</h3>
+<div class="table"><table>
+  <tr><th>Scope</th><th>Used for</th></tr>
+  <tr><td><code>https://www.googleapis.com/auth/youtube.upload</code></td><td>Uploading videos and setting custom thumbnails</td></tr>
+  <tr><td><code>https://www.googleapis.com/auth/youtube.readonly</code></td><td>Showing your channel and reading view/like counts (learning from results)</td></tr>
+  <tr><td><code>https://www.googleapis.com/auth/youtube.force-ssl</code></td><td>Moving the publish time of a video that is already uploaded and scheduled</td></tr>
+</table></div>
+<h3>Setup</h3>
+<ol>
+  <li>Open <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a> and create a project (any name).</li>
+  <li><b>APIs &amp; Services → Library</b> → search <b>YouTube Data API v3</b> → <b>Enable</b>.</li>
+  <li><b>Google Auth Platform → Branding</b> (the OAuth consent screen): app name, your support email, developer contact. Audience:
+    <b>External</b>.</li>
+  <li><b>Data Access → Add or remove scopes</b>: add the three scopes above (filter by “youtube”).</li>
+  <li><b>Audience → Test users → Add users</b>: add the Google account that owns your channel.</li>
+  <li><b>Clients → Create client</b> → Application type <b>Desktop app</b> → Create → <b>Download JSON</b>.</li>
+  <li>Reelwright → <b>Publish → YouTube → Upload client JSON</b> → <b>Sign in with Google</b> → approve every permission.</li>
+</ol>
+<div class="note"><b>Know before you post:</b>
+  <ul>
+    <li>While the consent screen is in <b>Testing</b>, Google expires the sign-in after <b>7 days</b>. Set the app to <b>In production</b>
+      (Audience → Publish app) to keep it. Without Google verification you'll see an “unverified app” warning when signing in; that's
+      fine for your own channel.</li>
+    <li>Until your project passes YouTube's API compliance audit, videos uploaded through the API are locked to <b>private</b>. Request the
+      audit from the YouTube API Services form linked in Google Cloud.</li>
+    <li>Custom thumbnails need a channel verified by phone (youtube.com/verify).</li>
+    <li>The API has a daily quota (10,000 units by default) and uploads use a large share of it; request more in Google Cloud if you post a lot.</li>
+    <li>Connected before this version? Reelwright shows a notice: Disconnect and sign in again to grant <code>youtube.force-ssl</code>.</li>
+  </ul></div>
+
+<h2 id="tiktok">TikTok</h2>
+<h3>Permissions (scopes) Reelwright requests</h3>
+<div class="table"><table>
+  <tr><th>Scope</th><th>Product</th><th>Used for</th></tr>
+  <tr><td><code>user.info.basic</code></td><td>Login Kit</td><td>Your display name and avatar</td></tr>
+  <tr><td><code>video.publish</code></td><td>Content Posting API (Direct Post)</td><td>Posting videos to your profile, reading your posting options and post status</td></tr>
+</table></div>
+<h3>Setup</h3>
+<ol>
+  <li>Go to <a href="https://developers.tiktok.com/apps" target="_blank">developers.tiktok.com → Manage apps</a> → <b>Connect an app</b>.</li>
+  <li>Fill in the app details: icon, name, category, description, and your public <b>Terms of Service</b> and <b>Privacy Policy</b> URLs
+    (see <a href="#urls">Policy URLs</a>). Under <b>Platforms</b>, choose <b>Desktop</b>.</li>
+  <li><b>Add products → Login Kit</b>. Under Redirect URI add exactly <code>http://localhost:8765/oauth/tiktok/callback</code>
+    (the Publish page shows the exact value if you changed Reelwright's port).</li>
+  <li><b>Add products → Content Posting API</b> and turn on <b>Direct Post</b>.</li>
+  <li><b>Scopes</b>: make sure <code>user.info.basic</code> and <code>video.publish</code> are added.</li>
+  <li>For testing before review, open <b>Sandbox</b>, create a sandbox and add your TikTok account as a target user.</li>
+  <li>Copy the <b>Client key</b> and <b>Client secret</b> → Reelwright <b>Publish → TikTok → Save app → Sign in with TikTok</b>.</li>
+</ol>
+<div class="note"><b>Until TikTok audits your app</b> (Content Posting API audit, submitted from the developer portal with a demo of the posting
+  screen): posts are <b>Only me</b>, your TikTok account must be set to <b>private</b> when posting, and at most 5 accounts can post per day.
+  After the audit, the publish dialog offers every audience your account allows.</div>
+
+<h2 id="instagram">Instagram</h2>
+<p>Your Instagram account must be a <b>Business or Creator</b> account (Instagram app → Settings → Account type and tools). Meta offers two
+ways to get a token; Reelwright accepts either.</p>
+
+<h3>Route A — Instagram Login (simplest, no Facebook Page)</h3>
+<div class="table"><table>
+  <tr><th>Permission</th><th>Used for</th></tr>
+  <tr><td><code>instagram_business_basic</code></td><td>Your username, picture, follower count, account ID</td></tr>
+  <tr><td><code>instagram_business_content_publish</code></td><td>Publishing Reels</td></tr>
+</table></div>
+<ol>
+  <li>At <a href="https://developers.facebook.com/apps" target="_blank">developers.facebook.com/apps</a> → <b>Create app</b> → choose the
+    Instagram use case (“Manage messaging &amp; content on Instagram”) → app type <b>Business</b>.</li>
+  <li>In the app: <b>Use cases → Manage messaging &amp; content on Instagram → Customize</b>, or <b>Instagram → API setup with Instagram
+    (business) login</b>. <i>Not listed?</i> Add it with <b>Use cases → Add use case</b>; if that option is missing, the app's type can't
+    use it, so create a new app and pick the Instagram use case (type <b>Business</b>) when asked.</li>
+  <li>Step <b>Generate access tokens → Add account</b>: log in with your Instagram account. If asked, accept the tester invite in Instagram
+    (Settings → Website permissions / Apps and websites → Tester invites).</li>
+  <li>Click <b>Generate token</b> next to your account, approve, and copy the token.</li>
+  <li>Reelwright → <b>Publish → Instagram</b> → paste the token → <b>Connect Instagram</b> (the account ID is found automatically).</li>
+</ol>
+<div class="note"><b>“Invalid Request: Request parameters are invalid: Invalid platform app”</b> means the <b>Meta/Facebook App ID</b> was used where the
+  <b>Instagram App ID</b> belongs (shown under <i>API setup with Instagram login → Business login settings</i>), or old scopes such as
+  <code>user_profile</code>, <code>user_media</code> or <code>instagram_basic</code> were requested in this flow. Use the Generate token button above, or the
+  Instagram App ID with the two scopes in the table.</div>
+
+<h3>Route B — Facebook Login (Instagram linked to a Facebook Page)</h3>
+<div class="table"><table>
+  <tr><th>Permission</th><th>Used for</th></tr>
+  <tr><td><code>instagram_basic</code></td><td>Reading your Instagram account</td></tr>
+  <tr><td><code>instagram_content_publish</code></td><td>Publishing Reels</td></tr>
+  <tr><td><code>pages_read_engagement</code></td><td>Required by Meta for publishing through a Page-linked account</td></tr>
+  <tr><td><code>pages_show_list</code></td><td>Only to look up your Instagram account ID (step 4)</td></tr>
+  <tr><td><code>business_management</code></td><td>Only if your Page is managed in a Meta Business portfolio (Business Suite): without it
+    the token sees no Pages</td></tr>
+  <tr><td><code>ads_management</code>, <code>ads_read</code></td><td>Only if your role on the Page comes through Business Manager</td></tr>
+</table></div>
+<ol>
+  <li>Link the Instagram account to a Facebook Page (Page settings → Linked accounts).</li>
+  <li>Create a Meta app (type <b>Business</b>) and add <b>Facebook Login for Business</b>.</li>
+  <li>Open <a href="https://developers.facebook.com/tools/explorer/" target="_blank">Graph API Explorer</a>: select your app, <b>User Token</b>,
+    add the permissions above, <b>Generate Access Token</b>.</li>
+  <li><i>Optional:</i> Reelwright finds your Instagram account through your Page by itself. To look it up by hand, run
+    <code>me/accounts</code> to get your Page ID, then <code>&lt;PAGE_ID&gt;?fields=instagram_business_account</code>; the <code>id</code>
+    inside (usually starting <code>1784…</code>) is the Instagram account ID. Don't use the ID from <code>me</code>: that's your Facebook
+    user, and Meta answers “username field is deprecated”.</li>
+  <li>Make the token long-lived: <a href="https://developers.facebook.com/tools/debug/accesstoken/" target="_blank">Access Token Debugger</a>
+    → paste → <b>Extend Access Token</b>.</li>
+  <li>Reelwright → <b>Publish → Instagram</b> → paste the token (account ID optional) → <b>Connect Instagram</b>.</li>
+</ol>
+<div class="note">Tokens from both routes last about <b>60 days</b>; when one expires, Reelwright marks Instagram posts “Needs connection” — paste a
+  fresh token. With <b>Standard access</b> your app can publish to accounts that have a role on the app (yours). Publishing for other people's
+  accounts needs <b>Advanced access</b> through Meta App Review. Meta allows 100 API posts per account per 24 hours.</div>
+
+<h2 id="obs">OBS (optional)</h2>
+<ol>
+  <li>In OBS: <b>Tools → WebSocket Server Settings → Enable WebSocket server</b> (port <code>4455</code>), and keep authentication on.</li>
+  <li><b>Show Connect Info</b> → copy the server password.</li>
+  <li>Reelwright → <b>OBS link → Connect OBS directly</b>: the PC's address, port and password. OBS on another PC: also allow port 4455 through
+    that PC's firewall, and either map its recording folder or use the Relay (instructions on the OBS link page).</li>
+</ol>
+
+<h2 id="urls">Public Terms and Privacy Policy URLs</h2>
+<p>TikTok and Meta ask for public links to your Terms of Service and Privacy Policy (Google asks for a privacy policy before verification).
+Reelwright includes both: fill in the highlighted placeholders in <code>reelwright/static/legal/terms.html</code> and
+<code>privacy.html</code>, publish the two files on any public static host (for example GitHub Pages), and use those URLs in each portal.</p>
+</main>
+</body>
+</html>

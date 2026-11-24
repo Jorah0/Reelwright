@@ -161,19 +161,21 @@ def discover(timeout: float = 3.0, port: int = DISCOVERY_PORT) -> str | None:
     """Find a Reelwright receiver on the LAN by UDP broadcast; returns its base URL."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.settimeout(timeout)
-        for target in ("255.255.255.255", "127.0.0.1"):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:  # UDP is lossy (Wi-Fi, busy PCs): probe again every 0.5 s until someone answers
+            for target in ("255.255.255.255", "127.0.0.1"):
+                try:
+                    s.sendto(DISCOVER_MAGIC, (target, port))
+                except OSError:
+                    pass
+            s.settimeout(max(0.05, min(0.5, end - time.monotonic())))
             try:
-                s.sendto(DISCOVER_MAGIC, (target, port))
-            except OSError:
-                pass
-        try:
-            data, (ip, _) = s.recvfrom(2048)
-            info = json.loads(data)
-            if info.get("app") == "reelwright":
-                return f"http://{ip}:{int(info['port'])}"
-        except (OSError, ValueError, KeyError):
-            pass
+                data, (ip, _) = s.recvfrom(2048)
+                info = json.loads(data)
+                if info.get("app") == "reelwright":
+                    return f"http://{ip}:{int(info['port'])}"
+            except (OSError, ValueError, KeyError):
+                continue
     return None
 
 

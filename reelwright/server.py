@@ -1,15 +1,17 @@
 """HTTP API + static UI. Bound to localhost only (it holds your API keys and social tokens)."""
 import json
+import math
 import os
 import re
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import ai, config, doctor, lan, learn, log, media, obs, pipeline, platforms, store, usage, youtube
+from . import ai, assets, config, doctor, lan, learn, log, media, obs, pipeline, platforms, schedule, store, usage, youtube
 from .config import PROJECTS, STATIC, YT_SECRET
 
 VIDEO_EXT = media.VIDEO_EXT
@@ -66,8 +68,15 @@ def get_settings():
 def put_settings(patch: dict):
     if "anthropic_api_key" in patch and patch["anthropic_api_key"] is None:
         patch.pop("anthropic_api_key")
+    if "ui_scale" in patch:  # per-component interface scale; a bad value must never make the UI unusable
+        raw = patch["ui_scale"] if isinstance(patch["ui_scale"], dict) else {}
+        patch["ui_scale"] = {k: round(min(max(float(v), 0.6), 2.0), 2) for k, v in raw.items()
+                             if k in UI_SCALE_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool) and v == v}
     config.save(patch)
     return config.public()
+
+
+UI_SCALE_KEYS = ("app", "sidebar", "text", "preview", "timeline", "panels")
 
 
 # ---------- projects ----------
@@ -181,13 +190,150 @@ EDIT_ENUMS = {"aspect": ("source", "9:16", "1:1", "4:5", "16:9"), "fit": ("crop"
               "sticker_pos": ("top-left", "top-center", "top-right", "bottom-left", "bottom-right")}
 
 
-def clean_edit(edit: dict) -> dict:
-    """Validate edit values at the API boundary (from the UI, the AI assistant, or anything else posting here)."""
+def _keyframes(v, length: float) -> list:
+    """Manual tracking keyframes: up to 500 [t (0..clip length), cx, cy (0..1)] or [t, cx, cy, zoom (1..4)]."""
+    if not isinstance(v, list) or len(v) > 500:
+        raise HTTPException(400, "track_manual must be a list of up to 500 [t, cx, cy] or [t, cx, cy, zoom] keyframes.")
+    out = []
+    for kf in v:
+        try:
+            nums = [float(n) for n in kf]
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Each tracking keyframe must be [t, cx, cy] or [t, cx, cy, zoom] numbers.")
+        if len(nums) not in (3, 4):
+            raise HTTPException(400, "Each tracking keyframe must be [t, cx, cy] or [t, cx, cy, zoom] numbers.")
+        t, x, y, *z = nums
+        if not (0 <= t <= length + 0.01 and 0 <= x <= 1 and 0 <= y <= 1 and all(1 <= v <= 4 for v in z)):  # rejects NaN
+            raise HTTPException(400, "Tracking keyframe out of range (t within the clip, cx/cy 0..1, zoom 1..4).")
+        out.append([round(t, 3), round(x, 4), round(y, 4), *(round(v, 3) for v in z)])
+    return sorted(out)
+
+
+def _num(v, name: str, lo: float, hi: float) -> float:
+    """A finite number clamped to [lo, hi] (like EDIT_RANGES), else 400."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{name} must be a number.")
+    if not math.isfinite(f):
+        raise HTTPException(400, f"{name} must be a number.")
+    return min(max(f, lo), hi)
+
+
+def _framing(v) -> dict:
+    """Follow framing: offset_y (headroom, -0.4..0.4 of the crop height) and zoom (1..4); only the keys given."""
+    if not isinstance(v, dict):
+        raise HTTPException(400, "framing must be an object.")
+    ranges = {"offset_y": (-0.4, 0.4), "zoom": (1.0, 4.0)}
+    return {k: round(_num(v[k], f"framing.{k}", *r), 4) for k, r in ranges.items() if k in v and v[k] is not None}
+
+
+TEXT_RANGES = {"size": (24, 200), "outline": (0, 20), "shadow": (0, 20), "spacing": (-5, 20)}  # size: px at 1080 wide
+
+
+def _text_style(field: str, v, name: str):
+    """One text-styling value (font, size, weight, color, outline, outline_color, shadow, spacing); None = the default."""
+    if v is None:
+        return None
+    if field == "font":
+        if not isinstance(v, str) or len(v) > 80:
+            raise HTTPException(400, f"{name} must be a font family name.")
+        return v.strip() or None
+    if field == "weight":
+        if v not in ("normal", "bold"):
+            raise HTTPException(400, f"{name} must be normal or bold.")
+        return v
+    if field in ("color", "outline_color"):
+        if not isinstance(v, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+            raise HTTPException(400, f"{name} must be a #RRGGBB colour.")
+        return v.upper()
+    return round(_num(v, name, *TEXT_RANGES[field]), 2)
+
+
+TEXT_FIELDS = ("font", "size", "weight", "color", "outline", "outline_color", "shadow", "spacing")
+TEXT_KEYS = {f"{who}_{f}": f for who in ("caption", "title", "sticker") for f in TEXT_FIELDS}
+OVERLAY_KINDS = ("image", "gif", "video", "sound", "text", "emoji")
+OVERLAY_ANIMS = ("none", "pop", "fade", "shake", "slide")
+
+
+def _overlays(v, clip: dict) -> list | None:
+    """Clip overlays (≤ 60): media kinds must name a library asset of that kind; text/emoji carry ≤ 80 chars. Times are
+    clip time (t inside the clip, d clamped to its end; sounds/videos default to the asset's length)."""
+    if v is None or v == []:
+        return None
+    if not isinstance(v, list) or len(v) > 60:
+        raise HTTPException(400, "overlays must be a list of up to 60 overlays.")
+    length, out = clip["end"] - clip["start"], []
+    for o in v:
+        if not isinstance(o, dict) or o.get("kind") not in OVERLAY_KINDS:
+            raise HTTPException(400, f"Each overlay needs a kind: {', '.join(OVERLAY_KINDS)}.")
+        kind = o["kind"]
+        t = _num(o.get("t", 0), "overlay t", -1e9, 1e9)
+        if not 0 <= t < length:
+            raise HTTPException(400, "Overlay starts outside the clip.")
+        o2 = {"id": str(o.get("id") or store.new_id())[:40], "kind": kind, "t": round(t, 3)}
+        if kind in ("text", "emoji"):
+            text = o.get("text")
+            if not isinstance(text, str) or not text.strip() or len(text) > 80:
+                raise HTTPException(400, "Text overlays need 1 to 80 characters.")
+            o2["text"], default_d = text, 2.0
+            o2.update({f: _text_style(f, o.get(f), f"overlay {f}") for f in TEXT_FIELDS if o.get(f) is not None})
+        else:
+            a = store.get("asset", str(o.get("asset_id") or ""))
+            if not a or a["kind"] != kind:
+                raise HTTPException(400, f"Overlay asset not found in the library (or not a {kind}).")
+            o2["asset_id"], default_d = a["id"], (a.get("duration") or 3.0)
+        d = default_d if o.get("d") is None else _num(o["d"], "overlay d", 0, 1e9)
+        if d <= 0:
+            raise HTTPException(400, "Overlay duration must be positive.")
+        anim = o.get("anim") or "none"
+        if anim not in OVERLAY_ANIMS:
+            raise HTTPException(400, f"anim must be one of {', '.join(OVERLAY_ANIMS)}.")
+        o2.update(d=round(min(d, length - t), 3), x=round(_num(o.get("x", 0.5), "overlay x", 0, 1), 4),
+                  y=round(_num(o.get("y", 0.5), "overlay y", 0, 1), 4), w=round(_num(o.get("w", 0.3), "overlay w", 0.02, 1), 4),
+                  anim=anim, volume=round(_num(o.get("volume", 1.0), "overlay volume", 0, 2), 3),
+                  layer=int(_num(o.get("layer", 0), "overlay layer", -50, 50)), cutaway=bool(o.get("cutaway")) and kind == "video")
+        out.append(o2)
+    return out
+
+
+def _words(v, clip: dict) -> list | None:
+    """Caption words override: up to 2000 {s, e, w} with s ≤ e inside the clip (absolute source seconds), w ≤ 40 chars."""
+    if v is None or v == []:
+        return None
+    if not isinstance(v, list) or len(v) > 2000:
+        raise HTTPException(400, "words must be a list of up to 2000 {s, e, w}.")
+    out = []
+    for w in v:
+        try:
+            s, e, txt = float(w["s"]), float(w["e"]), w["w"]
+        except (TypeError, KeyError, ValueError):
+            raise HTTPException(400, "Each word must be {s, e, w}.")
+        if not isinstance(txt, str) or len(txt) > 40 or not clip["start"] - 0.01 <= s <= e <= clip["end"] + 0.01:
+            raise HTTPException(400, "Word out of range (inside the clip, s ≤ e, at most 40 characters).")
+        out.append({"s": round(s, 3), "e": round(e, 3), "w": txt})
+    return out
+
+
+def clean_edit(edit: dict, clip: dict) -> dict:
+    """Validate edit values at the API boundary (from the UI, the AI assistant, or anything else posting here).
+    `clip` (start/end) bounds the list-valued keys; track_manual comes back as is for patch_clip to file under track."""
     out = {}
     for k, v in edit.items():
+        if k == "track_manual":
+            out[k] = _keyframes(v, clip["end"] - clip["start"])
+            continue
         if k not in media.DEFAULT_EDIT:
             continue
-        if k in EDIT_RANGES:
+        if k in TEXT_KEYS:
+            out[k] = _text_style(TEXT_KEYS[k], v, k)
+        elif k == "words":
+            out[k] = _words(v, clip)
+        elif k == "framing":
+            out[k] = _framing(v)
+        elif k == "overlays":
+            out[k] = _overlays(v, clip)
+        elif k in EDIT_RANGES:
             try:
                 lo, hi = EDIT_RANGES[k]
                 out[k] = min(max(float(v), lo), hi)
@@ -208,9 +354,25 @@ def clean_edit(edit: dict) -> dict:
     return out
 
 
+POSTED = "Already posted — make a new version to edit it."
+META_KEYS = {"title", "hook", "rating"}  # what stays editable after a clip is posted (doesn't change the video)
+
+
+def posted(cid: str) -> bool:
+    return bool(store.find("upload", clip_id=cid, status="done"))
+
+
+def _editable(cid: str) -> dict:
+    """The clip, unless it has been posted: the published render is final (pending uploads still use it)."""
+    clip = _404(store.get("clip", cid))
+    if posted(cid):
+        raise HTTPException(409, POSTED)
+    return clip
+
+
 @app.patch("/api/clips/{cid}")
 def patch_clip(cid: str, body: dict):
-    clip = _404(store.get("clip", cid))
+    clip = _editable(cid) if body.keys() - META_KEYS else _404(store.get("clip", cid))
     dur = store.get("project", clip["project_id"])["meta"]["duration"]
 
     def apply(c):
@@ -221,7 +383,12 @@ def patch_clip(cid: str, body: dict):
                     c[k] = round(min(max(float(body[k]), 0.0), dur), 3)
                     changed = True
         if "edit" in body:
-            c["edit"] = {**c["edit"], **clean_edit(body["edit"])}
+            ed = clean_edit(body["edit"], c)
+            if "track_manual" in ed:  # manual keyframes live beside the AI points, which stay
+                c["edit"]["track"] = {"points": [], **(c["edit"].get("track") or {}), "manual": ed.pop("track_manual")}
+            if "framing" in ed:  # partial framing updates keep the other key
+                ed["framing"] = {**(c["edit"].get("framing") or {}), **ed["framing"]}
+            c["edit"] = {**c["edit"], **ed}
             changed = True
         for k in ("title", "hook"):
             if k in body:
@@ -241,6 +408,18 @@ def patch_clip(cid: str, body: dict):
     return clip
 
 
+@app.post("/api/clips/{cid}/version")
+def version_clip(cid: str):
+    """A fresh, editable copy of a (usually posted) clip: same source, edit, overlays and track; no render or posts."""
+    src = _404(store.get("clip", cid))
+    root = src.get("version_of") or cid
+    base = re.sub(r" \(v\d+\)$", "", src["title"])
+    n = 2 + len(store.find("clip", version_of=root))
+    copy = {k: json.loads(json.dumps(v)) for k, v in src.items() if k not in ("id", "created", "export", "posts", "rating",
+                                                                               "track_error")}
+    return store.put("clip", {**copy, "title": f"{base} (v{n})", "export": None, "posts": {}, "rating": 0, "version_of": root})
+
+
 @app.delete("/api/clips/{cid}")
 def delete_clip(cid: str):
     clip = store.get("clip", cid)
@@ -252,7 +431,7 @@ def delete_clip(cid: str):
 
 @app.post("/api/clips/{cid}/export")
 def export_clip(cid: str):
-    _404(store.get("clip", cid))
+    _editable(cid)
     return pipeline.request_export(cid)
 
 
@@ -279,6 +458,231 @@ def facecam(cid: str):
     return patch_clip(cid, {"edit": {"layout": "split", **rect}})
 
 
+def _track_jobs(cid: str) -> list[dict]:
+    return store.find("job", clip_id=cid, kind="track")  # newest first
+
+
+def track_request(body, clip: dict) -> tuple[str, dict | None]:
+    """(mode, target) for a track job. No body repeats the clip's last choice; a target alone implies mode "target".
+    target = {t (s from the clip start), x, y, w, h (fractions of the source frame)}."""
+    if body is not None and not isinstance(body, dict):
+        raise HTTPException(400, "Expected a JSON object.")
+    body, prev = body or {}, clip["edit"].get("track") or {}
+    mode = body.get("mode") or ("target" if body.get("target") else prev.get("mode") or "auto")
+    if mode not in ("auto", "face", "target"):
+        raise HTTPException(400, "mode must be auto, face or target.")
+    if mode != "target":
+        return mode, None
+    target = body["target"] if "target" in body else prev.get("target")
+    try:
+        t, x, y, w, h = (float(target[k]) for k in ("t", "x", "y", "w", "h"))
+    except (TypeError, KeyError, ValueError):
+        raise HTTPException(400, "Pick what to follow: target needs t, x, y, w, h numbers.")
+    if not (0 <= t <= clip["end"] - clip["start"] + 0.01 and 0 <= x <= 1 and 0 <= y <= 1 and 0.01 < w <= 1 and 0.01 < h <= 1
+            and x + w <= 1.001 and y + h <= 1.001):  # also rejects NaN
+        raise HTTPException(400, "Target out of range (t within the clip, box inside the frame, w/h over 1%).")
+    return mode, {"t": round(t, 3), "x": round(x, 4), "y": round(y, 4), "w": round(w, 4), "h": round(h, 4)}
+
+
+@app.post("/api/clips/{cid}/track")
+def track_clip(cid: str, body: dict | None = None):
+    mode, target = track_request(body, _editable(cid))
+    running = [j for j in _track_jobs(cid) if j["status"] in ("queued", "running")
+               and j.get("mode", "auto") == mode and j.get("target") == target]
+    return running[0] if running else pipeline.submit("track", clip_id=cid, mode=mode, target=target)
+
+
+@app.get("/api/clips/{cid}/track")
+def get_track(cid: str):
+    clip = _404(store.get("clip", cid))
+    tr, jobs = clip["edit"].get("track") or {}, _track_jobs(cid)
+    return {"points": tr.get("points") or [], "manual": tr.get("manual") or [], "follow": bool(clip["edit"].get("follow")),
+            "mode": tr.get("mode") or "auto", "target": tr.get("target"), "job": jobs[0] if jobs else None}
+
+
+# ---------- pipeline board ----------
+
+STAGES = [("harvested", "Harvested"), ("preclipped", "Pre-clipped"), ("longform", "Long form"), ("shortform", "Short form"),
+          ("ready", "Ready to post"), ("uploaded", "Uploaded")]
+PENDING = {"waiting_render", "scheduled", "held", "queued", "uploading", "needs_auth", "failed"}
+
+
+def _iso(ts) -> str | None:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat() if isinstance(ts, (int, float)) else ts
+
+
+def _clip_item(c: dict, ups: list[dict]) -> dict:
+    """A clip card, in the furthest stage it has reached."""
+    done = [u for u in ups if u["status"] == "done"]
+    pending = [u for u in ups if u["status"] in PENDING]
+    aspect = c["edit"].get("aspect")
+    if done:
+        stage = "uploaded"
+    elif pipeline.clip_export_current(c) or pending:
+        stage = "ready"
+    elif c.get("rev", 1) <= 1 and not c.get("export") and not ups:
+        stage = "preclipped"
+    else:
+        stage = "longform" if aspect in ("16:9", "source") else "shortform"
+    exp, pid = c.get("export") or {}, c["project_id"]
+    thumb = f"/files/{pid}/{exp['cover']}" if exp.get("cover") else         (f"/files/{pid}/poster.jpg" if (pipeline.pdir(pid) / "poster.jpg").exists() else None)
+    stamps = [exp.get("at"), *(u.get("uploaded_at") for u in ups)]
+    return {"type": "clip", "id": c["id"], "project_id": pid, "title": c.get("title"), "stage": stage, "thumb": thumb,
+            "duration": round(c["end"] - c["start"], 3), "aspect": aspect,
+            "updated": max([s for s in stamps if s] or [_iso(c.get("created"))]),
+            "posts": [{"platform": u["platform"], "url": u.get("url"), "video_id": u.get("video_id"), "publish_at": u.get("publish_at")}
+                      for u in done],
+            "pending": [{"platform": u["platform"], "status": u["status"], "when": u.get("publish_at") or u.get("upload_at")}
+                        for u in pending],
+            "locked": bool(done), "edit_url": f"#/studio/{c['id']}"}
+
+
+@app.get("/api/pipeline")
+def pipeline_board():
+    """Every project and clip on one board: each in exactly one stage, the furthest it has reached."""
+    stages = {k: [] for k, _ in STAGES}
+    clips, ups = store.find("clip"), store.find("upload")
+    by_clip: dict[str, list] = {}
+    for u in ups:
+        by_clip.setdefault(u.get("clip_id"), []).append(u)
+    with_clips = {c["project_id"] for c in clips}
+    for p in store.find("project"):
+        if p.get("status") in ("importing", "queued", "analyzing") or p.get("status") == "ready" and p["id"] not in with_clips:
+            stages["harvested"].append({
+                "type": "project", "id": p["id"], "project_id": p["id"], "title": p.get("name"), "stage": "harvested",
+                "thumb": f"/files/{p['id']}/poster.jpg" if (pipeline.pdir(p["id"]) / "poster.jpg").exists() else None,
+                "duration": (p.get("meta") or {}).get("duration"), "aspect": None, "updated": _iso(p.get("created")),
+                "posts": [], "pending": [], "locked": False, "edit_url": f"#/editor/{p['id']}"})
+    for c in clips:
+        item = _clip_item(c, by_clip.get(c["id"], []))
+        stages[item["stage"]].append(item)
+    return {"stages": [{"key": k, "label": label, "items": stages[k]} for k, label in STAGES]}
+
+
+# ---------- AI plan → approve → apply ----------
+
+def _plan_context(clip: dict, proj: dict, library: list[dict]) -> str:
+    """Everything Claude needs to plan one clip, with times relative to the clip start (what overlays use)."""
+    s0, s1 = clip["start"], clip["end"]
+    segs = pipeline.load_json(proj["id"], "transcript.json", {"segments": []})["segments"]
+    sig = pipeline.load_json(proj["id"], "signals.json", {})
+    lines = [f"[{max(g['start'] - s0, 0):.1f}-{g['end'] - s0:.1f}] {g['text'].strip()}" for g in segs if g["end"] > s0 and g["start"] < s1]
+    loud = [f"{p['t'] - s0:.1f}s (energy {p['energy']})" for p in sig.get("loud", []) if s0 <= p["t"] <= s1]
+    cuts = [f"{t - s0:.1f}s" for t in sig.get("scenes", []) if s0 < t < s1]
+    edit = {k: v for k, v in clip["edit"].items() if k not in ("track", "words")}
+    lib = [f"{a['id']} | {a['kind']} | {a['name']} | {', '.join(a.get('tags') or [])} | {a.get('duration') or 0:.1f}s" for a in library]
+    taste, guide = pipeline.taste_examples(), pipeline.guidance()
+    return "\n".join([
+        f"Clip: {clip.get('title')!r}, {s1 - s0:.1f}s long, hook: {clip.get('hook') or '-'}",
+        "Transcript (seconds from the clip start):", *(lines or ["(no speech)"]),
+        f"Loud moments: {', '.join(loud) or 'none'}", f"Scene cuts: {', '.join(cuts) or 'none'}",
+        f"Current edit settings: {json.dumps(edit)}",
+        "Asset library (id | kind | name | tags | length) — built-in sound effects have ids starting sfx-:", *(lib or ["(empty)"]),
+        *([f"Creator's style guidance:\n{guide}"] if guide else []), *([f"Creator's taste:\n{taste}"] if taste else [])])
+
+
+def _plan_patch(item, clip: dict) -> dict:
+    """One plan item -> its validated patch (HTTPException when Claude proposed something invalid, e.g. a made-up asset)."""
+    sub = getattr(item, item.kind)
+    raw = sub.model_dump(exclude_none=True) if sub else {}
+    if item.kind == "overlay":
+        return _overlays([raw], clip)[0] if raw else {}
+    if item.kind == "track":
+        out = {"mode": track_request({"mode": raw["mode"]}, clip)[0]} if raw.get("mode") else {}
+        fr = _framing({k: raw[k] for k in ("offset_y", "zoom") if k in raw})
+        return {**out, **({"framing": fr} if fr else {})}
+    return clean_edit(raw, clip)  # edit / captions: exactly what PATCH would accept
+
+
+@app.post("/api/clips/{cid}/plan")
+def plan_clip(cid: str, body: dict | None = None):
+    clip = _404(store.get("clip", cid))
+    prompt = str((body or {}).get("prompt") or "")[:2000]
+    plan = ai.plan(_plan_context(clip, store.get("project", clip["project_id"]), assets.listing()), prompt)
+    items, dropped = [], 0
+    for it in plan.items:
+        try:
+            patch = _plan_patch(it, clip)
+        except HTTPException:
+            patch = None
+        if not patch:
+            dropped += 1
+            continue
+        items.append({"id": store.new_id(), "kind": it.kind, "title": it.title[:120], "why": it.why[:400], "patch": patch})
+    doc = store.put("plan", {"clip_id": cid, "prompt": prompt, "summary": plan.summary, "items": items, "dropped": dropped})
+    return {"plan_id": doc["id"], "summary": plan.summary, "items": items, "dropped": dropped}
+
+
+@app.post("/api/clips/{cid}/apply")
+def apply_plan(cid: str, body: dict):
+    clip = _editable(cid)
+    plan = store.get("plan", str(body.get("plan_id") or ""))
+    if not plan or plan["clip_id"] != cid:
+        raise HTTPException(404, "Plan not found for this clip.")
+    picked = set(body.get("item_ids") or [])
+    edit, overlays, mode = {}, [], None
+    for it in plan["items"]:
+        if it["id"] not in picked:
+            continue
+        if it["kind"] == "overlay":
+            overlays.append(it["patch"])
+        elif it["kind"] == "track":
+            mode = it["patch"].get("mode") or mode
+            if "framing" in it["patch"]:
+                edit["framing"] = {**edit.get("framing", {}), **it["patch"]["framing"]}
+        else:
+            edit.update(it["patch"])
+    if overlays:  # added to the clip's overlays, never replacing them
+        edit["overlays"] = (clip["edit"].get("overlays") or []) + overlays
+    if edit:
+        patch_clip(cid, {"edit": edit})  # the same validation as a manual edit
+    if mode:
+        track_clip(cid, {"mode": mode})
+    return store.get("clip", cid)
+
+
+# ---------- media library ----------
+
+@app.get("/api/assets")
+def list_assets():
+    return assets.listing()
+
+
+@app.post("/api/assets")
+def upload_asset(file: UploadFile = File(...), name: str = Form(""), tags: str = Form("")):
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in assets.KINDS:
+        raise HTTPException(400, f"Unsupported file type {ext or '(none)'} — use {', '.join(sorted(assets.KINDS))}.")
+    tmp = assets.ASSETS / f".upload-{store.new_id()}{ext}"
+    try:
+        size = 0
+        with open(tmp, "wb") as f:
+            while chunk := file.file.read(1 << 20):
+                size += len(chunk)
+                if size > assets.MAX_BYTES:
+                    raise HTTPException(413, "That file is over 200 MB.")
+                f.write(chunk)
+        return assets.add(tmp, file.filename, name, tags.split(","))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@app.get("/api/fonts")
+def list_fonts():
+    return assets.fonts()
+
+
+@app.delete("/api/assets/{aid}")
+def delete_asset(aid: str):
+    try:
+        assets.remove(aid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
 @app.post("/api/clips/{cid}/music")
 def music(cid: str, file: UploadFile = File(...)):
     clip = _404(store.get("clip", cid))
@@ -294,10 +698,11 @@ def music(cid: str, file: UploadFile = File(...)):
 
 @app.post("/api/clips/{cid}/assist")
 def assist(cid: str, body: dict):
-    clip = _404(store.get("clip", cid))
+    clip = _editable(cid)
     p = store.get("project", clip["project_id"])
     segs = pipeline.load_json(p["id"], "transcript.json", {"segments": []})["segments"]
-    patch = ai.assist(body.get("instruction", ""), clip, clip["edit"], segs, p["meta"]["duration"])
+    edit = {k: v for k, v in clip["edit"].items() if k not in ("track", "words", "overlays")}  # bulky lists it can't edit
+    patch = ai.assist(body.get("instruction", ""), clip, edit, segs, p["meta"]["duration"])
     explanation = patch.pop("explanation", "")
     update = {k: patch.pop(k) for k in ("start", "end") if k in patch}
     if patch:
@@ -346,6 +751,61 @@ def cancel_upload(uid: str):
     else:
         store.update("upload", uid, {"status": "canceled"})
     return {"ok": True}
+
+
+@app.patch("/api/uploads/{uid}")
+def move_upload(uid: str, body: dict):
+    """Schedule tab: change a post's time (null = post as soon as possible) and/or platform."""
+    _404(store.get("upload", uid))
+    return pipeline.reschedule(uid, body["when"] if "when" in body else "keep", body.get("platform"))
+
+
+# ---------- schedule ----------
+
+@app.get("/api/schedule")
+def schedule_view():
+    clips = {c["id"]: c for c in store.find("clip")}
+    items = []
+    for u in store.find("upload"):
+        if u.get("status") in ("canceled",) or (u.get("status") == "done" and not (u.get("publish_at") and not pipeline._due({"upload_at": u["publish_at"]}))):
+            continue  # already out (a YouTube post still waiting for its publish time stays visible and movable)
+        c = clips.get(u["clip_id"]) or {}
+        exp = c.get("export") or {}
+        items.append({"id": u["id"], "platform": u.get("platform", "youtube"), "status": u["status"], "auto": bool(u.get("auto")),
+                      "when": u.get("publish_at") or u.get("upload_at"), "title": u.get("title") or c.get("title"),
+                      "error": u.get("error", ""), "clip_id": u["clip_id"], "project_id": u.get("project_id"),
+                      "cover": f"/files/{u.get('project_id')}/{exp['cover']}" if exp.get("cover") else None,
+                      "category_id": u.get("category_id"), "privacy": u.get("privacy")})
+    return {"items": items, "heat": schedule.heat(), "paused": pipeline.paused(), "connected": {p: platforms.connected(p) for p in platforms.PLATFORMS}}
+
+
+@app.post("/api/schedule/suggest")
+def suggest_time(body: dict):
+    platform = body.get("platform", "youtube")
+    if platform not in platforms.PLATFORMS:
+        raise HTTPException(400, "Unknown platform.")
+    taken = [t for t in schedule.scheduled_times(platform) if t != body.get("current")]
+    times = schedule.suggest(platform, max(1, min(int(body.get("n", 1)), 20)), category=body.get("category_id"), taken=taken)
+    return {"times": times, "source": schedule.slot_scores(platform)[1]}
+
+
+@app.put("/api/autopilot")
+def autopilot_switch(body: dict):
+    """The one-click Autopilot pause: stops new scheduling everywhere and holds Autopilot's queued posts."""
+    config.save({"autopilot_paused": bool(body.get("paused"))})
+    log.event("autopilot", "paused" if body.get("paused") else "resumed")
+    if not body.get("paused"):
+        pipeline._scheduler_tick()  # release held posts now rather than within 15 s
+    held = len(store.find("upload", status="held"))
+    return {"paused": pipeline.paused(), "held": held}
+
+
+@app.get("/api/tiktok/creator")
+def tiktok_creator():
+    try:
+        return platforms.tiktok_creator()
+    except platforms.AuthError as e:
+        raise HTTPException(401, str(e))
 
 
 @app.post("/api/uploads/{uid}/retry")
@@ -548,9 +1008,9 @@ def tiktok_callback(code: str = "", state: str = "", error: str = "", error_desc
 
 @app.put("/api/connections/instagram")
 def instagram(body: dict):
-    if not body.get("access_token") or not body.get("ig_user_id"):
-        raise HTTPException(400, "Enter the access token and your Instagram professional account ID.")
-    platforms.instagram_set(body["access_token"], body["ig_user_id"])
+    if not body.get("access_token"):
+        raise HTTPException(400, "Paste your Instagram access token.")
+    platforms.instagram_set(body["access_token"], body.get("ig_user_id") or "")
     pipeline.requeue_needs_auth()
     return connections()
 
@@ -725,4 +1185,5 @@ def relay_script():
 
 
 app.mount("/files", StaticFiles(directory=PROJECTS), name="files")
+app.mount("/assets", StaticFiles(directory=assets.ASSETS), name="assets")  # read-only files; no listing
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="ui")

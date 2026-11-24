@@ -5,8 +5,21 @@ from datetime import datetime, timedelta, timezone
 
 from .config import YT_SECRET, YT_TOKEN
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload",     # upload videos, set thumbnails
+          "https://www.googleapis.com/auth/youtube.readonly",   # channel name, view counts
+          "https://www.googleapis.com/auth/youtube.force-ssl"]  # move a scheduled video's publish time (videos.update)
 _state = {"connecting": False, "error": "", "channel": None}
+
+
+def missing_scopes() -> list[str]:
+    """Permissions added in newer versions that this sign-in hasn't granted yet (fixed by reconnecting)."""
+    import json
+
+    try:
+        granted = set(json.loads(YT_TOKEN.read_text("utf-8")).get("scopes") or [])
+    except (FileNotFoundError, ValueError):
+        return []
+    return [s for s in SCOPES if granted and s not in granted]
 
 
 def _creds():
@@ -15,7 +28,9 @@ def _creds():
 
     if not YT_TOKEN.exists():
         return None
-    creds = Credentials.from_authorized_user_file(str(YT_TOKEN), SCOPES)
+    # the scopes this sign-in actually granted (stored in the token): forcing today's longer list on an older token
+    # would make Google refuse the refresh and break all uploads until reconnecting
+    creds = Credentials.from_authorized_user_file(str(YT_TOKEN))
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
         YT_TOKEN.write_text(creds.to_json(), "utf-8")
@@ -48,8 +63,10 @@ def status() -> dict:
                                      "subscribers": st.get("subscriberCount"), "videos": st.get("videoCount")}
         except Exception as e:
             _state["error"] = str(e)
+    missing = missing_scopes() if connected else []
     return {"has_secret": YT_SECRET.exists(), "connected": connected, "connecting": _state["connecting"],
-            "error": _state["error"], "channel": _state["channel"] if connected else None}
+            "error": _state["error"], "channel": _state["channel"] if connected else None,
+            "needs_reconnect": bool(missing), "missing_scopes": missing}
 
 
 def connect(on_connected=None) -> None:
@@ -92,6 +109,24 @@ def effective_publish_at(publish_at: str | None) -> str | None:
     if t <= datetime.now(timezone.utc) + timedelta(minutes=10):
         return None
     return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def set_publish_at(video_id: str, iso: str) -> str:
+    """Move the publish time of an uploaded, still-private scheduled video."""
+    pub = effective_publish_at(iso)
+    if not pub:
+        raise RuntimeError("Pick a time at least a few minutes in the future.")
+    if "https://www.googleapis.com/auth/youtube.force-ssl" in missing_scopes():
+        raise RuntimeError("Moving an already-uploaded YouTube video needs one more permission: reconnect YouTube on the "
+                           "Publish page (Disconnect, then Sign in) and approve it.")
+    svc = _service()  # send the whole existing status: a partial update resets fields like made-for-kids
+    items = svc.videos().list(part="status", id=video_id).execute().get("items") or []
+    if not items:
+        raise RuntimeError("That video is no longer on YouTube.")
+    keep = ("embeddable", "license", "publicStatsViewable", "selfDeclaredMadeForKids", "containsSyntheticMedia")
+    status = {k: v for k, v in items[0]["status"].items() if k in keep}
+    svc.videos().update(part="status", body={"id": video_id, "status": {**status, "privacyStatus": "private", "publishAt": pub}}).execute()
+    return pub
 
 
 def set_thumbnail(video_id: str, image) -> None:
