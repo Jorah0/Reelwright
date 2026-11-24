@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Reelwright">
+  <defs>
+    <linearGradient id="rw-g" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#FF3D6E"/>
+      <stop offset="0.55" stop-color="#FF7A3D"/>
+      <stop offset="1" stop-color="#FFC247"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="#111218"/>
+  <!-- a film reel with a wedge cut out: the "clip" -->
+  <path d="M32 32 L49.32 22 A20 20 0 1 1 32 12 Z" fill="url(#rw-g)"/>
+  <circle cx="41.5" cy="37.5" r="3.4" fill="#111218"/>
+  <circle cx="30.1" cy="43" r="3.4" fill="#111218"/>
+  <circle cx="21.2" cy="35.8" r="3.4" fill="#111218"/>
+  <circle cx="22.5" cy="24.5" r="3.4" fill="#111218"/>
+  <path d="M29 27.2 L37.4 32 L29 36.8 Z" fill="#111218"/>
+  <!-- the cut: a blade spark flying out of the wedge -->
+  <path d="M37 22.5 L50.5 9.5" stroke="url(#rw-g)" stroke-width="3.2" stroke-linecap="round"/>
+  <circle cx="53.2" cy="7" r="2" fill="#FFC247"/>
+</svg>

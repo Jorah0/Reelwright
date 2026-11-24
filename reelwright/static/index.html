@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reelwright</title>
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <aside class="side">
+    <a class="brand" href="#/library" title="Reelwright"><img src="logo.svg" alt=""><span>Reel<b>wright</b></span></a>
+    <nav>
+      <a href="#/library" data-nav="library" title="Library"><i>▦</i><span>Library</span></a>
+      <a href="#/editor" data-nav="editor" id="nav-editor" hidden title="Editor"><i>✂</i><span>Editor</span></a>
+      <a href="#/sources" data-nav="sources" title="Channels"><i>◉</i><span>Channels</span></a>
+      <a href="#/obs" data-nav="obs" title="OBS link"><i>⏺</i><span>OBS link</span></a>
+      <a href="#/lab" data-nav="lab" title="Virality Lab"><i>✦</i><span>Virality Lab</span></a>
+      <a href="#/publish" data-nav="publish" title="Publish"><i>⇪</i><span>Publish</span></a>
+      <a href="#/jobs" data-nav="jobs" title="Activity"><i>⚙</i><span>Activity</span> <b class="badge" id="jobs-badge" hidden></b></a>
+      <a href="#/settings" data-nav="settings" title="Settings"><i>☰</i><span>Settings</span></a>
+    </nav>
+    <div class="side-foot" id="side-status"></div>
+  </aside>
+  <main id="view"></main>
+  <div id="modal-root"></div>
+  <div id="toasts"></div>
+  <script src="app.js"></script>
+</body>
+</html>

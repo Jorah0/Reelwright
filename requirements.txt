@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+python-multipart
+anthropic
+faster-whisper
+numpy
+opencv-python-headless
+yt-dlp
+httpx
+websockets  # OBS link (obs-websocket v5)
+google-api-python-client
+google-auth-oauthlib
+pywebview
+# build / test only
+pyinstaller
+pillow
+pytest
