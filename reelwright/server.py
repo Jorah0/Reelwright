@@ -530,6 +530,51 @@ def _headline(v) -> dict | None:
     if "seconds" in v:
         out["seconds"] = round(_num(v["seconds"], "Headline seconds", 0.5, 30), 2)
     return out
+
+
+CARD_ENUMS = {"style": tuple(media.BADGE_THEMES), "platform": ("", *media.CARD_PLATFORMS), "show": media.HEADLINE_SHOW,
+              "position": media.CARD_POSITIONS, "anim": media.CARD_ANIMS}
+CARD_NUMS = {"seconds": (0.5, 30), "x": (0, 1), "y": (0, 1), "scale": (0.5, 2)}
+
+
+def _streamer_card(v) -> dict | None:
+    """The streamer card: only the keys given (patch_clip merges them), each checked. None clears it."""
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise HTTPException(400, "streamer_card must be an object.")
+    out = {}
+    for k in ("name", "handle", "category"):
+        if k in v:
+            s = v[k] if isinstance(v[k], str) else None
+            s = s.strip().lstrip("@") if s is not None and k == "handle" else s and s.strip()
+            if s is None or len(s) > media.CARD_TEXT_MAX or (k == "handle" and not re.fullmatch(r"[\w.\-]*", s)):
+                raise HTTPException(400, f"Streamer card {k} must be text of at most {media.CARD_TEXT_MAX} characters"
+                                         + (" (letters, digits, _ . -)." if k == "handle" else "."))
+            out[k] = s
+    for k, opts in CARD_ENUMS.items():
+        if k in v:
+            if v[k] not in opts:
+                raise HTTPException(400, f"Streamer card {k} must be one of {', '.join(o or '(style)' for o in opts)}.")
+            out[k] = v[k]
+    for k, (lo, hi) in CARD_NUMS.items():
+        if k in v:
+            out[k] = round(_num(v[k], f"Streamer card {k}", lo, hi), 4)
+    if "on" in v:
+        out["on"] = bool(v["on"])
+    if "accent" in v:
+        if v["accent"] is not None and not (isinstance(v["accent"], str) and re.fullmatch(r"#[0-9a-fA-F]{6}", v["accent"])):
+            raise HTTPException(400, "Streamer card accent must be a #RRGGBB colour.")
+        out["accent"] = v["accent"] and v["accent"].upper()
+    if "avatar_asset_id" in v:
+        aid = v["avatar_asset_id"] or None
+        a = store.get("asset", str(aid)) if aid else None
+        if aid and (not a or a.get("kind") != "image"):
+            raise HTTPException(400, "The avatar must be an image in the media library.")
+        out["avatar_asset_id"] = a and a["id"]
+    return out
+
+
 OVERLAY_KINDS = ("image", "gif", "video", "sound", "text", "emoji")
 OVERLAY_ANIMS = ("none", "pop", "fade", "shake", "slide")
 
@@ -594,6 +639,61 @@ def _overlays(v, clip: dict) -> list | None:
     return out
 
 
+EFFECT_KEYS = {"zoom": ((1, 4), (0, 1), (0, 1)), "opacity": ((0, 1),)}  # per key after t: (lo, hi) of each value
+
+
+def _effects(v, clip: dict) -> list | None:
+    """Timeline effects (≤ 60), clip time like overlays: zoom {x, y, keys [[t, zoom, x?, y?]]} (punch-in / pan, keyed),
+    opacity {keys [[t, 0..1]]} (dip to black), blur {amount 1..40}. Key t is from the effect's start, clamped into it."""
+    if v is None or v == []:
+        return None
+    if not isinstance(v, list) or len(v) > 60:
+        raise HTTPException(400, "effects must be a list of up to 60 effects.")
+    length, out = clip["end"] - clip["start"], []
+    for fx in v:
+        if not isinstance(fx, dict) or fx.get("kind") not in ("zoom", "opacity", "blur"):
+            raise HTTPException(400, "Each effect needs a kind: zoom, opacity or blur.")
+        kind, t = fx["kind"], _num(fx.get("t", 0), "effect t", -1e9, 1e9)
+        d = _num(fx.get("d", 0), "effect d", -1e9, 1e9)
+        if not 0 <= t < length or d <= 0:
+            raise HTTPException(400, "An effect must start inside the clip and last longer than 0 s.")
+        d = min(d, length - t)
+        e2 = {"id": str(fx.get("id") or store.new_id())[:40], "kind": kind, "t": round(t, 3), "d": round(d, 3)}
+        if kind == "blur":
+            e2["amount"] = int(_num(fx.get("amount", 10), "blur amount", 1, 40))
+        else:
+            keys = fx.get("keys")
+            if not isinstance(keys, list) or not 1 <= len(keys) <= 32:
+                raise HTTPException(400, f"A {kind} effect needs 1 to 32 keyframes.")
+            if kind == "zoom":
+                e2["x"], e2["y"] = (round(_num(fx.get(k, 0.5), f"zoom {k}", 0, 1), 4) for k in ("x", "y"))
+            ranges, ks = EFFECT_KEYS[kind], []
+            for kf in keys:
+                if not isinstance(kf, (list, tuple)) or not 2 <= len(kf) <= 1 + len(ranges):
+                    raise HTTPException(400, f"Each {kind} keyframe is [t, {', '.join(['zoom', 'x', 'y'] if kind == 'zoom' else ['opacity'])}].")
+                vals = [*kf[1:], *(e2["x"], e2["y"])[len(kf) - 2:]] if kind == "zoom" else list(kf[1:])
+                ks.append([round(_num(kf[0], "keyframe t", 0, d), 3),
+                           *(round(_num(x, f"{kind} keyframe", lo, hi), 4) for x, (lo, hi) in zip(vals, ranges))])
+            e2["keys"] = sorted(ks, key=lambda k: k[0])
+        out.append(e2)
+    return out
+
+
+def _markers(v, clip: dict) -> list | None:
+    """Timeline markers (≤ 200) {t (clip time, clamped), label ≤ 60}: notes for the editor and the NLE export, not the render."""
+    if v is None or v == []:
+        return None
+    if not isinstance(v, list) or len(v) > 200:
+        raise HTTPException(400, "markers must be a list of up to 200 {t, label}.")
+    out = []
+    for m in v:
+        if not isinstance(m, dict):
+            raise HTTPException(400, "Each marker must be {t, label}.")
+        out.append({"t": round(_num(m.get("t"), "marker t", 0, clip["end"] - clip["start"]), 3),
+                    "label": str(m.get("label") or "").strip()[:60] or "Marker"})
+    return sorted(out, key=lambda m: m["t"])
+
+
 def _words(v, clip: dict) -> list | None:
     """Caption words override: up to 2000 {s, e, w} with s ≤ e inside the clip (absolute source seconds), w ≤ 40 chars."""
     if v is None or v == []:
@@ -651,6 +751,9 @@ def clean_edit(edit: dict, clip: dict) -> dict:
         if k == "cuts":  # text-based cuts (WP5): [[s, e], …] source seconds the render removes (pipeline.clip_keeps)
             out[k] = _cuts(v, clip)
             continue
+        if k in ("effects", "markers"):  # the timeline's effect items and markers (not in DEFAULT_EDIT, like cuts)
+            out[k] = (_effects if k == "effects" else _markers)(v, clip)
+            continue
         if k not in media.DEFAULT_EDIT:
             continue
         if k in TEXT_KEYS:
@@ -661,6 +764,8 @@ def clean_edit(edit: dict, clip: dict) -> dict:
             out[k] = _framing(v)
         elif k == "headline":
             out[k] = _headline(v)
+        elif k == "streamer_card":
+            out[k] = _streamer_card(v)
         elif k == "regions":
             out[k] = _regions(v, angle_ids(store.get("project", clip.get("project_id") or "")))
         elif k == "overlays":
@@ -733,6 +838,8 @@ def patch_clip(cid: str, body: dict):
                 ed["framing"] = {**(c["edit"].get("framing") or {}), **ed["framing"]}
             if ed.get("headline"):  # partial headline updates (just the theme, just the text…) keep the rest
                 ed["headline"] = {**(c["edit"].get("headline") or {}), **ed["headline"]}
+            if ed.get("streamer_card"):  # likewise the streamer card
+                ed["streamer_card"] = {**(c["edit"].get("streamer_card") or {}), **ed["streamer_card"]}
             c["edit"] = {**c["edit"], **ed}
             changed = True
         for k in ("title", "hook"):
@@ -903,6 +1010,31 @@ def save_headline_default(cid: str, body: dict):
     store.put("pref", {"id": "headline", "edit": {"headline": look, **{f"headline_{f}": e[f"headline_{f}"] for f in TEXT_FIELDS
                                                                        if e[f"headline_{f}"] is not None}}})
     return {"ok": True, "on": True}
+
+
+# ---------- streamer card / platform badges ----------
+
+@app.get("/api/streamer/badges")
+def streamer_badges():
+    """The badge styles, the platform names, the creator's saved card ({card, auto}) and the app UI safe zone it avoids."""
+    return {"badges": media.BADGE_THEMES, "platforms": media.PLATFORM_NAMES, "default": media.CARD_DEFAULT,
+            "saved": store.get("pref", "streamer_card"), "safe": media.CARD_SAFE}
+
+
+@app.get("/api/clips/{cid}/streamer/guess")
+def streamer_guess(cid: str):
+    """Platform, handle and display name from the project's source link / channel, a connected source or a linked account."""
+    clip = _404(store.get("clip", cid))
+    return pipeline.streamer_guess(store.get("project", clip["project_id"]) or {})
+
+
+@app.post("/api/clips/{cid}/streamer/save")
+def save_streamer_card(cid: str, body: dict):
+    """This clip's card saved as "my streamer card"; {"auto": true} also puts it on new clips (manual, AI and autopilot)."""
+    card = {**media.CARD_DEFAULT, **(_404(store.get("clip", cid))["edit"].get("streamer_card") or {})}
+    card.pop("on")
+    saved = store.put("pref", {"id": "streamer_card", "card": card, "auto": bool(body.get("auto"))})
+    return saved
 
 
 def _track_jobs(cid: str) -> list[dict]:
@@ -1333,6 +1465,22 @@ def retry(uid: str):
 @app.get("/api/jobs")
 def jobs():
     return store.find("job")[:80]
+
+
+CANCELABLE = {"export", "find", "virality", "research", "results", "track"}  # no other doc waits on these jobs' status
+
+
+@app.post("/api/jobs/{jid}/cancel")
+def cancel_job(jid: str):
+    """The status indicator's ✕: a queued job is dropped before it starts (_run_job skips canceled jobs). Running jobs
+    can't be stopped mid-way; imports, analyses and posts are canceled where they live (their project / the Schedule)."""
+    if _404(store.get("job", jid))["kind"] not in CANCELABLE:
+        raise HTTPException(409, "This kind of job can't be canceled here.")
+    hit = []
+    store.update("job", jid, fn=lambda j: j["status"] == "queued" and (hit.append(1), j.update(status="canceled", message="Canceled")))
+    if not hit:
+        raise HTTPException(409, "Only a queued job can be canceled: this one is already running or finished.")
+    return {"ok": True}
 
 
 @app.get("/api/reports")

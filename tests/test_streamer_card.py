@@ -81,7 +81,8 @@ def _proj(**kw):
     return store.get("project", p["id"])
 
 
-def test_autofill_reads_twitch_kick_and_youtube_sources():
+def test_autofill_reads_twitch_kick_and_youtube_sources(monkeypatch):
+    monkeypatch.setattr(pipeline.accounts, "all_accounts", lambda platform=None: [])
     g = pipeline.streamer_guess(_proj(source_url="https://www.twitch.tv/videos/2001", source_info={"channel": "NightOwl"}))
     assert g == {"platform": "twitch", "handle": "nightowl", "name": "NightOwl"}
     g = pipeline.streamer_guess(_proj(source_url="https://kick.com/trainwreck/videos/abc-1", source_info={"channel": "Trainwreck"}))
@@ -95,6 +96,8 @@ def test_autofill_reads_twitch_kick_and_youtube_sources():
     finally:
         store.delete("source", src["id"])
     assert pipeline.streamer_guess(_proj()) == {}
+    monkeypatch.setattr(pipeline.accounts, "all_accounts", lambda platform=None: [{"platform": "youtube", "handle": "@me", "name": "Me"}])
+    assert pipeline.streamer_guess(_proj()) == {"platform": "youtube", "handle": "me", "name": "Me"}
 
 
 # ---------- validation ----------
@@ -226,7 +229,7 @@ def test_saved_card_goes_on_new_clips():
 
 def _pixel(path, t, x, y):
     raw = subprocess.run([media.FFMPEG, "-v", "error", "-ss", str(t), "-i", str(path), "-frames:v", "1",
-                          "-vf", f"crop=1:1:{x}:{y}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
+                          "-vf", f"crop=2:2:{x - x % 2}:{y - y % 2},format=rgb24", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
     return tuple(raw[:3])
 
 

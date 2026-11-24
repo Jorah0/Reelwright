@@ -33,7 +33,7 @@ def _margin_v(ass: str, style: str) -> int:
 # ---------- themes ----------
 
 def test_themes_are_complete_and_use_only_bundled_fonts():
-    assert len(media.HEADLINE_THEMES) == 10
+    assert len(media.HEADLINE_THEMES) == 13  # 10 looks + Twitch, Kick and YouTube colour schemes
     for tid, th in media.HEADLINE_THEMES.items():
         assert media.HEADLINE_THEME_KEYS <= th.keys(), tid
         assert th["font"] in media.HEADLINE_FONTS and th["kicker_font"] in media.HEADLINE_FONTS, tid

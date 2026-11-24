@@ -116,8 +116,9 @@ def safe_zones(clip: dict, W: int, H: int) -> list[dict]:
     proj = store.get("project", clip.get("project_id") or "") or {}
     hl = media.headline_spec(e, (proj.get("video_type") or {}).get("type"),
                              (store.get("pref", "headline_theme") or {}).get("theme")) if e.get("headline") else None
+    card = media.card_spec(e)
     ass = media.build_ass([], 0, 1, 1, (W, H), e["title_text"], True, "#FFD400", False, e["caption_style"], e["caption_pos"],
-                          e["sticker_text"], e["sticker_pos"], None, media.seam(e), text_style=e, headline=hl)
+                          e["sticker_text"], e["sticker_pos"], None, media.seam(e), text_style=e, headline=hl, card=card)
     st = {f[0][7:]: f for f in (line.split(",") for line in ass.splitlines() if line.startswith("Style: "))}
     boxes = ([("Captions", *_span(st["Cap"], 2, H))] if e["captions"] else []) + \
         ([("The title card", *_span(st["Title"], 1, H))] if str(e["title_text"]).strip() else []) + \
@@ -132,6 +133,11 @@ def safe_zones(clip: dict, W: int, H: int) -> list[dict]:
                 where = "top bar" if y0 < z["top"] * H else "caption and buttons at the bottom"
                 out.append(_issue("safe_zone", "warn", f"{what} sits under {NAMES[plat]}'s {where}",
                                   "Move it (position) and check with Studio's safe-zone overlay.", plat))
+        if card:  # the card isn't full width: the button column on the right counts too
+            x, y, w, h = media.card_place(card, W, H, hl, media.seam(e), ass)["rect"]
+            if y < z["top"] * H or y + h > (1 - z["bottom"]) * H or (x + w > (1 - z["right"]) * W and y + h > 0.4 * H):
+                out.append(_issue("safe_zone", "warn", f"The streamer card sits under {NAMES[plat]}'s UI",
+                                  "Move it (a corner spot stays clear) and check with Studio's safe-zone overlay.", plat))
     return out
 
 

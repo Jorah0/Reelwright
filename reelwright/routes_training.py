@@ -36,6 +36,16 @@ def status():
                                                "training_tolerance", "training_target")}}
 
 
+@router.get("/api/training/active")
+def active():
+    """Queued, running or paused training jobs, slim: the status indicator's one extra request per poll (status() is heavy)."""
+    def prog(j):
+        step, total = (j.get("last") or {}).get("step"), ((j.get("spec") or {}).get("train") or {}).get("max_steps")
+        return round(min(step / total, 1.0), 3) if step and total else None
+    return [{"id": j["id"], "kind": j["kind"], "status": j["status"], "message": j.get("message") or "", "progress": prog(j)}
+            for j in store.find("train_job")[:20] if j.get("status") in ("queued", "running", "paused")]
+
+
 @router.get("/api/training/profile")
 def profile():
     """This PC's training profile (another Reelwright that targets this one checks its fit against it)."""

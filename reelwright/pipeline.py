@@ -661,6 +661,41 @@ def default_layout(proj: dict | None) -> dict:
     return lay
 
 
+STREAM_HOSTS = {"twitch.tv": "twitch", "kick.com": "kick", "youtube.com": "youtube", "youtu.be": "youtube"}
+_NOT_HANDLES = {"videos", "video", "clip", "clips", "watch", "live", "shorts", "embed", "channel", "c", "user", "directory", "popout"}
+
+
+def streamer_guess(proj: dict) -> dict:
+    """{platform, handle, name} for the streamer card, from what the project knows: the connected channel it came from,
+    its link (twitch.tv/<h>, kick.com/<h>, youtube.com/@<h>), the downloader's channel name, else a linked account of
+    that platform. Only what was found; {} for a plain local file."""
+    from urllib.parse import urlparse
+
+    o, info = proj.get("origin") or {}, proj.get("source_info") or {}
+    src = store.get("source", o.get("source_id") or "") if o.get("source_id") else None
+    out: dict = {}
+    if src and src.get("platform") in media.CARD_PLATFORMS:
+        out = {"platform": src["platform"], "handle": str(src.get("handle") or "").lstrip("@").strip()}
+    url = proj.get("source_url") or o.get("url") or ""
+    u = urlparse(url if "//" in url else f"https://{url}") if url else None
+    host = (u.hostname or "").removeprefix("www.").removeprefix("m.") if u else ""
+    plat = next((p for h, p in STREAM_HOSTS.items() if host == h or host.endswith("." + h)), None)
+    if plat and not out:
+        first = next((s for s in (u.path or "").split("/") if s), "")
+        h = first[1:] if plat == "youtube" and first.startswith("@") else first if plat != "youtube" else ""
+        out = {"platform": plat, **({"handle": h} if h and h.lower() not in _NOT_HANDLES else {})}
+    name = str(info.get("channel") or "").strip()[:media.CARD_TEXT_MAX]
+    if name:
+        out["name"] = name
+        if out.get("platform") in ("twitch", "kick") and not out.get("handle") and name.replace("_", "").isalnum():
+            out["handle"] = name.lower()  # their channel names are the handle in another case
+    if not out.get("handle") and out.get("platform") in (None, "youtube"):  # a linked YouTube account (the one card platform
+        acc = next(iter(accounts.all_accounts("youtube")), None)              # accounts.py links)
+        if acc and (acc.get("handle") or acc.get("name")):
+            out = {"platform": "youtube", "handle": str(acc.get("handle") or "").lstrip("@"), "name": out.get("name") or acc.get("name")}
+    return {k: v for k, v in out.items() if v}
+
+
 def new_clip(pid: str, c: dict, source: str = "manual", query: str = "", parts: list | None = None) -> dict:
     s = config.load()
     proj = store.get("project", pid)
@@ -677,6 +712,10 @@ def new_clip(pid: str, c: dict, source: str = "manual", query: str = "", parts: 
     hl = (store.get("pref", "headline") or {}).get("edit")  # "headline on new clips": the saved look, this clip's hook as text
     if hl and (text := media.headline_text(c.get("hook") or c.get("title"))):
         edit.update(hl, headline={**hl.get("headline", {}), "on": True, "text": text})
+    sc = store.get("pref", "streamer_card") or {}
+    if sc.get("auto") and sc.get("card"):  # "streamer card on new clips": the saved card, empty fields from this source
+        guess = streamer_guess(proj or {})
+        edit["streamer_card"] = {**sc["card"], "on": True, **{k: v for k, v in guess.items() if not sc["card"].get(k)}}
     ai_pick = source in ("ai", "auto", "search")
     return store.put("clip", {
         "project_id": pid, "start": c["start"], "end": c["end"], "title": c.get("title") or "Untitled clip",
@@ -751,12 +790,13 @@ def _render_clip(clip: dict, prog) -> str:
     bleeps = media.bleep_spans(words, clip["start"], clip["end"], bad) if bad else None  # what was said, like filler cuts
     if bad:
         cap_words = media.censor(cap_words, bad)
-    if (e["captions"] and cap_words) or e["title_text"] or e["sticker_text"] or texts or headline:
+    card = card_of(e)
+    if (e["captions"] and cap_words) or e["title_text"] or e["sticker_text"] or texts or headline or card:
         ass = media.build_ass(cap_words, clip["start"], clip["end"], float(e["speed"]), size, e["title_text"], s["caption_uppercase"],
                               s["caption_color"], bool(e["captions"]), e["caption_style"], e["caption_pos"], e["sticker_text"],
                               e["sticker_pos"], keeps, media.seam(e),
                               overlays=texts, text_style=e, headline=headline, anim=e["caption_anim"],
-                              emphasis=bool(e["caption_emphasis"]))
+                              emphasis=bool(e["caption_emphasis"]), card=card)
     music = (pdir(pid) / e["music"]).resolve() if e["music"] else None
     if music and (not music.is_file() or (pdir(pid) / "music").resolve() not in music.parents):
         music = None
@@ -764,8 +804,14 @@ def _render_clip(clip: dict, prog) -> str:
     rel = f"exports/{clip['id']}.mp4"
     media.render(src, pdir(pid) / rel, clip["start"], clip["end"], e, proj["meta"], ass, prog, keeps, music,
                  placed, assets.uploaded_font_files(), headline=headline,
-                 angles=multicam.render_angles(pid, proj) if media.used_angles(e) else None, bleeps=bleeps)
+                 angles=multicam.render_angles(pid, proj) if media.used_angles(e) else None, bleeps=bleeps, card=card)
     return rel
+
+
+def card_of(e: dict) -> dict | None:
+    """The edit's streamer card for rendering, its avatar resolved to the library file (a deleted one: the lettered circle)."""
+    a = store.get("asset", str((e.get("streamer_card") or {}).get("avatar_asset_id") or "")) if e.get("streamer_card") else None
+    return media.card_spec(e, str(assets.path(a)) if a and a.get("kind") == "image" and assets.path(a).exists() else None)
 
 
 def _export(job):
