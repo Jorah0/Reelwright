@@ -20,9 +20,11 @@ PROJECTS.mkdir(parents=True, exist_ok=True)
 DEFAULTS = {
     "anthropic_api_key": "",
     "model": "claude-opus-5-5",
+    "visual_judge": True,       # the long-video judge pass also sees a few small frames per candidate (more tokens)
     "whisper_model": "large-v3-turbo",
     "whisper_device": "auto",  # auto | cuda | cpu
     "clip_min": 20,
+    "clip_target": 35,          # length clips aim for (0 = halfway between min and max); clip_max is a hard cap
     "clip_max": 60,
     "clip_count": 8,
     "default_aspect": "9:16",

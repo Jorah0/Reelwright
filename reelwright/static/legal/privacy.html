@@ -32,7 +32,7 @@ computer, and are sent only to the services you choose to connect, when you use 
 or the <code>data</code> folder when run from source):</p>
 <ul>
   <li><b>Your media and edits:</b> videos you import or receive from OBS, thumbnails, rendered clips, cover images, music you add,
-    transcripts (speech-to-text), detected audio, scene and chat signals, and your clip edits.</li>
+    transcripts (speech-to-text), detected audio, scene, on-screen activity and chat signals, and your clip edits.</li>
   <li><b>Settings and credentials:</b> your Anthropic API key, the OAuth tokens for the YouTube, TikTok and Instagram accounts you
     connect, OBS WebSocket passwords you enter, and the pairing token for receiving clips from other PCs. These are stored
     unencrypted in files that, by default, only your user account can read; protect your computer accordingly.</li>
@@ -44,7 +44,7 @@ or the <code>data</code> folder when run from source):</p>
   <li><b>Diagnostics:</b> a local event log (<code>events.log</code>, rotated at 2 MB) and a record of Claude API usage (token counts and
     estimated cost per feature, without prompt contents).</li>
 </ul>
-<p>Speech transcription (Whisper) and face detection run entirely on your computer. Reelwright contains no analytics,
+<p>Speech transcription (Whisper), on-screen activity analysis and face detection run entirely on your computer. Reelwright contains no analytics,
 advertising or tracking code and sends no usage data to us.</p>
 
 <h2>2. Information sent to third-party services</h2>
@@ -55,8 +55,10 @@ data under its own terms and privacy policy.</p>
   <tr><td><b>Anthropic (Claude AI)</b><br><a href="https://www.anthropic.com/legal/privacy">privacy policy</a></td>
     <td>Only if you add an Anthropic API key and use AI features (clip finding, search, Ask AI, titles and captions, virality analysis,
       style training, live research).</td>
-    <td>Transcript text and timing, audio, scene and chat signals, clip titles and edit settings, your style-profile notes and interview
-      answers, titles and view counts of reference videos, and examples from your learning memory. Video and audio files are not sent.
+    <td>Transcript text and timing, audio, scene, on-screen activity and chat signals, clip titles and edit settings, your style-profile
+      notes and interview answers, titles and view counts of reference videos, and examples from your learning memory. When ranking
+      clips from long videos with “Let Claude see a few small frames” on (Settings → Claude AI), a few small still images (about
+      4 per candidate clip, 384 px wide) are also sent. Video and audio files are not sent.
       Requests use your own API key and are governed by your agreement with Anthropic.</td></tr>
   <tr><td><b>Google / YouTube</b><br><a href="https://policies.google.com/privacy">privacy policy</a></td>
     <td>If you connect a YouTube channel.</td>

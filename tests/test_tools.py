@@ -194,3 +194,29 @@ def test_event_log_rotates_and_tails(tmp_path):
     lines = log.tail(5)
     assert len(lines) == 5 and "line 199" in lines[-1]
     assert (tmp_path / "events.log.1").exists()  # rotated instead of growing forever
+
+
+def test_project_paths_cannot_escape_the_projects_folder():
+    for bad in ("..", "../x", "a/b", "", ".", "..\\x"):
+        with pytest.raises(ValueError):
+            pipeline.pdir(bad)
+    assert pipeline.pdir("abc123def456").parent == pipeline.PROJECTS
+    from fastapi.testclient import TestClient
+    from reelwright.server import app
+    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    assert c.delete("/api/projects/%2E%2E").status_code in (400, 404)
+    from fastapi import HTTPException
+    from reelwright import server
+    with pytest.raises(HTTPException) as e:  # straight at the route: URL normalization can't hide the bad id
+        server.delete_project("..")
+    assert e.value.status_code == 404
+    assert pipeline.config.DATA.exists()
+
+
+def test_app_shell_loads_nothing_from_the_internet():
+    """Fonts/scripts/styles must be local: works offline and nothing phones home on launch."""
+    import re
+    from pathlib import Path
+    static = Path(media.__file__).parent / "static"
+    for name in ("index.html", "styles.css"):
+        assert not re.findall(r"https?://", (static / name).read_text("utf-8")), name

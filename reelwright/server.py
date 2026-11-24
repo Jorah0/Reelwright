@@ -72,6 +72,14 @@ def put_settings(patch: dict):
         raw = patch["ui_scale"] if isinstance(patch["ui_scale"], dict) else {}
         patch["ui_scale"] = {k: round(min(max(float(v), 0.6), 2.0), 2) for k, v in raw.items()
                              if k in UI_SCALE_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool) and v == v}
+    if {"clip_min", "clip_target", "clip_max"} & patch.keys():  # lengths must make a usable range (target 0 = auto)
+        cur = {**config.load(), **patch}
+        try:
+            lo, tg, hi = (float(cur[k]) for k in ("clip_min", "clip_target", "clip_max"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Clip lengths must be numbers.")
+        if not (3 <= lo < hi <= 900) or (tg and not lo <= tg <= hi):
+            raise HTTPException(400, "Clip lengths need min < max (3–900 s), with the target between them.")
     config.save(patch)
     return config.public()
 
@@ -127,6 +135,10 @@ def patch_project(pid: str, body: dict):
 
 @app.delete("/api/projects/{pid}")
 def delete_project(pid: str):
+    try:
+        pipeline.pdir(pid)
+    except ValueError:
+        raise HTTPException(404, "No such project")
     pipeline.delete_project(pid)
     return {"ok": True}
 
@@ -148,7 +160,9 @@ def _ready(pid: str) -> dict:
 @app.post("/api/projects/{pid}/find")
 def find(pid: str, body: dict):
     _ready(pid)
-    return pipeline.submit("find", project_id=pid, query=(body.get("query") or "").strip(), count=body.get("count"))
+    num = lambda k: body[k] if isinstance(body.get(k), (int, float)) and not isinstance(body[k], bool) and 3 <= body[k] <= 900 else None  # noqa: E731
+    return pipeline.submit("find", project_id=pid, query=(body.get("query") or "").strip(), count=body.get("count"),
+                           target=num("target"), max_len=num("max_len"))
 
 
 @app.post("/api/projects/{pid}/virality")

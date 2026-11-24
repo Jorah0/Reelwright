@@ -11,7 +11,8 @@ from collections import Counter
 
 import numpy as np
 
-FEATURES = ("length", "ai", "wps", "loud", "spikes", "cuts", "chat", "pos", "question", "lead")
+FEATURES = ("length", "ai", "wps", "loud", "spikes", "cuts", "chat", "pos", "question", "lead", "motion", "flashes", "face_share")
+NEUTRAL = {"motion": 1.0}  # value for a feature a lesson predates (same as a clip without that signal), so it isn't learned
 WH = {"what", "why", "how", "who", "when", "where", "which", "did", "have", "ever", "guess"}
 WHY_WEIGHT = {"rated": 1.0, "published": 0.6, "dismissed": 0.4}
 STYLE_KEYS = ("aspect", "fit", "layout", "caption_style", "caption_pos", "captions", "remove_silence", "loudnorm", "denoise")
@@ -60,6 +61,8 @@ def features(clip: dict, segments: list[dict], signals: dict, duration: float) -
     first = segs[0] if segs else None
     opener = first["text"].strip().lower() if first else ""
     question = bool(opener) and (opener.endswith("?") or opener.split(" ", 1)[0].strip(",.!?") in WH)
+    vis = signals.get("visual") or {}
+    on_cam = np.asarray(vis.get("face") or [], dtype=np.float32)[int(s):max(int(e), int(s) + 1)]  # per second
     return {
         "length": span / 60,
         "ai": (clip.get("score") or 0) / 100,
@@ -71,6 +74,9 @@ def features(clip: dict, segments: list[dict], signals: dict, duration: float) -
         "pos": s / max(duration, 1.0),
         "question": float(question),
         "lead": ((first["start"] - s) if first else span) / 5,
+        "motion": _rel(vis.get("motion"), s, e, 1),
+        "flashes": sum(s <= m["t"] < e for m in vis.get("spikes", []) if m.get("kind") == "flash") * 60 / span / 4,
+        "face_share": round(float(on_cam.mean()), 3) if on_cam.size else 0.0,
     }
 
 
@@ -88,7 +94,7 @@ def samples(feedback: list[dict]):
         v = num(f.get("views"))
         if f.get("why") == "published" and med is not None and v is not None:
             label, weight = (1.0 if v >= med else 0.0), 1.0
-        X.append([num(feats.get(k)) or 0.0 for k in FEATURES])
+        X.append([val if (val := num(feats.get(k))) is not None else NEUTRAL.get(k, 0.0) for k in FEATURES])
         y.append(label)
         w.append(weight)
     return np.asarray(X, dtype=np.float64).reshape(-1, len(FEATURES)), np.asarray(y), np.asarray(w)
@@ -125,7 +131,7 @@ def train(feedback: list[dict], folds: int = 5) -> dict | None:
 
 
 def predict(model: dict, feats: dict) -> float:
-    z = (np.asarray([float(feats.get(k, 0.0)) for k in FEATURES]) - np.asarray(model["mu"])) / np.asarray(model["sd"])
+    z = (np.asarray([float(feats.get(k, NEUTRAL.get(k, 0.0))) for k in FEATURES]) - np.asarray(model["mu"])) / np.asarray(model["sd"])
     return float(1 / (1 + np.exp(-np.clip(z @ np.asarray(model["w"]) + model["b"], -30, 30))))
 
 
@@ -192,7 +198,8 @@ def hints(feedback: list[dict], model: dict | None = None) -> str:
     if model and model["useful"]:
         names = {"loud": "loud/high-energy audio", "wps": "fast speech", "spikes": "energy spikes", "cuts": "frequent scene cuts",
                  "chat": "chat activity", "question": "opening with a question", "lead": "a slow start before speech",
-                 "length": "longer clips", "pos": "moments late in the video", "ai": "your own high scores"}
+                 "length": "longer clips", "pos": "moments late in the video", "ai": "your own high scores",
+                 "motion": "lots of on-screen action", "flashes": "on-screen flashes", "face_share": "the streamer on camera"}
         top = sorted(model["weights"].items(), key=lambda kv: -abs(kv[1]))[:3]
         out.append("Learned from their feedback: they favour " + "; ".join(
             f"{'more' if v > 0 else 'less'} {names.get(k, k)}" for k, v in top) + ".")

@@ -1,6 +1,7 @@
 """AI layer: Whisper transcription, Claude-powered clip finding / search / edit assistant / YouTube metadata."""
 from __future__ import annotations
 
+import base64
 import math
 import threading
 from typing import Literal, Optional
@@ -9,7 +10,7 @@ import anthropic
 import numpy as np
 from pydantic import BaseModel, Field
 
-from . import config, usage
+from . import config, log, usage
 
 # ---------- transcription (faster-whisper, GPU when available) ----------
 
@@ -79,9 +80,10 @@ def transcribe(path, duration: float, progress=None) -> dict:
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-fable-5-1"}
 
 
-def _ask(system: str, user: str | tuple[str, str], schema: type[BaseModel], effort: str = "high") -> BaseModel:
+def _ask(system: str, user: str | list | tuple[str, str | list], schema: type[BaseModel], effort: str = "high") -> BaseModel:
     """One structured Claude call. Pass user as (context, task) to cache the context: repeated searches or analyses
-    of the same video then re-read the transcript from cache (~10% of the price, faster). Keep volatile text in task."""
+    of the same video then re-read the transcript from cache (~10% of the price, faster). Keep volatile text in task.
+    user (or task) may also be a list of content blocks, e.g. text interleaved with image blocks."""
     key = config.api_key()
     if not key:
         raise RuntimeError("Add your Anthropic API key in Settings to use Claude-powered features.")
@@ -89,7 +91,8 @@ def _ask(system: str, user: str | tuple[str, str], schema: type[BaseModel], effo
     client = anthropic.Anthropic(api_key=key, max_retries=4)  # rides out short 429/529 overload bursts
     if isinstance(user, tuple):
         context, task = user
-        user = [{"type": "text", "text": context, "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": task}]
+        user = [{"type": "text", "text": context, "cache_control": {"type": "ephemeral"}},
+                *(task if isinstance(task, list) else [{"type": "text", "text": task}])]
     kw = dict(model=model, max_tokens=16000, system=system, messages=[{"role": "user", "content": user}],
               output_format=schema, output_config={"effort": effort})
     if model in FALLBACK_MODELS:  # server-side refusal fallback (routes a declined request to another model)
@@ -141,7 +144,9 @@ You find the moments in long videos that work as standalone clips. A great clip:
 Use the timestamps given; start/end must align with transcript line boundaries. Never overlap clips. Score honestly.
 Transcript lines may carry measured tags: LOUD / VERY LOUD (audio well above this video's normal level: laughter,
 shouting, hype), fast (rapid speech), CHAT SPIKE (live chat exploded) — strong evidence of a reaction-worthy moment,
-but the words still have to stand alone."""
+but the words still have to stand alone. On-screen tags come from the picture: ACTION (far more motion than usual:
+fights, clutch plays, chases), FLASH (a sudden flash: explosion, jump scare, hit), ON-CAM (the streamer's face reacting
+on camera). In gaming and VTuber streams a visual payoff can carry a clip that has little speech."""
 
 
 def even_sample(xs: list, k: int) -> list:
@@ -152,12 +157,18 @@ def even_sample(xs: list, k: int) -> list:
 
 
 def tagged_lines(segments: list[dict], signals: dict) -> str:
-    """Transcript lines annotated with what the audio/chat was doing: (LOUD/VERY LOUD, fast, CHAT SPIKE).
-    Gives the model per-line prosody instead of a separate list of timestamps it has to line up itself."""
+    """Transcript lines annotated with what the audio/chat/picture was doing: (LOUD/VERY LOUD, fast, CHAT SPIKE,
+    ACTION, FLASH, ON-CAM). Gives the model per-line prosody instead of a separate list of timestamps it has to line up."""
     wave = np.asarray(signals.get("waveform") or [], dtype=np.float32)
     wmed = float(np.median(wave)) if wave.size else 0.0
     chat = np.asarray(signals.get("chat") or [], dtype=np.float32)  # messages per 10 s
     chat_hi = max(float(np.percentile(chat, 95)), 2 * float(np.median(chat)), 3.0) if chat.size else None
+    vis = signals.get("visual") or {}
+    motion = np.asarray(vis.get("motion") or [], dtype=np.float32)  # per second
+    motion_hi = max(2.0 * float(np.median(motion)), 0.012) if motion.size else None
+    face = np.asarray(vis.get("face") or [], dtype=np.float32)
+    cam_rare = face.size and float(face.mean()) < 0.5  # a face on screen only means something when the cam isn't always on
+    vspikes = vis.get("spikes") or []
     out = []
     for s in segments:
         tags = []
@@ -172,6 +183,14 @@ def tagged_lines(segments: list[dict], signals: dict) -> str:
             part = chat[int(s["start"] // 10):int(s["end"] // 10) + 1]
             if part.size and float(part.max()) >= chat_hi:
                 tags.append("CHAT SPIKE")
+        a, b = int(s["start"]), int(s["end"]) + 1
+        if motion_hi is not None and motion[a:b].size and float(motion[a:b].mean()) >= motion_hi:
+            tags.append("ACTION")
+        near = {m["kind"] for m in vspikes if s["start"] - 0.5 <= m["t"] <= s["end"] + 0.5}
+        if "flash" in near:
+            tags.append("FLASH")
+        if "face_reaction" in near or (cam_rare and face[a:b].size and float(face[a:b].mean()) >= 0.5):
+            tags.append("ON-CAM")
         out.append(f"[{s['start']:.1f}-{s['end']:.1f}]{' (' + ', '.join(tags) + ')' if tags else ''} {s['text']}")
     return "\n".join(out)
 
@@ -189,10 +208,11 @@ CHUNK_S, OVERLAP_S = 40 * 60, 120  # long VODs are scanned in 40-minute windows 
 
 
 def find_moments(segments, duration, signals: dict, count: int, min_len: int, max_len: int, query: str = "",
-                 guidance: str = "", taste: str = "", avoid=(), progress=None) -> list[dict]:
+                 guidance: str = "", taste: str = "", avoid=(), progress=None, target: float | None = None) -> list[dict]:
     """Short videos: one pass. Long ones: scan each window in parallel, then a judge pass ranks all candidates
-    on one scale (a single pass over a 6-hour transcript under-samples its later hours)."""
-    kw = dict(query=query, guidance=guidance, taste=taste, avoid=avoid)
+    on one scale (a single pass over a 6-hour transcript under-samples its later hours). signals["video"] (the source
+    file, when known) lets the judge look at a few frames of each candidate (setting "visual_judge")."""
+    kw = dict(query=query, guidance=guidance, taste=taste, avoid=avoid, **({"target": target} if target else {}))
     if duration <= CHUNK_S * 1.5:
         return _find_pass(segments, duration, signals, count, min_len, max_len, **kw)
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -208,8 +228,8 @@ def find_moments(segments, duration, signals: dict, count: int, min_len: int, ma
             jobs.append((segs, sig, [r for r in avoid if a <= r[0] < b]))
     cands, done = [], 0
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futs = [pool.submit(_find_pass, segs, duration, sig, per, min_len, max_len, query=query, guidance=guidance, taste=taste,
-                            avoid=av, window=(segs[0]["start"], segs[-1]["end"])) for segs, sig, av in jobs]
+        futs = [pool.submit(_find_pass, segs, duration, sig, per, min_len, max_len, **{**kw, "avoid": av},
+                            window=(segs[0]["start"], segs[-1]["end"])) for segs, sig, av in jobs]
         for f in as_completed(futs):
             cands += f.result()
             done += 1
@@ -218,7 +238,7 @@ def find_moments(segments, duration, signals: dict, count: int, min_len: int, ma
     cands = _dedupe(cands)
     if len(cands) <= count:
         return cands
-    return rank_moments(cands, segments, count, guidance=guidance, taste=taste, query=query)
+    return rank_moments(cands, segments, count, guidance=guidance, taste=taste, query=query, video=signals.get("video"))
 
 
 def _dedupe(clips: list[dict]) -> list[dict]:
@@ -240,19 +260,48 @@ class Ranking(BaseModel):
     ranked: list[Ranked] = Field(description="the best candidates, best first")
 
 
+JUDGE_SHOWN, JUDGE_FRAMES = 12, 4  # the visual judge sees 4 small frames of each of the 12 best-scored candidates
+
+
+def _judge_frames(cands: list[dict], video) -> dict[int, list[str]]:
+    """Base64 JPEGs per candidate index. Best-effort: a failed extraction leaves that candidate text-only."""
+    if not video or not config.load().get("visual_judge", True):
+        return {}
+    from . import vision
+
+    out = {}
+    for i, c in sorted(enumerate(cands), key=lambda ic: -ic[1].get("score", 0))[:JUDGE_SHOWN]:
+        try:
+            out[i] = [base64.b64encode(j).decode() for j in vision.frames(video, c["start"], c["end"], JUDGE_FRAMES)]
+        except Exception as e:
+            log.event("vision", f"judge frames skipped at {c['start']:.0f}s: {e}")
+    return out
+
+
 def rank_moments(cands: list[dict], segments: list[dict], count: int, guidance: str = "", taste: str = "",
-                 query: str = "") -> list[dict]:
-    """Judge pass: compare candidates from different parts of a long video side by side and keep the best."""
-    listing = "\n\n".join(
-        f"#{i} [{c['start']:.0f}-{c['end']:.0f}s] {c.get('title', '')} — hook: {c.get('hook', '')}\n"
-        f"{' '.join(s['text'] for s in segments if c['start'] <= s['start'] < c['end'])[:700]}"
-        for i, c in enumerate(cands))
+                 query: str = "", video=None) -> list[dict]:
+    """Judge pass: compare candidates from different parts of a long video side by side and keep the best.
+    With the source video (and the "visual_judge" setting on) the top candidates carry a few still frames each."""
+    entries = [f"#{i} [{c['start']:.0f}-{c['end']:.0f}s] {c.get('title', '')} — hook: {c.get('hook', '')}\n"
+               f"{' '.join(s['text'] for s in segments if c['start'] <= s['start'] < c['end'])[:700]}"
+               for i, c in enumerate(cands)]
     goal = f'matching the request "{query}"' if query else "for short-form (Shorts/TikTok/Reels)"
     system = ("You are the final editor choosing which candidate clips to publish. Candidates were found in separate "
               "parts of one long video by different passes, so their original scores are not comparable: rescore them "
               "on one honest scale." + (f"\n\nCreator style profile:\n{guidance}" if guidance else ""))
-    user = (f"CANDIDATES:\n{listing}\n\n" + (f"The creator's reactions to earlier picks:\n{taste}\n\n" if taste else "")
-            + f"Pick the {count} strongest {goal}, best first.")
+    tail = (f"The creator's reactions to earlier picks:\n{taste}\n\n" if taste else "") + f"Pick the {count} strongest {goal}, best first."
+    shots = _judge_frames(cands, video)
+    if shots:
+        system += (" Some candidates come with still frames from inside the clip, in time order: judge the visual payoff "
+                   "too (action, reactions, on-screen events), not only the words.")
+        user = [{"type": "text", "text": "CANDIDATES:"}]
+        for i, entry in enumerate(entries):
+            user.append({"type": "text", "text": entry})
+            user += [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": d}} for d in shots.get(i, [])]
+        user.append({"type": "text", "text": tail})
+    else:
+        listing = "\n\n".join(entries)
+        user = f"CANDIDATES:\n{listing}\n\n{tail}"
     res = _ask(system, user, Ranking, effort="medium")
     out, seen = [], set()
     for r in res.ranked:
@@ -264,17 +313,22 @@ def rank_moments(cands: list[dict], segments: list[dict], count: int, guidance: 
 
 
 def _find_pass(segments, duration, signals: dict, count: int, min_len: int, max_len: int, query: str = "",
-               guidance: str = "", taste: str = "", avoid=(), window=None) -> list[dict]:
+               guidance: str = "", taste: str = "", avoid=(), window=None, target: float | None = None) -> list[dict]:
+    aim = (f" Aim for about {target:.0f}s each (shorter is fine when the moment is complete); never longer than {max_len:.0f}s."
+           if target else f" Never longer than {max_len:.0f}s.")
     task = (f'Find up to {count} moments matching this request: "{query}". Length may be {max(5, min_len // 2)}-{max_len * 2}s; '
             "relevance to the request matters most." if query else
-            f"Find the {count} best clips, each {min_len}-{max_len} seconds long, sorted best first.")
+            f"Find the {count} best clips, each {min_len:.0f}-{max_len:.0f} seconds long, sorted best first.{aim}")
     if window:
         task += f" This is the part of the video from {window[0]:.0f}s to {window[1]:.0f}s; only pick moments inside it."
     chat = chat_spikes(signals.get("chat") or [])
+    vspikes = [(m["t"], m["kind"], m["strength"]) for m in (signals.get("visual") or {}).get("spikes", [])
+               if not window or window[0] <= m["t"] < window[1]]
     # stable per video → cached; taste and task change between calls so they come after the cache breakpoint
     context = (f"Video duration: {duration:.1f}s\n"
                f"Scene cuts (s): {even_sample(signals.get('scenes', []), 400)}\n"
                f"Audio energy spikes (t, relative energy): {[(m['t'], m['energy']) for m in signals.get('loud', [])]}\n"
+               + (f"Visual spikes (t, kind, strength): {vspikes}\n" if vspikes else "")
                + (f"Live-chat activity spikes (s): {[t for t in chat if not window or window[0] <= t < window[1]]}\n" if chat else "")
                + f"\nTRANSCRIPT (tags show audio/chat at that line):\n{tagged_lines(segments, signals)}")
     if avoid:
@@ -289,8 +343,11 @@ def _find_pass(segments, duration, signals: dict, count: int, min_len: int, max_
     return [m.model_dump() for m in res.clips]
 
 
-def refine(clips: list[dict], segments: list[dict], duration: float, min_len: float, max_len: float) -> list[dict]:
-    """Snap AI/heuristic clip bounds to sentence boundaries, enforce length, drop overlaps (keeps higher score)."""
+def refine(clips: list[dict], segments: list[dict], duration: float, min_len: float, max_len: float,
+           target: float | None = None) -> list[dict]:
+    """Snap AI/heuristic clip bounds to sentence boundaries, enforce length, drop overlaps (keeps higher score).
+    With a target length, over-long picks end at the sentence boundary nearest the target (never past max_len)."""
+    near = (lambda s: (lambda t: abs(t - s - target))) if target else None
     starts = [s["start"] for s in segments] or [0.0]
     ends = [s["end"] for s in segments] or [duration]
     out = []
@@ -302,7 +359,10 @@ def refine(clips: list[dict], segments: list[dict], duration: float, min_len: fl
         s, e = max(0.0, s), min(duration, e)
         if e - s > max_len:
             fit = [t for t in ends if s + min_len <= t <= s + max_len]
-            e = max(fit) if fit else s + max_len
+            e = (min(fit, key=near(s)) if near else max(fit)) if fit else s + min(max_len, target or max_len)
+        if near and e - s > target * 1.5:  # far over the target: pull back to the sentence end nearest it
+            fit = [t for t in ends if s + min_len <= t <= s + target * 1.5]
+            e = min(fit, key=near(s)) if fit else e
         if e - s < min_len:
             fit = [t for t in ends if s + min_len <= t <= s + max_len]
             e = min(fit) if fit else min(duration, s + min_len)

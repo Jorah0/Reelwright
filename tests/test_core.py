@@ -212,7 +212,7 @@ def test_find_more_skips_existing_clips_but_still_fills_the_count(monkeypatch):
     pid = clip["project_id"]
     seen = {}
 
-    def fake(segs, dur, signals, count, lo, hi, query="", guidance="", taste="", avoid=(), progress=None):
+    def fake(segs, dur, signals, count, lo, hi, query="", guidance="", taste="", avoid=(), progress=None, target=None):
         seen.update(count=count, avoid=avoid)
         return [{"start": 10.0, "end": 29.8, "score": 90, "title": "dup"}] + [
             {"start": 40.0 + 25 * i, "end": 59.8 + 25 * i, "score": 80 - i, "title": f"new {i}"} for i in range(5)]

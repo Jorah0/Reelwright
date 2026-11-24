@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
-from . import ai, assets, config, covers, learn, log, media, platforms, schedule, store, track
+from . import ai, assets, config, covers, learn, log, media, platforms, schedule, store, track, vision
 from .config import PROJECTS
 
 _heavy = queue.Queue()    # GPU/CPU-bound work (analysis, renders), one at a time
@@ -21,7 +21,10 @@ QUEUE_OF = {"upload": _uploads, "find": _ai, "virality": _ai, "train": _ai, "res
 
 
 def pdir(pid: str):
-    return PROJECTS / pid
+    p = (PROJECTS / pid).resolve()
+    if not pid or p.parent != PROJECTS.resolve():  # ids come from store.new_id; anything else is a traversal attempt
+        raise ValueError(f"bad project id: {pid!r}")
+    return p
 
 
 def load_json(pid: str, name: str, default=None):
@@ -273,7 +276,7 @@ def _import_url(job):
                                    "subtitleslangs": ["live_chat"], "quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
                 ydl.download([job["url"]])
         except Exception as e:  # optional signal: never fail the import over chat
-            print(f"live chat skipped: {e}")
+            log.event("import", f"live chat skipped: {e}")
     submit("analyze", project_id=pid)
 
 
@@ -318,8 +321,13 @@ def _analyze(job):
         signals["waveform"], signals["loud"] = media.audio_signals(src)
     step(0, "Detecting scene cuts", 0.12, 0.25)
     signals["scenes"] = media.scenes(src)
+    step(0, "Analyzing on-screen action", 0.25, 0.28)
+    try:  # best-effort: clip finding works without it
+        signals["visual"] = vision.analyze(src, meta, lambda f: step(f, None, 0.25, 0.28))
+    except Exception as e:
+        log.event("vision", f"on-screen analysis skipped: {e}")
     if meta["has_audio"]:
-        step(0, "Detecting silences", 0.25, 0.3)
+        step(0, "Detecting silences", 0.28, 0.3)
         signals["silences"] = media.silences(src)
     chat = next(pdir(pid).glob("*.live_chat.json"), None)
     if chat:
@@ -342,18 +350,49 @@ def _analyze(job):
     _autopilot(pid)
 
 
-def _find(pid: str, query: str, job: dict | None = None, count: int | None = None):
+def _num(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and v > 0 else None
+
+
+def lengths(s: dict, target=None, max_len=None) -> tuple[float, float, float]:
+    """(min, target, max) clip seconds from settings, with optional per-search overrides. max is a hard cap; target sits
+    between min and max (0/unset = halfway); an override below the saved min pulls min down so the range stays usable."""
+    mx = min(max(_num(max_len) or float(s["clip_max"]), 5.0), 900.0)
+    tg = _num(target) or _num(s.get("clip_target")) or (float(s["clip_min"]) + mx) / 2
+    tg = min(tg, mx)
+    mn = max(3.0, min(float(s["clip_min"]), tg * 0.8))
+    return round(mn, 2), round(max(tg, mn), 2), round(mx, 2)
+
+
+VISUAL_KIND = {"action": "Action", "flash": "Flash", "color": "Colour shift", "face_reaction": "On-cam reaction"}
+
+
+def visual_picks(spikes: list[dict], clip_max: float, dur: float) -> list[dict]:
+    """Clips around the strongest visual spikes (a short lead-in first), best first, without overlaps."""
+    out = []
+    for m in spikes:
+        start = max(0.0, m["t"] - min(5.0, clip_max / 3))
+        name = VISUAL_KIND.get(m["kind"], m["kind"])
+        out.append({"start": start, "end": min(start + clip_max, dur), "score": round(40 + 40 * m["strength"]),
+                    "title": f"{name} at {int(m['t'] // 60)}:{int(m['t'] % 60):02d}", "hook": "", "hashtags": [],
+                    "reason": f"On-screen {name.lower()} (no speech detected)."})
+    return ai._dedupe(out)
+
+
+def _find(pid: str, query: str, job: dict | None = None, count: int | None = None, target=None, max_len=None):
     s = config.load()
     proj = store.get("project", pid)
     segs = load_json(pid, "transcript.json", {"segments": []})["segments"]
     signals = load_json(pid, "signals.json", {})
+    if proj.get("source"):  # lets the long-video judge look at frames (ai.rank_moments, setting "visual_judge")
+        signals["video"] = str(pdir(pid) / proj["source"])
     dur = proj["meta"]["duration"]
     count = count or s["clip_count"]
-    clip_min, clip_max = s["clip_min"], s["clip_max"]
+    clip_min, clip_target, clip_max = lengths(s, target, max_len)
     # short source (an OBS replay-buffer save, a short upload): the whole thing is the clip — tighten it to the speech
     short = not query and dur <= clip_max * 1.25
     if short:
-        count, clip_min, clip_max = 1, max(3.0, min(clip_min, dur * 0.5)), dur
+        count, clip_min, clip_max, clip_target = 1, max(3.0, min(clip_min, dur * 0.5)), dur, None
     # "find more" (no query): skip moments the creator already has as clips, asking for extras so the count still fills
     have = [] if query else [c for c in store.find("clip", project_id=pid) if not c.get("parts")]
     if short and have:
@@ -364,13 +403,14 @@ def _find(pid: str, query: str, job: dict | None = None, count: int | None = Non
     used_ai = bool(config.api_key()) and bool(segs)
     if used_ai:
         taste = "\n".join(x for x in (taste_examples(), learn.hints(fb, model)) if x)
+        aim = clip_target if (not query or target or max_len) else None  # a search obeys lengths only when picked for it
         prog = (lambda f: _progress(job["id"], f, "Scanning long video in parts", pid, 0.8, 0.98)) if job else None
         raw = ai.find_moments(segs, dur, signals, want, clip_min, clip_max, query, guidance(), taste,
-                              avoid=[(c["start"], c["end"]) for c in have], progress=prog)
-        lo_len, hi_len = (3, clip_max * 2) if query else (clip_min, clip_max)
-        found = ai.refine(raw, segs, dur, lo_len, hi_len)
+                              avoid=[(c["start"], c["end"]) for c in have], progress=prog, target=aim)
+        lo_len, hi_len = (3, clip_max if max_len else clip_max * 2) if query else (clip_min, clip_max)
+        found = ai.refine(raw, segs, dur, lo_len, hi_len, target=aim)
         if not query and not short:  # creator's learned re-trim habit, re-snapped to sentence boundaries
-            found = ai.refine(learn.apply_trim(found, learn.trim_bias(fb)), segs, dur, lo_len, hi_len)
+            found = ai.refine(learn.apply_trim(found, learn.trim_bias(fb)), segs, dur, lo_len, hi_len, target=aim)
     elif query:
         q = query.lower()
         found = [{"start": x["start"], "end": x["end"], "score": 50, "title": x["text"][:60], "hook": x["text"],
@@ -378,6 +418,8 @@ def _find(pid: str, query: str, job: dict | None = None, count: int | None = Non
                  for x in segs if q in x["text"].lower()][:count]
     elif segs:
         found = ai.heuristic_moments(segs, signals.get("loud", []), dur, want if not short else 1, clip_min, clip_max)
+    elif (signals.get("visual") or {}).get("spikes"):  # no speech: cut around on-screen action, flashes, reactions
+        found = visual_picks(signals["visual"]["spikes"], clip_max, dur)[:want]
     else:  # no speech: cut around scene changes
         marks = sorted({0.0, *signals.get("scenes", [])})
         found = [{"start": t, "end": min(t + clip_max, dur), "score": 40, "title": f"Scene at {int(t // 60)}:{int(t % 60):02d}",
@@ -421,7 +463,7 @@ def new_clip(pid: str, c: dict, source: str = "manual", query: str = "", parts: 
 
 
 def _find_job(job):
-    _find(job["project_id"], job.get("query", ""), job, count=job.get("count"))
+    _find(job["project_id"], job.get("query", ""), job, count=job.get("count"), target=job.get("target"), max_len=job.get("max_len"))
 
 
 def _analyze_failed(job, err):

@@ -51,6 +51,11 @@ const SIZES = { "9:16": [1080, 1920], "1:1": [1080, 1080], "4:5": [1080, 1350], 
 const CAPTION_POS = { low: [0.24, 0.08], middle: [0.42, 0.40], high: [0.68, 0.72] };
 const CATEGORIES = { 1: "Film & Animation", 2: "Autos & Vehicles", 10: "Music", 15: "Pets & Animals", 17: "Sports", 19: "Travel & Events", 20: "Gaming", 22: "People & Blogs", 23: "Comedy", 24: "Entertainment", 25: "News & Politics", 26: "Howto & Style", 27: "Education", 28: "Science & Technology" };
 
+// Find-bar length presets: "target/max" seconds (clips aim for the target, never exceed the max); "" = Settings defaults
+const FIND_LENGTHS = [["", "Length: Settings"], ["15/20", "≈15 s · max 20"], ["30/45", "≈30 s · max 45"], ["45/60", "≈45 s · max 60"], ["60/90", "≈60 s · max 90"], ["90/180", "≈90 s · max 3 min"]];
+const lsGet = (k) => { try { return localStorage[k]; } catch { return undefined; } };
+const lsSet = (k, v) => { try { localStorage[k] = v; } catch { /* private mode: just don't remember */ } };
+
 const S = { settings: null, conn: null, timers: [], nav: 0, ui: { app: 1, sidebar: 1, text: 1, preview: 1, timeline: 1, panels: 1 } };
 
 // Pointer position in an element's own CSS pixels (correct even when an ancestor is scaled with CSS zoom).
@@ -58,10 +63,22 @@ const localXY = (ev, el) => { const r = el.getBoundingClientRect(), k = r.width 
 
 // ---------- interface scale (saved in settings.ui_scale; applied as CSS variables) ----------
 const UI_KEYS = { app: "Whole app", sidebar: "Sidebar", text: "Text size", preview: "Video preview", timeline: "Timelines", panels: "Panel spacing" };
-function applyUi(ui) {
+// Base size adapts to the window (small laptop → slightly smaller, 1440p/4K-class CSS widths → larger); the saved per-part scale multiplies on top.
+const uiAuto = () => Math.min(Math.max(innerWidth / 1600, 0.9), 1.4);
+function applyUi(ui = S.ui) {
   S.ui = Object.fromEntries(Object.keys(UI_KEYS).map((k) => [k, Math.min(Math.max(+ui?.[k] || 1, 0.6), 2)]));
-  for (const [k, v] of Object.entries(S.ui)) document.documentElement.style.setProperty(`--ui-${k}`, v);
+  const auto = uiAuto(), root = document.documentElement.style, sb = S.ui.sidebar * auto;
+  // the sidebar folds to icons when the window is narrow or the full sidebar would take more than a fifth of it
+  const icons = innerWidth <= 1180 || 228 * sb > innerWidth * 0.2;
+  document.body.classList.toggle("side-icons", icons);
+  // ponytail: the applied zoom keeps >= ~1000x600 CSS px for the main view so layouts never run out of room; the saved value is untouched
+  const room = Math.max(0.6, Math.min((innerWidth - (innerWidth <= 720 ? 0 : (icons ? 64 : 228) * sb)) / 1000, innerHeight / 600));
+  const eff = { ...S.ui, app: Math.min(S.ui.app * auto, Math.max(room, Math.min(S.ui.app * auto, 1))), sidebar: sb };
+  for (const [k, v] of Object.entries(eff)) root.setProperty(`--ui-${k}`, +v.toFixed(3));
 }
+applyUi();
+let uiResize = 0;
+window.addEventListener("resize", () => { clearTimeout(uiResize); uiResize = setTimeout(() => applyUi(), 150); });
 function saveUi() {
   clearTimeout(S.uiTimer);
   S.uiTimer = setTimeout(() => api("/api/settings", { method: "PUT", body: { ui_scale: S.ui } }).then((s) => (S.settings = s)).catch(fail), 500);
@@ -70,7 +87,11 @@ document.addEventListener("keydown", (e) => { // Ctrl+= / Ctrl+- / Ctrl+0: scale
   if (!(e.ctrlKey || e.metaKey) || e.altKey || !["=", "+", "-", "_", "0"].includes(e.key)) return;
   e.preventDefault();
   const v = e.key === "0" ? 1 : Math.round((S.ui.app + (e.key === "-" || e.key === "_" ? -0.05 : 0.05)) * 100) / 100;
-  applyUi({ ...S.ui, app: v }); saveUi();
+  const css = () => getComputedStyle(document.documentElement).getPropertyValue("--ui-app"), before = css();
+  applyUi({ ...S.ui, app: v });
+  if (["=", "+"].includes(e.key) && css() === before) { // capped by the window: don't save a size that isn't shown
+    applyUi({ ...S.ui, app: Math.round((v - 0.05) * 100) / 100 }); return toast("That's the largest size that fits this window.", "info", 1500); }
+  saveUi();
   $$("[data-ui=app]").forEach((r) => { r.value = Math.round(S.ui.app * 100); r.nextElementSibling.textContent = r.value + "%"; });
   toast(`Interface ${Math.round(S.ui.app * 100)}%`, "info", 1200);
 });
@@ -79,6 +100,19 @@ document.addEventListener("keydown", (e) => { // Ctrl+= / Ctrl+- / Ctrl+0: scale
 // Sizes are output pixels (1080-wide frame); k = on-screen px per output px.
 const FONT_FALLBACK = ["Arial", "Arial Black", "Bahnschrift", "Calibri", "Cambria", "Candara", "Comic Sans MS", "Consolas", "Constantia", "Corbel", "Courier New",
   "Franklin Gothic Medium", "Gabriola", "Georgia", "Impact", "Lucida Console", "Palatino Linotype", "Segoe UI", "Segoe UI Black", "Tahoma", "Times New Roman", "Trebuchet MS", "Verdana"];
+// Font flavours by name (only fonts the backend reports, so the export can render every one).
+const FONT_CATS = [["all", "All"], ["featured", "Featured"], ["bold", "Bold / Impact"], ["sans", "Clean sans"], ["serif", "Elegant serif"], ["script", "Handwritten"], ["display", "Retro / Display"], ["mono", "Mono / Tech"], ["other", "Other"]];
+const FONT_FEATURED = ["Impact", "Anton", "Bebas Neue", "Montserrat", "Poppins", "Oswald", "Bahnschrift", "Segoe UI", "Arial", "Franklin Gothic", "Franklin Gothic Medium", "Verdana", "Trebuchet MS", "Futura", "Gill Sans MT", "Century Gothic", "Rockwell", "Georgia", "Comic Sans MS", "Segoe Print", "Ink Free", "Lucida Console", "Haettenschweiler", "Cooper Black", "Showcard Gothic"];
+const FLAVOR = [
+  ["mono", /mono|consol|courier|code|terminal|lucida console|fixedsys|ocr|typewriter|cascadia/i],
+  ["script", /script|brush|hand|marker|comic|\bpen\b|\bink\b|chalk|signature|kristen|segoe print|gabriola|mistral|vivaldi|freestyle|pacifico|lobster|cursive|calligra|edwardian|french|pristina|viner|bradley|harlow|jokerman|curlz|papyrus|tempus|gigi|kunstler|rage|palace/i],
+  ["display", /retro|display|stencil|neon|pixel|8.?bit|arcade|western|broadway|cooper|chiller|showcard|algerian|bauhaus|harrington|ravie|snap|magneto|old english|blackadder|engravers|castellar|copperplate|goudy stout|poplar|playbill|wide latin|elephant|niagara|matura|onyx|bernard|jazz|outline|shadow|deco|wild|ravie|forte|hobo/i],
+  ["bold", /impact|anton|bebas|black|heavy|condensed|compressed|ultra|extra ?bold|poster|haettenschweiler|oswald|league gothic|fat|\bbold\b|thick/i],
+  ["serif", /(?<!sans )serif|times|georgia|garamond|cambria|constantia|palatino|book antiqua|bodoni|didot|baskerville|caslon|playfair|merriweather|roman|schoolbook|rockwell|perpetua|sylfaen|bookman|centaur|footlight|high tower|californian|lora|crimson|elephant|modern no|calisto/i],
+  ["sans", /sans|arial|segoe|calibri|verdana|tahoma|helvetica|inter\b|roboto|lato|montserrat|poppins|candara|corbel|trebuchet|bahnschrift|franklin|gill|futura|century gothic|nunito|source|ubuntu|noto|dejavu|aptos|selawik|myriad|avenir|raleway|quicksand|tw cen|gothic/i],
+];
+const fontFlavor = (fam) => FLAVOR.find(([, re]) => re.test(fam))?.[0] || "other";
+const featuredFonts = (pool) => FONT_FEATURED.map((n) => pool.find((f) => (f.lc || f.family.toLowerCase()) === n.toLowerCase())).filter(Boolean);
 const TS_KEYS = ["font", "size", "weight", "color", "outline", "outline_color", "shadow", "spacing"];
 const famCss = (f) => `"${String(f || "").replace(/["\\\n\r;{}<>]/g, "")}"`;
 const hexOr = (v, d) => (/^#[0-9a-f]{6}$/i.test(v || "") ? v : d);
@@ -91,8 +125,8 @@ function loadFonts(force = false) {
     for (const f of Array.isArray(list) ? list : []) {
       const key = String(f?.family || "").toLowerCase();
       if (!key) continue;
-      if (seen.has(key)) { const g = seen.get(key); if (f.style && !g.styles.includes(f.style)) g.styles.push(f.style); if (f.source === "uploaded") g.source = "uploaded"; }
-      else seen.set(key, { family: f.family, source: f.source, styles: f.style ? [f.style] : [] }); // Pillow names "Arial Black" family Arial, style Black: one row per family
+      if (seen.has(key)) { const g = seen.get(key); if (f.style && !g.styles.includes(f.style)) g.styles.push(f.style); if (f.source === "uploaded") { g.source = "uploaded"; g.url = f.url; } }
+      else seen.set(key, { family: f.family, source: f.source, url: f.url, lc: key, flavor: fontFlavor(f.family), styles: f.style ? [f.style] : [] }); // Pillow names "Arial Black" family Arial, style Black: one row per family
       if (f.source === "uploaded" && /^\/assets\/[\w./-]+$/.test(f.url || "") && !loadedFaces.has(f.url)) { // uploaded fonts: load by URL so the picker and preview can draw them
         loadedFaces.add(f.url);
         const face = new FontFace(f.family, `url("${f.url}")`);
@@ -130,8 +164,10 @@ function textStyleEditor(box, { get, set, def, sample = "Sample text" }) {
     const s = cur();
     box.innerHTML = `<div class="ts-sample"><span>${esc(sample)}</span></div>
       <div class="fp"><button type="button" class="fp-btn" data-fp="open" title="Choose a font" style="font-family:${esc(famCss(s.font))}, Inter">${esc(s.font)} ▾</button>
-        <div class="fp-pop" hidden><input type="text" class="fp-q" placeholder="Search fonts"><div class="fp-list"><span class="spin"></span></div>
-          <label class="btn xs" title="Adds the font to your media library">⬆ Upload .ttf / .otf<input type="file" class="fp-up" accept=".ttf,.otf" hidden></label></div></div>
+        <div class="fp-pop" hidden><div class="row"><input type="search" class="fp-q grow" placeholder="Search fonts" aria-label="Search fonts">
+            <label class="btn xs" title="Adds the font to your media library">⬆ Upload .ttf / .otf<input type="file" class="fp-up" accept=".ttf,.otf" hidden></label></div>
+          <div class="fp-cats" role="tablist">${FONT_CATS.map(([k, l]) => `<button type="button" role="tab" data-fcat="${k}" class="${(box._cat || "all") === k ? "on" : ""}">${l}</button>`).join("")}</div>
+          <div class="fp-list" role="listbox" aria-label="Fonts" tabindex="-1"><span class="spin"></span></div></div></div>
       ${rng("size", "Size", 24, 200)}
       <div class="row wrap"><div class="seg">${[["normal", "Normal"], ["bold", "Bold"]].map(([v, l]) => `<button type="button" class="${s.weight === v ? "on" : ""}" data-fw="${v}">${l}</button>`).join("")}</div>
         <label class="field" style="flex-direction:row;align-items:center;gap:6px">Colour <input type="color" data-ts="color" value="${esc(hexOr(s.color, "#FFFFFF"))}"></label>
@@ -140,16 +176,27 @@ function textStyleEditor(box, { get, set, def, sample = "Sample text" }) {
       <div><button type="button" class="btn xs ghost" data-fp="reset">↺ Reset style</button></div>`;
     paint();
   };
+  // Gallery: sections by flavour, each card draws the sample in its own font and the current colour/outline.
+  // ponytail: sections show 24 cards and grow by 48 on demand ("Show more"); a big font folder (thousands) never renders at once.
   const fill = async () => {
     const list = await loadFonts(), q = ($(".fp-q", box)?.value || "").trim().toLowerCase(), el = $(".fp-list", box);
     if (!el) return;
-    const items = list.filter((f) => !q || f.family.toLowerCase().includes(q));
-    el.innerHTML = items.map((f) => `<button type="button" data-fam="${esc(f.family)}" style="font-family:${esc(famCss(f.family))}, Inter">${esc(f.family)}${f.source === "uploaded" ? ' <span class="dim">· uploaded</span>' : ""}${f.styles?.length > 1 ? ` <span class="dim fp-sty">${esc(f.styles.filter((s) => s !== "Regular").slice(0, 4).join(", "))}</span>` : ""}</button>`).join("") || `<div class="dim" style="padding:6px">No fonts match.</div>`;
+    const s = cur(), cat = box._cat || "all", shown = (box._shown ||= {});
+    const look = `color:${hexOr(s.color, "#FFFFFF")};-webkit-text-stroke:${Math.min(+s.outline || 0, 6) * 0.35}px ${hexOr(s.outline_color, "#000000")};paint-order:stroke fill;font-weight:${s.weight === "normal" ? 400 : 800}`;
+    const card = (f) => `<button type="button" role="option" class="fp-card" aria-selected="${f.family === s.font}" data-fam="${esc(f.family)}" title="${esc(f.family)}${f.styles?.length > 1 ? " — " + esc(f.styles.join(", ")) : ""}">
+        <span class="fp-s" style="font-family:${esc(famCss(f.family))}, Inter;${look}">THIS IS THE CLIP</span>
+        <span class="fp-n">${esc(f.family)}${f.source === "uploaded" ? ' <b class="fp-tag">yours</b>' : ""}</span></button>`;
+    const pool = list.filter((f) => !q || f.lc.includes(q));
+    const groups = FONT_CATS.filter(([k]) => k !== "all" && (cat === "all" || cat === k)).map(([k, l]) => [k, l, k === "featured" ? featuredFonts(pool) : pool.filter((f) => f.flavor === k)]).filter(([, , g]) => g.length);
+    el.innerHTML = groups.map(([k, l, g]) => { const n = shown[k] || (cat === "all" ? 12 : 24);
+      return `<div class="fp-sec" data-k="${k}"><h4>${l} <span class="dim">${g.length}</span></h4><div class="fp-grid">${g.slice(0, n).map(card).join("")}</div>
+        ${g.length > n ? `<button type="button" class="btn xs ghost fp-more" data-fmore="${k}">Show ${Math.min(48, g.length - n)} more</button>` : ""}</div>`; }).join("")
+      || `<div class="dim" style="padding:10px">No installed fonts match “${esc(q)}”.</div>`;
   };
   box.oninput = (e) => {
     e.stopPropagation();
     const t = e.target;
-    if (t.classList.contains("fp-q")) return fill();
+    if (t.classList.contains("fp-q")) { box._shown = {}; clearTimeout(box._qT); box._qT = setTimeout(fill, 120); return; }
     if (!t.dataset.ts) return;
     if (t.type === "range") t.nextElementSibling.textContent = t.value;
     set(t.dataset.ts, t.type === "range" ? +t.value : t.value); paint();
@@ -167,11 +214,25 @@ function textStyleEditor(box, { get, set, def, sample = "Sample text" }) {
       draw(); toast(`Font added${fam ? ` — ${fam}` : ""}.`, "ok");
     } catch (err) { fail(err); }
   };
+  box.onkeydown = (e) => { // gallery keys: arrows move between cards, Escape closes, Enter/Space pick (native buttons)
+    const pop = $(".fp-pop", box);
+    if (e.key === "Escape" && pop && !pop.hidden) { e.stopPropagation(); pop.hidden = true; return $(".fp-btn", box).focus(); }
+    if (!e.target.classList.contains("fp-card") && !(e.target.classList.contains("fp-q") && e.key === "ArrowDown")) return;
+    const cards = $$(".fp-card", box), i = cards.indexOf(e.target), cols = 2;
+    const j = { ArrowRight: i + 1, ArrowLeft: i - 1, ArrowDown: i < 0 ? 0 : i + cols, ArrowUp: i - cols, Home: 0, End: cards.length - 1 }[e.key];
+    if (j == null) return;
+    e.preventDefault(); e.stopPropagation();
+    cards[Math.min(Math.max(j, 0), cards.length - 1)]?.focus();
+  };
   box.onclick = (e) => {
     e.stopPropagation();
-    const t = e.target.closest("[data-fp],[data-fam],[data-fw]");
+    const t = e.target.closest("[data-fp],[data-fam],[data-fw],[data-fcat],[data-fmore]");
     if (!t) return;
     if (t.dataset.fp === "open") { const p = $(".fp-pop", box); p.hidden = !p.hidden; if (!p.hidden) { fill(); $(".fp-q", box).focus(); } return; }
+    if (t.dataset.fcat) { box._cat = t.dataset.fcat; box._shown = {}; $$("[data-fcat]", box).forEach((b) => b.classList.toggle("on", b === t)); return fill(); }
+    if (t.dataset.fmore) { const k = t.dataset.fmore; box._shown = { ...box._shown, [k]: (box._shown?.[k] || (box._cat && box._cat !== "all" ? 24 : 12)) + 48 };
+      const sec = () => $$(".fp-sec", box).find((x) => x.querySelector(`[data-fmore="${k}"]`) || x.dataset.k === k), n = $$(".fp-card", sec()).length;
+      return fill().then(() => $$(".fp-card", sec())[n]?.focus()); }
     if (t.dataset.fp === "reset") TS_KEYS.forEach((k) => set(k, null));
     if (t.dataset.fam) set("font", t.dataset.fam);
     if (t.dataset.fw) set("weight", t.dataset.fw);
@@ -434,6 +495,29 @@ function Library() {
 // ======================================================================
 // Editor
 // ======================================================================
+// On-screen action heat strip (signals.visual from the analyzer), drawn once into a 1-px-tall canvas the timeline scales:
+// orange = motion relative to this video's busiest moments, white = flash, cyan = on-cam reaction.
+function visualStrip(v) {
+  const m = v?.motion || [];
+  if (!m.length) return null;
+  const per = Math.ceil(m.length / 16000), n = Math.ceil(m.length / per); // stay under canvas width limits on long VODs
+  const sorted = [...m].sort((a, b) => a - b), top = sorted[Math.floor(sorted.length * 0.98)] || sorted.at(-1) || 1;
+  const c = Object.assign(document.createElement("canvas"), { width: n, height: 1 }), g = c.getContext("2d"), img = g.createImageData(n, 1);
+  for (let i = 0; i < n; i++) {
+    let x = 0; for (let j = i * per; j < (i + 1) * per && j < m.length; j++) x = Math.max(x, m[j]);
+    const a = Math.min(1, x / (top || 1));
+    img.data.set([255, 106 + 80 * (1 - a), 61, Math.round(255 * a * a)], i * 4);
+  }
+  for (const s of v.spikes || []) {
+    const i = Math.min(n - 1, Math.floor(s.t / per));
+    if (s.kind === "flash") img.data.set([255, 255, 255, 255], i * 4);
+    else if (s.kind === "face_reaction") img.data.set([80, 220, 255, 255], i * 4);
+  }
+  g.putImageData(img, 0, 0);
+  c.secs = n * per;
+  return c;
+}
+
 function Editor(pid) {
   const E = { pid, proj: null, clips: [], segs: [], words: [], signals: {}, sel: null, tab: "clips", zoom: 1, inMark: null, outMark: null, loop: false, pending: {}, sig: "", picked: new Set() };
   let video, canvas, ctx, raf, keyHandler, listeners, ro;
@@ -462,6 +546,7 @@ function Editor(pid) {
     E.segs = tr.segments || [];
     E.words = E.segs.flatMap((s) => s.words || []);
     E.signals = sig;
+    E.vstrip = visualStrip(sig.visual);
   }
 
   function layout() {
@@ -654,11 +739,12 @@ function Editor(pid) {
     if (!ctx || !dur()) return;
     const w = canvas.width / (window.devicePixelRatio || 1);
     ctx.clearRect(0, 0, w, TLH);
-    const step = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800].find((s) => s * pps > 70) || 3600;
+    const step = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800].find((s) => s * pps > 70 * TK) || 3600;
     ctx.fillStyle = "#5d6178"; ctx.font = `${10 * TK}px JetBrains Mono, monospace`;
-    for (let t = 0; t <= dur(); t += step) { const x = t * pps; ctx.fillRect(x, 10, 1, 6); ctx.fillText(fmt(t, 0), x + 3, 9); }
+    for (let t = 0; t <= dur(); t += step) { const x = t * pps; ctx.fillRect(x, 10 * TK, 1, 6 * TK); ctx.fillText(fmt(t, 0), x + 3, 9 * TK); }
     ctx.fillStyle = "#6aa8ff88";
     (E.signals.scenes || []).forEach((t) => ctx.fillRect(t * pps, SPR_Y, 1, SPR_H));
+    if (E.vstrip) ctx.drawImage(E.vstrip, 0, 0, E.vstrip.width, 1, 0, SPR_Y + SPR_H, E.vstrip.secs * pps, 4 * TK);
     const wf = E.signals.waveform || [];
     if (wf.length) {
       ctx.fillStyle = "#3b3f56";
@@ -703,15 +789,15 @@ function Editor(pid) {
       else if (y >= CLIP_Y - 2) {
         const hit = E.clips.find((k) => !k.parts && t >= k.start && t <= k.end);
         if (hit) { select(hit.id); return; }
-        drag = { edge: "seek", cur: t, lx: ev.clientX }; seek(t);
-      } else { drag = { edge: "seek", cur: t, lx: ev.clientX }; seek(t); }
+        drag = { edge: "seek", cur: t, lx: t * pps }; seek(t);
+      } else { drag = { edge: "seek", cur: t, lx: t * pps }; seek(t); }
     });
     window.addEventListener("mousemove", (ev) => {
       if (!drag) return;
-      const t = Math.min(Math.max(tAt(ev), 0), dur()), c = selClip();
+      const lx = localXY(ev, inner)[0], t = Math.min(Math.max(lx / pps, 0), dur()), c = selClip();
       if (drag.edge === "seek") { // Shift = fine scrub (10x slower); seeks are coalesced to one per frame
-        drag.cur = ev.shiftKey ? Math.min(Math.max(drag.cur + (ev.clientX - drag.lx) / pps / 10, 0), dur()) : t;
-        drag.lx = ev.clientX; E.scrubT = drag.cur; scrub(drag.cur, true); return draw();
+        drag.cur = ev.shiftKey ? Math.min(Math.max(drag.cur + (lx - drag.lx) / pps / 10, 0), dur()) : t;
+        drag.lx = lx; E.scrubT = drag.cur; scrub(drag.cur, true); return draw();
       }
       if (drag.edge === "start") c.start = Math.min(t, c.end - 0.5);
       else c.end = Math.max(t, c.start + 0.5);
@@ -795,7 +881,9 @@ function Editor(pid) {
         case "find": {
           const q = $("#q").value.trim();
           busy();
-          await api(`/api/projects/${pid}/find`, { body: { query: q } });
+          const [tg, mx] = ($("#qlen")?.value || "").split("/").map(Number);
+          lsSet("findLen", $("#qlen")?.value || "");
+          await api(`/api/projects/${pid}/find`, { body: { query: q, ...(mx ? { target: tg, max_len: mx } : {}) } });
           toast(q ? `Searching for “${q}”… new clips appear here.` : "Finding more clips…");
           setTimeout(() => { a.disabled = false; a.textContent = "Find"; }, 2500);
           break;
@@ -857,7 +945,7 @@ function Editor(pid) {
   const markTab = () => $$(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === E.tab));
 
   function onKey(e) {
-    if (e.target.closest("input, textarea, select") || !video || $("#modal-root").innerHTML) return;
+    if (e.target.closest?.("input, textarea, select") || !video || $("#modal-root").innerHTML) return;
     const c = selClip();
     if (e.code === "Space") { e.preventDefault(); E.loop = false; video.paused ? video.play() : video.pause(); }
     else if (e.key === "i" || e.key === "I") { E.inMark = video.currentTime; draw(); }
@@ -883,7 +971,9 @@ function Editor(pid) {
     const sorted = [...E.clips].sort((a, b) => (a.source === "manual") - (b.source === "manual") || b.score - a.score);
     const srcLabel = { search: "search", manual: "manual", ai: "AI", auto: "auto", montage: "montage" };
     el.innerHTML = `
-      <div class="search"><input type="text" id="q" placeholder="Find a moment: “when chat goes crazy”" ${ready ? "" : "disabled"}><button class="btn primary" data-act="find" ${ready ? "" : "disabled"}>Find</button></div>
+      <div class="search"><input type="text" id="q" placeholder="Find a moment: “when chat goes crazy”" ${ready ? "" : "disabled"}>
+        <select id="qlen" title="Clip length for new picks: aims for the first number, never longer than the second" ${ready ? "" : "disabled"}>${FIND_LENGTHS.map(([v, l]) => `<option value="${v}" ${v === (lsGet("findLen") || "") ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <button class="btn primary" data-act="find" ${ready ? "" : "disabled"}>Find</button></div>
       ${!S.settings?.anthropic_key_set ? `<div class="card" style="padding:10px 12px;margin-bottom:12px;font-size:12.5px">Clips below come from the offline heuristic. <a href="#/settings">Add a Claude API key</a> for AI-ranked clips, semantic search, the edit assistant, virality scoring and auto-written titles.</div>` : ""}
       <div class="row" style="margin-bottom:10px;font-size:12px" ${E.picked.size ? "" : "hidden"} id="pickbar"><span class="grow">${E.picked.size} selected</span><button class="btn sm primary" data-act="montage" ${E.picked.size > 1 ? "" : "disabled"}>▤ Make montage</button></div>
       ${sorted.length ? sorted.map((c) => `
@@ -892,7 +982,7 @@ function Editor(pid) {
             <div class="t grow">${esc(c.title)}</div>${c.viral ? `<span class="vbadge" title="Virality score">✦${+c.viral.score}</span>` : ""}${c.source !== "manual" && !c.parts ? `<span class="score" title="AI pick score">${+c.score}</span>` : ""}</div>
           ${c.reason ? `<div class="why">${esc(c.reason)}</div>` : ""}
           <div class="meta wrap"><span class="mono">${c.parts ? `${c.parts.length} clips` : `${fmt(c.start)} → ${fmt(c.end)}`}</span><span>${(c.end - c.start).toFixed(1)}s</span>
-            <span class="src-tag">${srcLabel[c.source] || esc(c.source)}</span><span class="grow"></span>
+            <span class="src-tag">${srcLabel[c.source] || esc(c.source)}</span>${c.features?.motion >= 2 ? `<span class="chip" title="Much more on-screen motion than usual for this video" style="font-size:11px">⚡ action</span>` : ""}${c.features?.flashes > 0 ? `<span class="chip" title="Sudden on-screen flash (explosion, jump scare, hit)" style="font-size:11px">✷ flash</span>` : ""}<span class="grow"></span>
             ${Object.entries(c.posts || {}).map(([p, r]) => (/^https:\/\//.test(r.url || "") ? `<a href="${esc(r.url)}" target="_blank" class="plat ${p}">${PLATFORM[p]}</a>` : platTag(p))).join("")}
             ${c.export?.status === "done" && c.export.rev === c.rev ? '<span title="Rendered" style="color:var(--ok)">●</span>' : ""}
             ${c.fit != null ? `<span class="chip" title="How well this matches what you've liked and posted before (learned from your feedback). AI score ${+c.ai_score}." style="font-size:11px">♥ ${+c.fit}% your taste</span>` : ""}
@@ -1559,7 +1649,7 @@ function Studio(cid) {
         const kf = localXY(ev, tl)[1] > KF_Y - 10 && T.manual.find((q) => Math.abs(tx(k.start + q[0]) - x) < 7);
         if (kf) { video.pause(); seek(k.start + kf[0]); return; }
         if (T.target && localXY(ev, tl)[1] > KF_Y - 10 && Math.abs(tx(k.start + T.target.t) - x) < 7) { video.pause(); seek(k.start + T.target.t); return; }
-        T.tdrag = "seek"; T.fine = { cur: Math.min(Math.max(tAt(x), k.start), k.end), lx: ev.clientX }; seek(T.fine.cur);
+        T.tdrag = "seek"; T.fine = { cur: Math.min(Math.max(tAt(x), k.start), k.end), lx: x }; seek(T.fine.cur);
       }
       tl.setPointerCapture(ev.pointerId);
     });
@@ -1575,8 +1665,8 @@ function Studio(cid) {
       const t = Math.min(Math.max(tAt(x), 0), dur() || T.range[1]);
       if (T.tdrag === "seek") { // Shift = fine scrub (10x slower); seeks coalesced to one per frame
         const F = T.fine;
-        F.cur = Math.min(Math.max(ev.shiftKey ? F.cur + (((ev.clientX - F.lx) / (tl.clientWidth || 1)) * (T.range[1] - T.range[0])) / 10 : t, k.start), k.end);
-        F.lx = ev.clientX; T.scrubT = F.cur;
+        F.cur = Math.min(Math.max(ev.shiftKey ? F.cur + (((x - F.lx) / (tl.clientWidth || 1)) * (T.range[1] - T.range[0])) / 10 : t, k.start), k.end);
+        F.lx = x; T.scrubT = F.cur;
         return scrubS(F.cur, true);
       }
       if (T.tdrag === "start") k.start = +Math.min(t, k.end - 0.5).toFixed(2); else k.end = +Math.max(t, k.start + 0.5).toFixed(2);
@@ -2669,6 +2759,7 @@ function Settings() {
           <p class="muted" style="margin:0;font-size:13px">Powers clip ranking, moment search, the Ask-AI editor, virality analysis, style training and titles/captions. Get a key at <a href="https://console.anthropic.com" target="_blank">console.anthropic.com</a>.</p>
           <label class="field">API key ${s.anthropic_key_set ? `<span class="pill ok">saved ${esc(s.anthropic_key_hint)}</span>` : ""}<input type="password" id="key" placeholder="${s.anthropic_key_set ? "Leave blank to keep the current key" : "sk-ant-…"}" autocomplete="off"></label>
           <label class="field">Model<select id="model">${opt([["claude-opus-5-5", "Claude Opus 5.5 — best judgement (default)"], ["claude-sonnet-5-5", "Claude Sonnet 5.5 — faster, cheaper"], ["claude-haiku-5-5", "Claude Haiku 5.5 — fastest, cheapest"], ["claude-fable-5-2", "Claude Fable 5.2 — most capable, premium"]], s.model)}</select></label>
+          <label class="switch"><input type="checkbox" id="vj" ${s.visual_judge !== false ? "checked" : ""}> Let Claude see a few small frames when ranking clips from long videos <span class="muted" style="font-size:12px">(better picks on gaming/VTuber streams; uses more tokens — about 4 images for each of up to 12 candidates)</span></label>
           ${s.anthropic_key_set ? `<div><button type="button" class="btn sm danger" id="rmkey">Remove key</button></div>` : ""}
         </div>
         <div class="card stack"><h2>Transcription</h2>
@@ -2678,7 +2769,8 @@ function Settings() {
         <div class="card stack"><h2>Clip finding</h2>
           <div class="row wrap"><label class="field grow">Clips per video<input type="number" id="cc" min="1" max="40" value="${+s.clip_count}"></label>
           <label class="field grow">Min length (s)<input type="number" id="cmin" min="3" max="600" value="${+s.clip_min}"></label>
-          <label class="field grow">Max length (s)<input type="number" id="cmax" min="5" max="900" value="${+s.clip_max}"></label></div>
+          <label class="field grow" title="Clips aim for about this length. 0 = halfway between min and max.">Target length (s)<input type="number" id="ctg" min="0" max="900" value="${+s.clip_target || 0}"></label>
+          <label class="field grow" title="Hard cap: no AI-found clip is ever longer than this.">Max length (s)<input type="number" id="cmax" min="5" max="900" value="${+s.clip_max}"></label></div>
           <p class="muted" style="margin:0;font-size:12px">Shorts, TikTok and Reels allow up to 3 minutes; 20–60 s performs best for most channels.</p>
         </div>
         <div class="card stack"><h2>Defaults</h2>
@@ -2689,8 +2781,8 @@ function Settings() {
         </div>
         <div><button class="btn primary">Save settings</button></div>
       </form>
-      <div class="card stack" style="margin-top:20px" id="uiscale"><div class="row wrap"><h2 class="grow" style="margin:0">Interface size</h2><button class="btn sm" data-uireset="all">Reset all</button></div>
-        <p class="muted" style="margin:0;font-size:12.5px">Changes apply as you drag and are kept across restarts and updates. <span class="kbd">Ctrl</span>+<span class="kbd">=</span> / <span class="kbd">Ctrl</span>+<span class="kbd">-</span> / <span class="kbd">Ctrl</span>+<span class="kbd">0</span> change the whole app.</p>
+      <div class="card stack" style="margin-top:20px" id="uiscale"><div class="row wrap"><h2 class="grow" style="margin:0">Interface size</h2><button class="btn sm" data-uireset="all" title="Every part back to 100% of the automatic size for this window">⤢ Fit to screen / Reset</button></div>
+        <p class="muted" style="margin:0;font-size:12.5px">The base size follows your window automatically (now ${Math.round(uiAuto() * 100)}% for ${innerWidth} px); these multiply on top. Changes apply as you drag and are kept across restarts and updates. <span class="kbd">Ctrl</span>+<span class="kbd">=</span> / <span class="kbd">Ctrl</span>+<span class="kbd">-</span> / <span class="kbd">Ctrl</span>+<span class="kbd">0</span> change the whole app.</p>
         ${Object.entries(UI_KEYS).map(([k, l]) => `<div class="row"><label class="slider grow ui-row"><span>${l}</span><input type="range" data-ui="${k}" min="60" max="200" step="5" value="${Math.round(S.ui[k] * 100)}"><output>${Math.round(S.ui[k] * 100)}%</output></label><button class="btn xs ghost" data-uireset="${k}" title="Back to 100%">Reset</button></div>`).join("")}</div>
       <div class="card stack" style="margin-top:20px"><div class="row wrap"><h2 class="grow" style="margin:0">Diagnostics</h2>
         <button class="btn sm" id="doc">Run checks</button><button class="btn sm" id="docd" title="Also verifies the API key with Anthropic">Deep check</button></div>
@@ -2720,10 +2812,12 @@ function Settings() {
       e.preventDefault();
       const body = {
         model: $("#model").value, whisper_model: $("#wm").value, whisper_device: $("#wd").value, clip_count: +$("#cc").value, clip_min: +$("#cmin").value,
-        clip_max: +$("#cmax").value, default_aspect: $("#da").value, default_privacy: $("#dp").value, caption_uppercase: $("#cu").checked, caption_color: $("#ccol").value,
+        clip_max: +$("#cmax").value, clip_target: +$("#ctg").value || 0, default_aspect: $("#da").value, default_privacy: $("#dp").value, caption_uppercase: $("#cu").checked, caption_color: $("#ccol").value,
       };
       if (body.clip_min >= body.clip_max) return toast("Min length must be below max length.", "err");
+      if (body.clip_target && (body.clip_target < body.clip_min || body.clip_target > body.clip_max)) return toast("Target length must be between min and max (or 0 for automatic).", "err");
       if ($("#key").value.trim()) body.anthropic_api_key = $("#key").value.trim();
+      body.visual_judge = $("#vj").checked;
       try { S.settings = await api("/api/settings", { method: "PUT", body }); toast("Settings saved.", "ok"); sideStatus(); route(); } catch (err) { fail(err); }
     };
   };
