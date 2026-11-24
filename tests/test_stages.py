@@ -58,7 +58,9 @@ def test_every_item_sits_in_the_furthest_stage_it_reached():
         ["preclipped", "longform", "shortform", "ready", "ready", "uploaded"]
     item = next(i for s in board["stages"] for i in s["items"] if i["id"] == posted["id"])
     assert item["locked"] and item["type"] == "clip" and item["edit_url"] == f"#/studio/{posted['id']}"
-    assert item["posts"] == [{"platform": "youtube", "url": "https://youtu.be/abc", "video_id": "abc", "publish_at": None}]
+    [p0] = item["posts"]  # upload_id + account: the delete dialog names each post and its channel
+    assert {k: p0[k] for k in ("platform", "url", "video_id", "publish_at", "account")} == \
+        {"platform": "youtube", "url": "https://youtu.be/abc", "video_id": "abc", "publish_at": None, "account": None} and p0["upload_id"]
     assert item["pending"] == [{"platform": "tiktok", "status": "held", "when": "2030-01-02T10:00:00+00:00"}]
     assert item["duration"] == 10.0 and item["aspect"] == "9:16" and item["updated"]
     proj = next(i for s in board["stages"] for i in s["items"] if i["id"] == empty["id"])

@@ -16,6 +16,7 @@ faster-whisper>=1.2,<2          # transcription (pulls ctranslate2)
 numpy>=2.4,<3
 opencv-contrib-python-headless>=5.0,<6  # face (YuNet) + anime/VTuber (cascade) detection, saliency, object tracking, covers
 # (contrib replaces opencv-python-headless: uninstall that one first — both provide the same cv2 module)
+sherpa-onnx>=2.0.2,<3           # audio events (laughter, screams, gunshots…): Apache-2.0, ships its own onnxruntime.dll; optional
 
 # --- import & publish ---
 yt-dlp>=2026.6.9                # no cap: sites change often, keep it current (pip install -U yt-dlp)
@@ -26,6 +27,12 @@ google-auth-oauthlib>=1.5,<2
 
 # --- OBS link ---
 websockets>=16.0,<17            # obs-websocket v5 client (sync API) — also the only extra the standalone Relay needs
+
+# --- Claude Desktop link (MCP server over stdio; works in the windowed .exe, checked with PyInstaller 6.22) ---
+mcp>=1.28,<2                    # 2.x is a breaking major: upgrade deliberately
+
+# --- phone remote ---
+segno==1.6.6                    # QR code for pairing a phone (pure Python, BSD); pinned: it only draws one QR, no reason to drift
 
 # --- optional: NVIDIA GPU transcription when running from source (the .exe bundles them) ---
 # nvidia-cublas-cu12

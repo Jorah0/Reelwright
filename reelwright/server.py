@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,8 +12,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import ai, assets, config, doctor, lan, learn, log, media, obs, pipeline, platforms, schedule, store, usage, youtube
-from .config import PROJECTS, STATIC, YT_SECRET
+from . import accounts, ai, assets, config, doctor, lan, learn, log, media, multicam, obs, pipeline, platforms, providers, schedule, storage, store, usage, youtube
+from .config import STATIC, YT_SECRET
+from . import remote  # phone remote: its own opt-in Wi-Fi listener; here only the PC's Settings → Phone remote endpoints
 
 VIDEO_EXT = media.VIDEO_EXT
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
@@ -47,8 +49,10 @@ def _start():
     log.setup()
     log.event("app", "started")
     pipeline.start()
+    storage.start()  # finish a storage-folder move the app was closed in
     obs.start()
     lan.apply()
+    remote.apply()  # the phone remote's listener, when turned on in Settings
 
 
 def _404(doc, what="Not found"):
@@ -59,6 +63,51 @@ def _404(doc, what="Not found"):
 
 # ---------- settings ----------
 
+# ---------- desktop app: close-to-taskbar, quit, start with Windows ----------
+
+def _app_state() -> dict:
+    from . import desktop
+    return {"desktop": desktop.WINDOW is not None, "close_to_taskbar": bool(config.load().get("close_to_taskbar", True)),
+            "start_on_boot": desktop.start_on_boot(), "boot_command": desktop.boot_command()}
+
+
+@app.get("/api/app")
+def app_state():
+    return _app_state()
+
+
+@app.put("/api/app")
+def put_app(body: dict):
+    from . import desktop
+    for k in ("close_to_taskbar", "start_on_boot"):
+        if k in body and not isinstance(body[k], bool):
+            raise HTTPException(400, f"{k} must be true or false.")
+    if "close_to_taskbar" in body:
+        config.save({"close_to_taskbar": body["close_to_taskbar"]})
+    if "start_on_boot" in body:
+        try:
+            desktop.set_start_on_boot(body["start_on_boot"])
+        except (ImportError, OSError) as e:
+            raise HTTPException(400, f"Couldn't change the Windows startup entry: {e}")
+    return _app_state()
+
+
+@app.post("/api/app/show")
+def app_show():  # a second launch asks the running copy to come back instead of opening another window
+    from . import desktop
+    desktop.show_window()
+    return {"ok": True}
+
+
+@app.post("/api/app/quit")
+def app_quit():
+    from . import desktop
+    if desktop.WINDOW is None:
+        raise HTTPException(400, "Reelwright is running in a browser here; close the terminal that started it to quit.")
+    threading.Timer(0.3, desktop.quit_app).start()  # answer the page first, then close
+    return {"ok": True}
+
+
 @app.get("/api/settings")
 def get_settings():
     return config.public()
@@ -68,6 +117,9 @@ def get_settings():
 def put_settings(patch: dict):
     if "anthropic_api_key" in patch and patch["anthropic_api_key"] is None:
         patch.pop("anthropic_api_key")
+    for k in ("training_python", "training_wsl", "training_env_dir"):  # which program training runs: only via the
+        patch.pop(k, None)                                            # validated /api/training/env routes
+
     if "ui_scale" in patch:  # per-component interface scale; a bad value must never make the UI unusable
         raw = patch["ui_scale"] if isinstance(patch["ui_scale"], dict) else {}
         patch["ui_scale"] = {k: round(min(max(float(v), 0.6), 2.0), 2) for k, v in raw.items()
@@ -80,21 +132,90 @@ def put_settings(patch: dict):
             raise HTTPException(400, "Clip lengths must be numbers.")
         if not (3 <= lo < hi <= 900) or (tg and not lo <= tg <= hi):
             raise HTTPException(400, "Clip lengths need min < max (3–900 s), with the target between them.")
+    _check_ai_settings(patch)
+    try:
+        storage.check_settings(patch)  # space saver + archive folders; switching it on starts every item's clock now
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     config.save(patch)
     return config.public()
 
 
 UI_SCALE_KEYS = ("app", "sidebar", "text", "preview", "timeline", "panels")
+AI_PROVIDER_FIELDS = {"model": str, "base_url": str, "api_key": str, "num_ctx": int, "vision": bool}
+
+
+def _check_ai_settings(patch: dict) -> None:
+    """Validates the multi-provider keys in place; provider settings merge into the saved ones (a null key = keep it)."""
+    names = providers.NAMES
+    if "ai_routes" in patch:
+        r = patch["ai_routes"]
+        if not isinstance(r, dict) or any(k not in ai.TASKS or v not in names for k, v in r.items()):
+            raise HTTPException(400, f"AI routes map a task ({', '.join(ai.TASKS)}) to a provider ({', '.join(names)}).")
+        patch["ai_routes"] = {**config.load()["ai_routes"], **r}
+    if "ai_consensus" in patch:
+        c = patch["ai_consensus"]
+        a, _, b = c.partition(":") if isinstance(c, str) else ("", "", "")
+        if c not in ("off", "local_then_claude") and not (a in names and b in names and a != b):
+            raise HTTPException(400, "Consensus is off, local_then_claude, or two different providers as scout:reviewer.")
+    if "ai_providers" in patch:
+        raw = patch["ai_providers"]
+        if not isinstance(raw, dict) or not set(raw) <= set(config.PROVIDER_DEFAULTS):
+            raise HTTPException(400, f"Unknown AI provider (known: {', '.join(config.PROVIDER_DEFAULTS)}).")
+        saved = config.load()["ai_providers"]
+        out = dict(saved)
+        for name, p in raw.items():
+            if not isinstance(p, dict):
+                raise HTTPException(400, f"Bad value in the {name} settings.")
+            p = {k: v for k, v in p.items() if k in AI_PROVIDER_FIELDS and v is not None}
+            if isinstance(p.get("num_ctx"), float) and abs(p["num_ctx"]) < 1e9:
+                p["num_ctx"] = int(p["num_ctx"])
+            if any(not isinstance(v, AI_PROVIDER_FIELDS[k]) or (k == "num_ctx" and isinstance(v, bool)) for k, v in p.items()):
+                raise HTTPException(400, f"Bad value in the {name} settings.")
+            if "base_url" in p:
+                try:
+                    p["base_url"] = providers.check_url(p["base_url"].strip())
+                except ValueError as e:
+                    raise HTTPException(400, str(e))
+            if "num_ctx" in p:
+                p["num_ctx"] = min(max(p["num_ctx"], 2048), 262144)
+            out[name] = {**(saved.get(name) or {}), **p}
+        patch["ai_providers"] = out
+
+
+@app.post("/api/ai/test")
+def test_ai_provider(body: dict):
+    """A tiny structured call to one provider with the saved settings: proves model, URL and key work."""
+    name = body.get("provider")
+    if name not in providers.NAMES:
+        raise HTTPException(400, "Unknown provider.")
+    try:
+        r = ai._ask("Reply with JSON only.", "Write a 2-4 word search query about cats doing funny things.", ai.Query,
+                    effort="low", provider=name)
+        return {"ok": True, "result": r.query, "model": ai.model_name(name)}
+    except Exception as e:  # shown in the card; the message never contains the key (providers scrub it)
+        return {"ok": False, "error": str(e)[:400]}
+
+
+@app.get("/api/ai/ollama/models")
+def ollama_models():
+    try:
+        ms = providers.ollama_models(config.provider("ollama")["base_url"])
+    except Exception as e:
+        return {"models": [], "error": f"Ollama isn't reachable: {str(e)[:200]}"}
+    return {"models": [{"name": m.get("name"), "size": (m.get("details") or {}).get("parameter_size"),
+                        "vision": "vision" in (m.get("capabilities") or [])} for m in ms]}
 
 
 # ---------- projects ----------
 
 @app.post("/api/projects")
-def upload_project(file: UploadFile = File(...), autopilot: str = Form("{}")):
+def upload_project(file: UploadFile = File(...), autopilot: str = Form("{}"), video_type: str = Form("auto"),
+                   sub_genre: str = Form("")):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in VIDEO_EXT:
         raise HTTPException(400, f"Unsupported file type {ext or '(none)'}.")
-    p = pipeline.new_project(Path(file.filename).stem, json.loads(autopilot or "{}"))
+    p = pipeline.new_project(Path(file.filename).stem, json.loads(autopilot or "{}"), video_type=_video_type(video_type, sub_genre))
     with open(pipeline.pdir(p["id"]) / f"source{ext}", "wb") as f:
         shutil.copyfileobj(file.file, f, 8 * 1024 * 1024)
     store.update("project", p["id"], {"source": f"source{ext}", "status": "queued", "stage": "Queued for analysis"})
@@ -107,30 +228,59 @@ def import_url(body: dict):
     url = (body.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "Enter a full http(s) link.")
-    p = pipeline.new_project(url, body.get("autopilot"))
+    p = pipeline.new_project(url, body.get("autopilot"), video_type=_video_type(body.get("video_type"), body.get("sub_genre")))
     pipeline.submit("import_url", project_id=p["id"], url=url)
     return p
+
+
+def _video_type(kind, sub=None) -> dict | None:
+    """The creator's fixed type ("auto"/missing = detect it during analysis); 400 for anything off the list."""
+    try:
+        return ai.fixed_type(kind, sub)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
 
 
 @app.get("/api/projects")
 def list_projects():
     projects = store.find("project")
-    clips = store.find("clip")
+    clips = [c for c in store.find("clip") if not c.get("expired")]  # expired clips: history, behind "Show expired"
+    dues = storage.due_map()
     for p in projects:
-        p["clip_count"] = sum(c["project_id"] == p["id"] for c in clips)
+        mine = [c for c in clips if c["project_id"] == p["id"]]
+        p["clip_count"] = len(mine)
+        p["first_clip"] = mine[0]["id"] if mine else None  # an imported short opens straight in the Studio
+        p.update(storage.project_view(p, dues))
     return projects
 
 
 @app.get("/api/projects/{pid}")
-def get_project(pid: str):
+def get_project(pid: str, expired: bool = False):
     p = _404(store.get("project", pid))
-    p["clips"] = sorted(store.find("clip", project_id=pid), key=lambda c: (c["source"] == "manual", -c["score"]))
+    every = store.find("clip", project_id=pid)
+    dues = storage.due_map({pid})
+    p["clips"] = sorted([{**c, "due": dues.get(("clip", c["id"]))} for c in every if expired or not c.get("expired")],
+                        key=lambda c: (c["source"] == "manual", -c["score"]))
+    p["expired_count"] = sum(bool(c.get("expired")) for c in every)
+    p.update(storage.project_view(p, dues))
     return p
 
 
 @app.patch("/api/projects/{pid}")
 def patch_project(pid: str, body: dict):
-    return _404(store.update("project", pid, {k: v for k, v in body.items() if k in ("name", "autopilot")}))
+    _404(store.get("project", pid))
+    patch = {k: v for k, v in body.items() if k in ("name", "autopilot")}
+    if "keep" in body:  # "Keep": the space saver never touches this project's source, clips or long forms
+        patch["keep"] = bool(body["keep"])
+    if "video_type" in body:  # the creator's override; "auto" hands it back to detection on the next analysis
+        patch["video_type"] = _video_type(body["video_type"], body.get("sub_genre"))
+    p = _404(store.update("project", pid, patch))
+    if body.get("refind") and p["status"] == "ready":  # re-find with the new type: untouched AI picks make way
+        for c in store.find("clip", project_id=pid):
+            if pipeline.replaceable(c):
+                store.delete("clip", c["id"])
+        pipeline.submit("find", project_id=pid, query="")
+    return p
 
 
 @app.delete("/api/projects/{pid}")
@@ -139,13 +289,67 @@ def delete_project(pid: str):
         pipeline.pdir(pid)
     except ValueError:
         raise HTTPException(404, "No such project")
+    if why := storage.hold_reason():  # mid-move or drive away: deleting now would orphan or miss its folder
+        raise HTTPException(409, why)
     pipeline.delete_project(pid)
     return {"ok": True}
 
 
+# ---------- camera angles (multicam.py) ----------
+
+def _angle(fn, *args):
+    try:
+        return fn(*args)
+    except multicam.AngleError as e:
+        raise HTTPException(e.status, str(e)) from None
+
+
+@app.post("/api/projects/{pid}/angles")
+def add_angle(pid: str, file: UploadFile = File(...), name: str = Form("")):
+    return _angle(multicam.add_upload, pid, file.filename or "", file.file, name)
+
+
+@app.post("/api/projects/{pid}/angles/url")
+def add_angle_url(pid: str, body: dict):
+    return _angle(multicam.add_url, pid, body.get("url") or "", body.get("name") or "")
+
+
+@app.get("/api/projects/{pid}/angles/obs")
+def angle_obs_files(pid: str):
+    _404(store.get("project", pid))
+    return multicam.obs_folders()
+
+
+@app.post("/api/projects/{pid}/angles/obs")
+def add_angle_obs(pid: str, body: dict):
+    return _angle(multicam.add_obs, pid, str(body.get("obs_id") or ""), body.get("file") or "", body.get("name") or "")
+
+
+@app.patch("/api/projects/{pid}/angles/{aid}")
+def patch_angle(pid: str, aid: str, body: dict):
+    return _angle(multicam.update, pid, aid, body)
+
+
+@app.post("/api/projects/{pid}/angles/{aid}/resync")
+def resync_angle(pid: str, aid: str):
+    return _angle(multicam.resync, pid, aid)
+
+
+@app.delete("/api/projects/{pid}/angles/{aid}")
+def delete_angle(pid: str, aid: str):
+    return _angle(multicam.remove, pid, aid)
+
+
+@app.post("/api/clips/{cid}/switches/suggest")
+def suggest_switches(cid: str):
+    """Auto-switch: proposed angle cuts for the clip (not saved: the creator approves or edits them)."""
+    return _angle(multicam.suggest_for_clip, _404(store.get("clip", cid)))
+
+
 @app.post("/api/projects/{pid}/analyze")
 def reanalyze(pid: str):
-    _404(store.get("project", pid))
+    if _404(store.get("project", pid)).get("source_removed"):  # removed to save space: 400 with the fix, never a failed project
+        pipeline.source_file(store.get("project", pid))
     store.update("project", pid, {"status": "queued", "stage": "Queued for analysis", "progress": 0.0})
     return pipeline.submit("analyze", project_id=pid)
 
@@ -198,10 +402,44 @@ def create_clip(pid: str, body: dict):
 
 EDIT_RANGES = {"crop_x": (0, 1), "crop_y": (0, 1), "speed": (0.25, 4), "brightness": (-1, 1), "contrast": (0, 3), "saturation": (0, 3),
                "gamma": (0.1, 3), "volume": (0, 5), "fade_in": (0, 10), "fade_out": (0, 10), "cam_x": (0, 1), "cam_y": (0, 1),
-               "cam_w": (0.02, 1), "cam_h": (0.02, 1), "split": (0.15, 0.7), "zoom": (1, 4), "music_volume": (0, 2)}
-EDIT_ENUMS = {"aspect": ("source", "9:16", "1:1", "4:5", "16:9"), "fit": ("crop", "blur"), "layout": ("single", "split"),
+               "cam_w": (0.02, 1), "cam_h": (0.02, 1), "split": (0.15, 0.7), "zoom": (1, 4), "music_volume": (0, 2),
+               "split2": (0.1, 0.5), "pip_size": (0.15, 0.6), "pip_radius": (0, 0.5), "pip_border": (0, 24)}
+EDIT_ENUMS = {"aspect": ("source", "9:16", "1:1", "4:5", "16:9"), "fit": ("crop", "blur"), "layout": media.LAYOUTS,
               "caption_style": ("bold", "clean", "boxed", "neon"), "caption_pos": ("low", "middle", "high"),
-              "sticker_pos": ("top-left", "top-center", "top-right", "bottom-left", "bottom-right")}
+              "sticker_pos": ("top-left", "top-center", "top-right", "bottom-left", "bottom-right"), "pip_corner": media.PIP_CORNERS,
+              "caption_anim": media.CAPTION_ANIMS, "bleep": media.BLEEP_MODES}
+
+
+def angle_ids(project: dict | None) -> set:
+    """Camera-angle ids of a project (project["angles"]: [{id, ...}] or ids; absent until angles can be imported)."""
+    return {a.get("id") if isinstance(a, dict) else a for a in (project or {}).get("angles") or []} - {None}
+
+
+def _regions(v, angles: set = frozenset()) -> list | None:
+    """Layout regions: up to media.MAX_REGIONS {id, role, x, y, w, h, follow, source?, out?}, boxes clamped inside the 0..1
+    frame; source is "main" (the default, not stored) or one of the project's camera-angle ids."""
+    if v is None:
+        return None
+    if not isinstance(v, list) or len(v) > media.MAX_REGIONS:
+        raise HTTPException(400, f"regions must be a list of up to {media.MAX_REGIONS} boxes.")
+    out, ids = [], set()
+    for i, r in enumerate(v):
+        if not isinstance(r, dict) or r.get("role") not in media.ROLES:
+            raise HTTPException(400, f"Each region needs a role: {', '.join(media.ROLES)}.")
+        try:
+            box = media.clamp_box(r)
+            dest = media.clamp_box(r["out"]) if r.get("out") is not None else None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise HTTPException(400, "Region boxes need numeric x, y, w, h.")
+        rid = str(r.get("id") or "")[:24] or f"r{i}"
+        rid = rid if rid not in ids else store.new_id()
+        ids.add(rid)
+        src = r.get("source") or "main"
+        if src != "main" and src not in angles:
+            raise HTTPException(400, f"Region source must be \"main\" or one of this project's camera angles, not {str(src)[:40]!r}.")
+        out.append({"id": rid, "role": r["role"], **box, "follow": bool(r.get("follow")), **({"out": dest} if dest else {}),
+                    **({"source": src} if src != "main" else {})})
+    return out or None
 
 
 def _keyframes(v, length: float) -> list:
@@ -252,7 +490,7 @@ def _text_style(field: str, v, name: str):
     if field == "font":
         if not isinstance(v, str) or len(v) > 80:
             raise HTTPException(400, f"{name} must be a font family name.")
-        return v.strip() or None
+        return media.safe_font(v) or None  # it is written into ASS tags: nothing that could inject one
     if field == "weight":
         if v not in ("normal", "bold"):
             raise HTTPException(400, f"{name} must be normal or bold.")
@@ -265,9 +503,54 @@ def _text_style(field: str, v, name: str):
 
 
 TEXT_FIELDS = ("font", "size", "weight", "color", "outline", "outline_color", "shadow", "spacing")
-TEXT_KEYS = {f"{who}_{f}": f for who in ("caption", "title", "sticker") for f in TEXT_FIELDS}
+TEXT_KEYS = {f"{who}_{f}": f for who in ("caption", "title", "sticker", "headline") for f in TEXT_FIELDS}
+HEADLINE_ENUMS = {"theme": ("auto", "custom", *media.HEADLINE_THEMES), "position": media.HEADLINE_POSITIONS, "show": media.HEADLINE_SHOW}
+
+
+def _headline(v) -> dict | None:
+    """The headline banner: only the keys given (patch_clip merges them into the clip's), each checked. None clears it."""
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise HTTPException(400, "headline must be an object.")
+    out = {}
+    for k, cap in (("text", media.HEADLINE_MAX), ("kicker", media.KICKER_MAX)):
+        if k in v:
+            if not isinstance(v[k], str) or len(v[k].strip()) > cap:
+                raise HTTPException(400, f"Headline {k} must be text of at most {cap} characters.")
+            out[k] = v[k].strip()
+    for k, opts in HEADLINE_ENUMS.items():
+        if k in v:
+            if v[k] not in opts:
+                raise HTTPException(400, f"Headline {k} must be one of {', '.join(opts)}.")
+            out[k] = v[k]
+    for k in ("on", "push"):
+        if k in v:
+            out[k] = bool(v[k])
+    if "seconds" in v:
+        out["seconds"] = round(_num(v["seconds"], "Headline seconds", 0.5, 30), 2)
+    return out
 OVERLAY_KINDS = ("image", "gif", "video", "sound", "text", "emoji")
 OVERLAY_ANIMS = ("none", "pop", "fade", "shake", "slide")
+
+
+def _switches(v, clip: dict, angles: set) -> list:
+    """Angle cuts [{t, angle}]: t in clip seconds (clamped into the clip), angle "main" or one of the project's angles;
+    sorted, one cut per moment."""
+    if v is None:
+        return []
+    if not isinstance(v, list) or len(v) > 500:
+        raise HTTPException(400, "switches must be a list of up to 500 {t, angle}.")
+    out, span = {}, clip["end"] - clip["start"]
+    for sw in v:
+        try:
+            t, ang = float(sw["t"]), sw.get("angle") or "main"
+        except (TypeError, KeyError, ValueError, AttributeError):
+            raise HTTPException(400, "Each switch must be {t, angle}.") from None
+        if not math.isfinite(t) or (ang != "main" and ang not in angles):
+            raise HTTPException(400, f"A switch must cut to \"main\" or one of this project's camera angles, not {str(ang)[:40]!r}.")
+        out[round(min(max(t, 0.0), span), 2)] = ang
+    return [{"t": t, "angle": a} for t, a in sorted(out.items())]
 
 
 def _overlays(v, clip: dict) -> list | None:
@@ -329,6 +612,34 @@ def _words(v, clip: dict) -> list | None:
     return out
 
 
+def _cuts(v, clip: dict) -> list | None:
+    """Cut spans: up to 500 [s, e] with s < e, clamped inside the clip, merged and sorted; None when nothing is cut.
+    At least 0.5 s of the clip must stay (the render would otherwise fall back to keeping everything)."""
+    if v is None or v == []:
+        return None
+    if not isinstance(v, list) or len(v) > 500:
+        raise HTTPException(400, "cuts must be a list of up to 500 [start, end] spans.")
+    spans = []
+    for c in v:
+        if not isinstance(c, (list, tuple)) or len(c) != 2:
+            raise HTTPException(400, "Each cut must be [start, end].")
+        s, e = _num(c[0], "cut start", -1e9, 1e9), _num(c[1], "cut end", -1e9, 1e9)
+        if s >= e:
+            raise HTTPException(400, "Each cut must end after it starts.")
+        s, e = max(s, clip["start"]), min(e, clip["end"])
+        if s < e:
+            spans.append([round(s, 3), round(e, 3)])
+    out: list = []
+    for s, e in sorted(spans):
+        if out and s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    if clip["end"] - clip["start"] - sum(e - s for s, e in out) < 0.5:
+        raise HTTPException(400, "Those cuts would remove the whole clip: keep at least 0.5 s.")
+    return out or None
+
+
 def clean_edit(edit: dict, clip: dict) -> dict:
     """Validate edit values at the API boundary (from the UI, the AI assistant, or anything else posting here).
     `clip` (start/end) bounds the list-valued keys; track_manual comes back as is for patch_clip to file under track."""
@@ -336,6 +647,9 @@ def clean_edit(edit: dict, clip: dict) -> dict:
     for k, v in edit.items():
         if k == "track_manual":
             out[k] = _keyframes(v, clip["end"] - clip["start"])
+            continue
+        if k == "cuts":  # text-based cuts (WP5): [[s, e], …] source seconds the render removes (pipeline.clip_keeps)
+            out[k] = _cuts(v, clip)
             continue
         if k not in media.DEFAULT_EDIT:
             continue
@@ -345,8 +659,20 @@ def clean_edit(edit: dict, clip: dict) -> dict:
             out[k] = _words(v, clip)
         elif k == "framing":
             out[k] = _framing(v)
+        elif k == "headline":
+            out[k] = _headline(v)
+        elif k == "regions":
+            out[k] = _regions(v, angle_ids(store.get("project", clip.get("project_id") or "")))
         elif k == "overlays":
             out[k] = _overlays(v, clip)
+        elif k == "switches":
+            out[k] = _switches(v, clip, angle_ids(store.get("project", clip.get("project_id") or "")))
+        elif k == "audio_source":
+            if v != "main" and v not in angle_ids(store.get("project", clip.get("project_id") or "")):
+                raise HTTPException(400, "audio_source must be \"main\" or one of this project's camera angles.")
+            out[k] = v
+        elif k == "switch_region":
+            out[k] = str(v or "")[:24]
         elif k in EDIT_RANGES:
             try:
                 lo, hi = EDIT_RANGES[k]
@@ -369,7 +695,8 @@ def clean_edit(edit: dict, clip: dict) -> dict:
 
 
 POSTED = "Already posted — make a new version to edit it."
-META_KEYS = {"title", "hook", "rating"}  # what stays editable after a clip is posted (doesn't change the video)
+META_KEYS = {"title", "hook", "rating", "keep"}  # what stays editable after a clip is posted (doesn't change the video)
+EXPIRED = "This clip expired (its render was removed to save space): press Keep to restore it, or make a new version."
 
 
 def posted(cid: str) -> bool:
@@ -377,10 +704,12 @@ def posted(cid: str) -> bool:
 
 
 def _editable(cid: str) -> dict:
-    """The clip, unless it has been posted: the published render is final (pending uploads still use it)."""
+    """The clip, unless it has been posted (the published render is final; pending uploads still use it) or expired."""
     clip = _404(store.get("clip", cid))
     if posted(cid):
         raise HTTPException(409, POSTED)
+    if clip.get("expired"):
+        raise HTTPException(409, EXPIRED)
     return clip
 
 
@@ -402,6 +731,8 @@ def patch_clip(cid: str, body: dict):
                 c["edit"]["track"] = {"points": [], **(c["edit"].get("track") or {}), "manual": ed.pop("track_manual")}
             if "framing" in ed:  # partial framing updates keep the other key
                 ed["framing"] = {**(c["edit"].get("framing") or {}), **ed["framing"]}
+            if ed.get("headline"):  # partial headline updates (just the theme, just the text…) keep the rest
+                ed["headline"] = {**(c["edit"].get("headline") or {}), **ed["headline"]}
             c["edit"] = {**c["edit"], **ed}
             changed = True
         for k in ("title", "hook"):
@@ -409,6 +740,10 @@ def patch_clip(cid: str, body: dict):
                 c[k] = body[k]
         if "rating" in body:
             c["rating"] = max(-1, min(1, int(body["rating"])))
+        if "keep" in body:  # pinned: never expired by the space saver; Keep on an expired clip restores it
+            c["keep"] = bool(body["keep"])
+            if c["keep"]:
+                c.pop("expired", None)
         if c["end"] - c["start"] < 0.5:
             raise HTTPException(400, "Clip must be at least 0.5 s long.")
         if changed:
@@ -430,7 +765,7 @@ def version_clip(cid: str):
     base = re.sub(r" \(v\d+\)$", "", src["title"])
     n = 2 + len(store.find("clip", version_of=root))
     copy = {k: json.loads(json.dumps(v)) for k, v in src.items() if k not in ("id", "created", "export", "posts", "rating",
-                                                                               "track_error")}
+                                                                               "track_error", "expired", "keep")}
     return store.put("clip", {**copy, "title": f"{base} (v{n})", "export": None, "posts": {}, "rating": 0, "version_of": root})
 
 
@@ -452,7 +787,7 @@ def export_clip(cid: str):
 def _face(cid: str):
     clip = _404(store.get("clip", cid))
     p = store.get("project", clip["project_id"])
-    face = media.face_center(pipeline.pdir(p["id"]) / p["source"], clip["start"], clip["end"])
+    face = media.face_center(pipeline.source_file(p), clip["start"], clip["end"])
     if not face:
         raise HTTPException(422, "No face found in this clip — position the box by hand instead.")
     return clip, p, face
@@ -469,7 +804,105 @@ def facecam(cid: str):
     clip, p, face = _face(cid)
     split = float(clip["edit"].get("split", 0.4))
     rect = media.facecam_rect(face, p["meta"]["width"], p["meta"]["height"], 1080 / max(round(1920 * split), 2))
-    return patch_clip(cid, {"edit": {"layout": "split", **rect}})
+    lay = clip["edit"].get("layout", "single")
+    edit = {"layout": "split" if lay == "single" else lay, **rect}
+    if clip["edit"].get("regions"):  # the regions drive the render: move (or add) the cam region too
+        box = {k[4:]: v for k, v in rect.items()}
+        rs = [dict(r) for r in clip["edit"]["regions"]]
+        cam = next((r for r in rs if r["role"] == "cam"), None)
+        edit["regions"] = [{**r, **box} if r is cam else r for r in rs] if cam else \
+            [{"id": "cam", "role": "cam", **box}, *rs[:media.MAX_REGIONS - 1]]
+    return patch_clip(cid, {"edit": edit})
+
+
+@app.post("/api/clips/{cid}/regions/detect")
+def detect_regions(cid: str):
+    """Suggested regions: cam around the face, a chat column if one stands out, main = the rest."""
+    clip = _editable(cid)
+    p = store.get("project", clip["project_id"])
+    regs = media.detect_regions(pipeline.source_file(p), clip["start"], clip["end"],
+                                p["meta"]["width"], p["meta"]["height"])
+    lay = clip["edit"].get("layout", "single")
+    roles = {r["role"] for r in regs}
+    if "chat" in roles:
+        lay = "stack3"
+    elif lay == "single" and "cam" in roles:
+        lay = "split"
+    return patch_clip(cid, {"edit": {"layout": lay, "regions": regs}})
+
+
+def _layout_of(cid: str) -> dict:
+    e = {**media.DEFAULT_EDIT, **_404(store.get("clip", cid))["edit"]}
+    return {k: e[k] for k in media.LAYOUT_KEYS}
+
+
+@app.post("/api/clips/{cid}/layout/apply-all")
+def apply_layout_all(cid: str):
+    """This clip's layout and regions onto every other editable clip of its project (posted clips and montages stay)."""
+    lay, pid = _layout_of(cid), store.get("clip", cid)["project_id"]
+    n = 0
+    for c in store.find("clip", project_id=pid):
+        if c["id"] != cid and not c.get("parts") and not posted(c["id"]):
+            patch_clip(c["id"], {"edit": lay})
+            n += 1
+    return {"updated": n}
+
+
+@app.post("/api/clips/{cid}/layout/default")
+def save_layout_default(cid: str):
+    """New clips start with this clip's layout and regions (pipeline.new_clip applies it over profile/learned guesses)."""
+    lay = _layout_of(cid)  # camera-angle sources belong to this project only: the default keeps the boxes, not them
+    lay["regions"] = [{k: v for k, v in r.items() if k != "source"} for r in lay.get("regions") or []] or lay.get("regions")
+    store.put("pref", {"id": "layout", "edit": lay})
+    return {"ok": True}
+
+
+# ---------- headline banner ----------
+
+@app.get("/api/headline/themes")
+def headline_themes():
+    """The preset themes, the "auto" map (video type -> theme), the creator's saved theme and whether new clips get one."""
+    return {"themes": media.HEADLINE_THEMES, "auto": media.HEADLINE_AUTO, "fonts": media.HEADLINE_FONTS,
+            "custom": (store.get("pref", "headline_theme") or {}).get("theme"), "default_on": bool(store.get("pref", "headline"))}
+
+
+@app.post("/api/clips/{cid}/headline/write")
+def headline_write(cid: str):
+    """3 headline options + a kicker from the clip's transcript, title and hook; without AI, the hook and title."""
+    clip = _404(store.get("clip", cid))
+    plain = list(dict.fromkeys(t for t in (media.headline_text(clip.get("hook")), media.headline_text(clip.get("title"))) if t))
+    segs = pipeline.load_json(clip["project_id"], "transcript.json", {"segments": []})["segments"]
+    try:
+        return {**ai.headline_options(clip, segs), "ai": True}
+    except RuntimeError as e:  # no key, offline, refused: the honest defaults still work
+        return {"options": plain, "kicker": "", "ai": False, "error": str(e)}
+
+
+@app.post("/api/clips/{cid}/headline/theme")
+def save_headline_theme(cid: str):
+    """This clip's headline look (theme + its style overrides) saved as the creator's own theme ("custom")."""
+    clip = _404(store.get("clip", cid))
+    e = {**media.DEFAULT_EDIT, **clip["edit"]}
+    vt = ((store.get("project", clip["project_id"]) or {}).get("video_type") or {}).get("type")
+    spec = media.headline_spec({**e, "headline": {**(e["headline"] or {}), "on": True, "text": "x"}}, vt,
+                               (store.get("pref", "headline_theme") or {}).get("theme"))
+    theme = {k: spec[k] for k in media.HEADLINE_THEME_KEYS} | {"name": "My theme"}
+    store.put("pref", {"id": "headline_theme", "theme": theme})
+    return theme
+
+
+@app.post("/api/clips/{cid}/headline/default")
+def save_headline_default(cid: str, body: dict):
+    """{"on": true}: new clips (manual, AI and autopilot) get this clip's headline look with their own hook as the text.
+    {"on": false} stops that."""
+    if not body.get("on", True):
+        store.delete("pref", "headline")
+        return {"ok": True, "on": False}
+    e = {**media.DEFAULT_EDIT, **_404(store.get("clip", cid))["edit"]}
+    look = {k: v for k, v in (e["headline"] or {}).items() if k not in ("on", "text", "kicker")}
+    store.put("pref", {"id": "headline", "edit": {"headline": look, **{f"headline_{f}": e[f"headline_{f}"] for f in TEXT_FIELDS
+                                                                       if e[f"headline_{f}"] is not None}}})
+    return {"ok": True, "on": True}
 
 
 def _track_jobs(cid: str) -> list[dict]:
@@ -544,33 +977,86 @@ def _clip_item(c: dict, ups: list[dict]) -> dict:
     return {"type": "clip", "id": c["id"], "project_id": pid, "title": c.get("title"), "stage": stage, "thumb": thumb,
             "duration": round(c["end"] - c["start"], 3), "aspect": aspect,
             "updated": max([s for s in stamps if s] or [_iso(c.get("created"))]),
-            "posts": [{"platform": u["platform"], "url": u.get("url"), "video_id": u.get("video_id"), "publish_at": u.get("publish_at")}
-                      for u in done],
+            "posts": [{"upload_id": u["id"], "platform": u["platform"], "url": u.get("url"), "video_id": u.get("video_id"),
+                       "publish_at": u.get("publish_at"), "account": (pipeline._account_of(u) or {}).get("name")} for u in done],
             "pending": [{"platform": u["platform"], "status": u["status"], "when": u.get("publish_at") or u.get("upload_at")}
                         for u in pending],
             "locked": bool(done), "edit_url": f"#/studio/{c['id']}"}
 
 
 @app.get("/api/pipeline")
-def pipeline_board():
-    """Every project and clip on one board: each in exactly one stage, the furthest it has reached."""
+def pipeline_board(expired: bool = False):
+    """Every project and clip on one board: each in exactly one stage, the furthest it has reached. Clips and long forms
+    the space saver expired are left out unless ?expired=1; every card carries its Keep pin and due date."""
     stages = {k: [] for k, _ in STAGES}
-    clips, ups = store.find("clip"), store.find("upload")
+    clips, ups, lfs = store.find("clip"), store.find("upload"), store.find("longform")
+    dues = storage.due_map()
     by_clip: dict[str, list] = {}
     for u in ups:
-        by_clip.setdefault(u.get("clip_id"), []).append(u)
-    with_clips = {c["project_id"] for c in clips}
+        by_clip.setdefault(u.get("longform_id") or u.get("clip_id"), []).append(u)
+    with_clips = {c["project_id"] for c in clips} | {d["project_id"] for d in lfs}
     for p in store.find("project"):
         if p.get("status") in ("importing", "queued", "analyzing") or p.get("status") == "ready" and p["id"] not in with_clips:
             stages["harvested"].append({
                 "type": "project", "id": p["id"], "project_id": p["id"], "title": p.get("name"), "stage": "harvested",
                 "thumb": f"/files/{p['id']}/poster.jpg" if (pipeline.pdir(p["id"]) / "poster.jpg").exists() else None,
                 "duration": (p.get("meta") or {}).get("duration"), "aspect": None, "updated": _iso(p.get("created")),
-                "posts": [], "pending": [], "locked": False, "edit_url": f"#/editor/{p['id']}"})
-    for c in clips:
-        item = _clip_item(c, by_clip.get(c["id"], []))
-        stages[item["stage"]].append(item)
+                "posts": [], "pending": [], "locked": False, "edit_url": f"#/editor/{p['id']}",
+                "keep": bool(p.get("keep")), "due": dues.get(("source", p["id"]))})
+    for kind, docs, make in (("clip", clips, _clip_item), ("longform", lfs, _longform_item)):
+        for d in docs:
+            if d.get("expired") and not expired:
+                continue
+            item = make(d, by_clip.get(d["id"], []))
+            item.update(keep=bool(d.get("keep")), expired=d.get("expired"), due=dues.get((kind, d["id"])))
+            stages[item["stage"]].append(item)
     return {"stages": [{"key": k, "label": label, "items": stages[k]} for k, label in STAGES]}
+
+
+LF_LANE = {"captured": "preclipped", "edited": "longform", "rendered": "ready", "uploaded": "uploaded"}
+
+
+def _longform_item(d: dict, ups: list[dict]) -> dict:
+    """A long-form card: captured → edited → rendered → uploaded, shown in the matching lane and marked Long form."""
+    lf_stage = longform.stage(d, ups)
+    done = [u for u in ups if u["status"] == "done"]
+    pending = [u for u in ups if u["status"] in PENDING]
+    exp, pid = d.get("export") or {}, d["project_id"]
+    thumb = f"/files/{pid}/{exp['cover']}" if exp.get("cover") else \
+        (f"/files/{pid}/poster.jpg" if (pipeline.pdir(pid) / "poster.jpg").exists() else None)
+    stamps = [exp.get("at"), *(u.get("uploaded_at") for u in ups)]
+    return {"type": "longform", "id": d["id"], "project_id": pid, "title": d.get("title"), "stage": LF_LANE[lf_stage],
+            "lf_stage": lf_stage, "thumb": thumb, "duration": longform.length(d), "aspect": d["edit"].get("aspect"),
+            "updated": max([s for s in stamps if s] or [_iso(d.get("created"))]),
+            "posts": [{"upload_id": u["id"], "platform": u["platform"], "url": u.get("url"), "video_id": u.get("video_id"),
+                       "publish_at": u.get("publish_at"), "account": (pipeline._account_of(u) or {}).get("name")} for u in done],
+            "pending": [{"platform": u["platform"], "status": u["status"], "when": u.get("publish_at") or u.get("upload_at")}
+                        for u in pending],
+            "locked": bool(done), "edit_url": f"#/long/{d['id']}"}
+
+
+@app.post("/api/pipeline/delete")
+def pipeline_delete(body: dict):
+    """Delete board items: {items: [{type: "project"|"clip", id}], options: {remote: {upload_id: true}}}. One result per
+    item, so one failure never blocks the rest. A posted video is deleted on its platform only when its box was ticked."""
+    items, remote = body.get("items"), (body.get("options") or {}).get("remote") or {}
+    if not isinstance(items, list) or not isinstance(remote, dict):
+        raise HTTPException(400, "Send items as a list of {type, id}.")
+    ticked = {k for k, v in remote.items() if v is True}
+    out = []
+    for it in items:
+        kind, iid = (it.get("type"), it.get("id")) if isinstance(it, dict) else (None, None)
+        if kind not in ("project", "clip", "longform") or not isinstance(iid, str) or not iid:
+            res = {"ok": False, "error": "Not a project, clip or long-form edit."}
+        else:
+            try:
+                res = pipeline.delete_item(kind, iid, ticked)
+            except Exception as e:
+                log.error("pipeline", f"delete {kind} {iid}")
+                res = {"ok": False, "error": str(e)[:300]}
+        out.append({"type": kind if isinstance(kind, str) else None, "id": iid if isinstance(iid, str) else None,
+                    "canceled": 0, "remote": [], "error": None, **res})
+    return {"results": out}
 
 
 # ---------- AI plan → approve → apply ----------
@@ -740,6 +1226,16 @@ def clip_virality(cid: str, body: dict):
 @app.post("/api/clips/{cid}/upload")
 def upload_clip(cid: str, body: dict):
     _404(store.get("clip", cid))
+    if body.get("accounts"):  # one upload per chosen account (two YouTube channels = two uploads)
+        accs = []
+        for aid in dict.fromkeys(body["accounts"]):  # each account once; all checked before anything is queued
+            acc = accounts.get(aid)
+            if not acc:
+                raise HTTPException(400, "One of the chosen accounts is no longer linked; reopen Publish.")
+            accs.append(pipeline._pick_account(acc["platform"], aid))  # approved, or 400
+        return [pipeline.request_upload(cid, {**body, "platform": a["platform"], "account_id": a["id"],
+                                              "tiktok": (body.get("tiktok_by_account") or {}).get(a["id"]) or body.get("tiktok")})
+                for a in accs]
     targets = body.get("platforms") or [body.get("platform", "youtube")]
     return [pipeline.request_upload(cid, {**body, "platform": t}) for t in targets]
 
@@ -752,8 +1248,10 @@ def uploads():
     clips = {c["id"]: c for c in store.find("clip")}
     for u in ups:
         u.setdefault("platform", "youtube")
-        c = clips.get(u["clip_id"])
-        u["clip"] = {"title": c["title"], "start": c["start"], "end": c["end"], "export": c.get("export")} if c else None
+        u["account"] = (pipeline._account_of(u) or {}).get("name")
+        c = clips.get(u.get("clip_id")) or (store.get("longform", u["longform_id"]) if u.get("longform_id") else None)
+        u["clip"] = {"title": c["title"], "start": c.get("start", 0), "end": c.get("end", longform.length(c) if c.get("segments") else 0),
+                     "export": c.get("export"), "longform": "segments" in c} if c else None
     return ups
 
 
@@ -769,9 +1267,9 @@ def cancel_upload(uid: str):
 
 @app.patch("/api/uploads/{uid}")
 def move_upload(uid: str, body: dict):
-    """Schedule tab: change a post's time (null = post as soon as possible) and/or platform."""
+    """Schedule tab: change a post's time (null = post as soon as possible) and/or account (or platform)."""
     _404(store.get("upload", uid))
-    return pipeline.reschedule(uid, body["when"] if "when" in body else "keep", body.get("platform"))
+    return pipeline.reschedule(uid, body["when"] if "when" in body else "keep", body.get("platform"), body.get("account_id"))
 
 
 # ---------- schedule ----------
@@ -783,14 +1281,17 @@ def schedule_view():
     for u in store.find("upload"):
         if u.get("status") in ("canceled",) or (u.get("status") == "done" and not (u.get("publish_at") and not pipeline._due({"upload_at": u["publish_at"]}))):
             continue  # already out (a YouTube post still waiting for its publish time stays visible and movable)
-        c = clips.get(u["clip_id"]) or {}
+        c = clips.get(u.get("clip_id")) or (store.get("longform", u["longform_id"]) or {} if u.get("longform_id") else {})
         exp = c.get("export") or {}
+        acc = pipeline._account_of(u) or {}
         items.append({"id": u["id"], "platform": u.get("platform", "youtube"), "status": u["status"], "auto": bool(u.get("auto")),
+                      "account_id": acc.get("id"), "account": acc.get("name"),
                       "when": u.get("publish_at") or u.get("upload_at"), "title": u.get("title") or c.get("title"),
-                      "error": u.get("error", ""), "clip_id": u["clip_id"], "project_id": u.get("project_id"),
+                      "error": u.get("error", ""), "clip_id": u["clip_id"], "longform_id": u.get("longform_id"), "project_id": u.get("project_id"),
                       "cover": f"/files/{u.get('project_id')}/{exp['cover']}" if exp.get("cover") else None,
                       "category_id": u.get("category_id"), "privacy": u.get("privacy")})
-    return {"items": items, "heat": schedule.heat(), "paused": pipeline.paused(), "connected": {p: platforms.connected(p) for p in platforms.PLATFORMS}}
+    return {"items": items, "heat": schedule.heat(), "paused": pipeline.paused(), "connected": {p: platforms.connected(p) for p in platforms.PLATFORMS},
+            "accounts": [accounts.public(a) for a in accounts.usable()]}  # where a post can be moved to
 
 
 @app.post("/api/schedule/suggest")
@@ -815,9 +1316,9 @@ def autopilot_switch(body: dict):
 
 
 @app.get("/api/tiktok/creator")
-def tiktok_creator():
+def tiktok_creator(account_id: str = ""):
     try:
-        return platforms.tiktok_creator()
+        return platforms.tiktok_creator(account_id or None)
     except platforms.AuthError as e:
         raise HTTPException(401, str(e))
 
@@ -979,15 +1480,26 @@ async def yt_secret(file: UploadFile = File(...)):
 
 
 @app.post("/api/youtube/connect")
-def yt_connect():
-    youtube.connect(on_connected=pipeline.requeue_needs_auth)
+def yt_connect(body: dict | None = None):
+    """{"account_id": id} reconnects that channel; without it the sign-in becomes a new, unapproved account."""
+    youtube.connect((body or {}).get("account_id"), on_connected=pipeline.requeue_needs_auth)
     return youtube.status()
 
 
-@app.post("/api/connections/{platform}/disconnect")
-def disconnect(platform: str):
-    platforms.disconnect(platform)
+@app.patch("/api/accounts/{aid}")
+def patch_account(aid: str, body: dict):
+    """The Publish page's two switches: Approved for uploads, and Allow Autopilot to post here."""
+    patch = {k: bool(body[k]) for k in ("approved", "autopilot") if k in body}
+    if not _404(accounts.update(aid, patch)).get("approved"):
+        accounts.update(aid, {"autopilot": False})  # Autopilot needs the account approved first
     return connections()
+
+
+@app.delete("/api/accounts/{aid}")
+def remove_account(aid: str):
+    _404(accounts.get(aid))
+    held = pipeline.remove_account(aid)
+    return {**connections(), "held": held}
 
 
 @app.put("/api/connections/tiktok/app")
@@ -999,8 +1511,8 @@ def tiktok_app(body: dict):
 
 
 @app.post("/api/connections/tiktok/connect")
-def tiktok_connect():
-    return {"url": platforms.tiktok_auth_url(PORT)}
+def tiktok_connect(body: dict | None = None):
+    return {"url": platforms.tiktok_auth_url(PORT, (body or {}).get("account_id"))}
 
 
 @app.get("/oauth/tiktok/callback", response_class=HTMLResponse)
@@ -1009,9 +1521,11 @@ def tiktok_callback(code: str = "", state: str = "", error: str = "", error_desc
         msg, ok = f"TikTok sign-in was not completed: {error_description or error}", False
     else:
         try:
-            platforms.tiktok_callback(code, state, PORT)
+            acc = platforms.tiktok_callback(code, state, PORT)
             pipeline.requeue_needs_auth()
-            msg, ok = "TikTok is connected to Reelwright. You can close this tab.", True
+            msg, ok = (f"TikTok account {acc.get('name') or ''} is linked to Reelwright. "
+                       + ("You can close this tab." if acc.get("approved") else
+                          "Before anything is posted to it, turn on “Approved for uploads” on the Publish page.")), True
         except RuntimeError as e:
             msg, ok = str(e), False
     color = "#37d39a" if ok else "#ff5a6a"
@@ -1024,7 +1538,7 @@ def tiktok_callback(code: str = "", state: str = "", error: str = "", error_desc
 def instagram(body: dict):
     if not body.get("access_token"):
         raise HTTPException(400, "Paste your Instagram access token.")
-    platforms.instagram_set(body["access_token"], body.get("ig_user_id") or "")
+    platforms.instagram_set(body["access_token"], body.get("ig_user_id") or "", body.get("account_id"))
     pipeline.requeue_needs_auth()
     return connections()
 
@@ -1090,6 +1604,256 @@ def ai_usage(days: int = 30):
 @app.get("/api/logs")
 def logs(n: int = 300):
     return {"lines": log.tail(max(10, min(n, 2000)))}
+
+
+# ---------- long-form edits (longform.py): capture, edit, render, publish ----------
+from . import longform  # noqa: E402
+
+LF_TITLES = {"condensed": "{} (condensed)", "highlights": "Best of {}", "clips": "{} (compilation)"}
+LF_STRIP = ("words", "track_manual", "framing", "follow")  # per-clip things a sequence of segments has no use for
+
+
+def _lf(lid: str) -> dict:
+    return _404(store.get("longform", lid), "Long-form edit not found")
+
+
+def _lf_view(d: dict) -> dict:
+    ups = store.find("upload", longform_id=d["id"])
+    jobs = [j for j in store.find("job", longform_id=d["id"]) if j["status"] in ("queued", "running")]
+    return {**d, "length": longform.length(d), "current": longform.export_current(d), "lf_stage": longform.stage(d, ups),
+            "locked": any(u["status"] == "done" for u in ups), "job": jobs[0] if jobs else None,
+            "chapters_text": longform.chapters_text(d),  # at the exported video's times
+            "uploads": [{"id": u["id"], "platform": u.get("platform"), "status": u["status"], "url": u.get("url"),
+                         "error": u.get("error", ""), "when": u.get("publish_at") or u.get("upload_at"),
+                         "account": (pipeline._account_of(u) or {}).get("name")} for u in ups]}
+
+
+def _lf_segments(v, dur: float) -> list:
+    if not isinstance(v, list) or not 0 < len(v) <= 5000:
+        raise HTTPException(400, "segments must be a list of 1 to 5000 [start, end] pairs.")
+    out = []
+    for seg in v:
+        try:
+            a, b = (float(x) for x in seg)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Each segment must be [start, end] in seconds.")
+        if not (0 <= a and b - a >= 0.1 and b <= dur + 0.01):  # also rejects NaN
+            raise HTTPException(400, "Segment out of range (inside the video, at least 0.1 s long).")
+        out.append([round(a, 3), round(min(b, dur), 3)])
+    return out
+
+
+def _lf_chapters(v, total: float) -> list:
+    if not isinstance(v, list) or len(v) > 200:
+        raise HTTPException(400, "chapters must be a list of up to 200 {t, title}.")
+    out = []
+    for c in v:
+        if not isinstance(c, dict) or not isinstance(c.get("title", ""), str):
+            raise HTTPException(400, "Each chapter needs t (seconds) and a title.")
+        out.append({"t": round(_num(c.get("t"), "chapter t", 0, max(total, 0)), 3), "title": c.get("title", "").strip()[:100]})
+    return sorted(out, key=lambda c: c["t"])
+
+
+@app.get("/api/projects/{pid}/longform")
+def list_longform(pid: str):
+    _404(store.get("project", pid))
+    return [_lf_view(d) for d in store.find("longform", project_id=pid)]
+
+
+@app.get("/api/longform")
+def all_longform():
+    names = {p["id"]: p.get("name") for p in store.find("project")}
+    return [{**_lf_view(d), "project_name": names.get(d["project_id"])} for d in store.find("longform")]
+
+
+@app.post("/api/projects/{pid}/longform")
+def capture_longform(pid: str, body: dict):
+    """{mode: condensed|highlights|clips, title?, pad?, target?, clip_ids?, transition?}: a new long-form edit from the
+    existing analysis. From clips is immediate; condensed and highlights run as a capture job."""
+    p = _ready(pid)
+    mode = body.get("mode")
+    if mode not in longform.MODES:
+        raise HTTPException(400, f"mode must be one of {', '.join(longform.MODES)}.")
+    title = str(body.get("title") or "").strip()[:100] or LF_TITLES[mode].format(p["name"])[:100]
+    tr = round(_num(body.get("transition", 0), "transition", 0, 1), 2)
+    if mode == "clips":
+        ids = body.get("clip_ids")
+        if not isinstance(ids, list) or not ids or len(ids) > 500:
+            raise HTTPException(400, "Pick the clips to combine, in order.")
+        clips = [store.get("clip", str(i)) for i in ids]
+        if any(not c or c["project_id"] != pid or c.get("parts") for c in clips):
+            raise HTTPException(400, "Every clip must be a (non-montage) clip of this project.")
+        segs, chapters = longform.from_clips(clips)
+        d = longform.create(pid, mode, title, segs, chapters, {"clip_ids": ids}, tr)
+    else:
+        st = {"pad": round(_num(body.get("pad", longform.DEFAULT_PAD), "pad", 0, 2), 2),
+              "target": round(_num(body.get("target", longform.DEFAULT_TARGET), "target", 60, 4 * 3600))}
+        d = longform.create(pid, mode, title, [], [], st, tr, status="capturing")
+        pipeline.submit("longform_capture", longform_id=d["id"])
+    return _lf_view(d)
+
+
+@app.get("/api/longform/{lid}")
+def get_longform(lid: str):
+    return _lf_view(_lf(lid))
+
+
+@app.patch("/api/longform/{lid}")
+def patch_longform(lid: str, body: dict):
+    """title and keep (always), and while it isn't posted: segments, chapters, transition, edit (the clip edit schema;
+    overlays are timed in sequence seconds)."""
+    d = _lf(lid)
+    if "keep" in body:  # the space saver's pin; Keep on an expired long form restores it
+        keep = bool(body["keep"])
+        d = store.update("longform", lid, fn=lambda x: x.update(keep=keep, **({"expired": None} if keep else {})))
+        body = {k: v for k, v in body.items() if k != "keep"}
+    if body.keys() - {"title"} and d.get("expired"):
+        raise HTTPException(409, "This long form expired (its render was removed to save space): press Keep to restore it.")
+    if body.keys() - {"title"} and longform.posted(lid):
+        raise HTTPException(409, POSTED)
+    if d.get("status") == "capturing" and body.keys() - {"title"}:
+        raise HTTPException(409, "Still capturing: wait for it to finish.")
+    proj = store.get("project", d["project_id"])
+    upd: dict = {}
+    if "title" in body:
+        upd["title"] = str(body["title"] or "").strip()[:100] or d["title"]
+    if "segments" in body:
+        upd["segments"] = _lf_segments(body["segments"], proj["meta"]["duration"])
+    total = sum(b - a for a, b in upd.get("segments", d["segments"]))
+    if "chapters" in body:
+        upd["chapters"] = _lf_chapters(body["chapters"], total)
+    if "transition" in body:
+        upd["transition"] = round(_num(body["transition"], "transition", 0, 1), 2)
+    if isinstance(body.get("edit"), dict):
+        ed = {k: v for k, v in body["edit"].items() if k not in LF_STRIP}
+        upd["edit"] = {**d["edit"], **clean_edit(ed, {"start": 0.0, "end": total, "project_id": d["project_id"]})}
+    changed = bool(upd.keys() - {"title"})
+
+    def apply(x):
+        x.update(upd)
+        if changed:
+            x["rev"] += 1
+
+    return _lf_view(store.update("longform", lid, fn=apply))
+
+
+@app.post("/api/longform/{lid}/export")
+def export_longform(lid: str):
+    d = _lf(lid)
+    if longform.posted(lid):
+        raise HTTPException(409, POSTED)
+    if d.get("expired"):
+        raise HTTPException(409, "This long form expired: press Keep to restore it first.")
+    if d.get("status") != "ready" or not d["segments"]:
+        raise HTTPException(409, "Nothing to render yet.")
+    return longform.request_export(lid)
+
+
+@app.post("/api/longform/{lid}/version")
+def version_longform(lid: str):
+    _lf(lid)
+    return _lf_view(longform.new_version(lid))
+
+
+@app.post("/api/longform/{lid}/chapters/auto")
+def auto_chapters(lid: str):
+    """Chapters from what is said (Claude titles them when a key is set; offline: a boundary every ~3 minutes)."""
+    d = _lf(lid)
+    words = [w for s in pipeline.load_json(d["project_id"], "transcript.json", {"segments": []})["segments"] for w in s.get("words", [])]
+    base = d.get("chapters") if len(d.get("chapters") or []) >= 3 else longform.auto_chapters(d["segments"], words)
+    if ai.ready("other") and words:
+        base = longform.titled_chapters(d["segments"], base, words) or base
+    return patch_longform(lid, {"chapters": base})
+
+
+@app.post("/api/longform/{lid}/metadata")
+def longform_metadata(lid: str):
+    """AI title, description (with the YouTube chapter block), tags and category for a regular YouTube video."""
+    d = _lf(lid)
+    words = [w for s in pipeline.load_json(d["project_id"], "transcript.json", {"segments": []})["segments"] for w in s.get("words", [])]
+    text = " ".join(w["w"].strip() for w in longform.seq_words(words, d["segments"]))
+    chapters = longform.chapters_text(d)
+    md = ai.longform_meta(d["title"], chapters, text, pipeline.guidance())
+    if chapters:
+        md["description"] = f"{md['description'].rstrip()}\n\n{chapters}"
+    return md
+
+
+@app.post("/api/longform/{lid}/upload")
+def upload_longform(lid: str, body: dict):
+    """{accounts: [ids], title, description, tags, category_id, privacy, publish_at?, upload_at?, tiktok_by_account?}:
+    one post per approved account (the same rules as a clip); Instagram only up to 15 minutes."""
+    d = _lf(lid)
+    if d.get("status") != "ready" or not d["segments"]:
+        raise HTTPException(409, "Nothing to publish yet.")
+    exp = d.get("export") or {}
+    secs = (exp.get("duration") if longform.export_current(d) else None) or longform.output_length(d)
+    accs = []
+    for aid in dict.fromkeys(body.get("accounts") or []):  # each account once
+        acc = accounts.get(aid)
+        if not acc:
+            raise HTTPException(400, "One of the chosen accounts is no longer linked; reopen Publish.")
+        pipeline._pick_account(acc["platform"], aid)  # approved, or 400 before anything is queued
+        if acc["platform"] == "instagram" and secs > 15 * 60:
+            raise HTTPException(400, f"Instagram Reels can be at most 15 minutes; this is {secs / 60:.0f} minutes.")
+        accs.append(acc)
+    if not accs:
+        raise HTTPException(400, "Pick at least one approved account.")
+    return [pipeline.request_upload(None, {**body, "platform": a["platform"], "account_id": a["id"],
+                                           "tiktok": (body.get("tiktok_by_account") or {}).get(a["id"]) or body.get("tiktok")},
+                                    longform_id=lid) for a in accs]
+
+
+@app.post("/api/longform/{lid}/music")
+def longform_music(lid: str, file: UploadFile = File(...)):
+    d = _lf(lid)
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in AUDIO_EXT:
+        raise HTTPException(400, f"Unsupported audio type {ext or '(none)'}.")
+    safe = re.sub(r"[^\w.-]+", "_", Path(file.filename).stem)[:60] + ext
+    (pipeline.pdir(d["project_id"]) / "music").mkdir(exist_ok=True)
+    with open(pipeline.pdir(d["project_id"]) / "music" / safe, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return patch_longform(lid, {"edit": {"music": f"music/{safe}"}})
+
+
+@app.post("/api/longform/{lid}/plan")
+def plan_longform(lid: str, body: dict | None = None):
+    """The Studio's "request -> AI plan" for a long form: edit, caption and overlay items (no subject tracking)."""
+    d = _lf(lid)
+    prompt = str((body or {}).get("prompt") or "")[:2000]
+    plan = ai.plan(longform.plan_context(d, store.get("project", d["project_id"]), assets.listing()), prompt)
+    seq = {"start": 0.0, "end": longform.length(d), "project_id": d["project_id"], "edit": d["edit"]}
+    items, dropped = [], 0
+    for it in plan.items:
+        try:
+            patch = _plan_patch(it, seq) if it.kind != "track" else None
+        except HTTPException:
+            patch = None
+        if not patch:
+            dropped += 1
+            continue
+        items.append({"id": store.new_id(), "kind": it.kind, "title": it.title[:120], "why": it.why[:400], "patch": patch})
+    doc = store.put("plan", {"longform_id": lid, "prompt": prompt, "summary": plan.summary, "items": items, "dropped": dropped})
+    return {"plan_id": doc["id"], "summary": plan.summary, "items": items, "dropped": dropped}
+
+
+@app.post("/api/longform/{lid}/apply")
+def apply_longform_plan(lid: str, body: dict):
+    d = _lf(lid)
+    plan = store.get("plan", str(body.get("plan_id") or ""))
+    if not plan or plan.get("longform_id") != lid:
+        raise HTTPException(404, "Plan not found for this long-form edit.")
+    picked, edit, overlays = set(body.get("item_ids") or []), {}, []
+    for it in plan["items"]:
+        if it["id"] in picked:
+            if it["kind"] == "overlay":
+                overlays.append(it["patch"])
+            else:
+                edit.update(it["patch"])
+    if overlays:  # added to the existing overlays, never replacing them
+        edit["overlays"] = (d["edit"].get("overlays") or []) + overlays
+    return patch_longform(lid, {"edit": edit}) if edit else _lf_view(d)
 
 
 # ---------- OBS: direct connections + network receiver ----------
@@ -1198,6 +1962,134 @@ def relay_script():
     return FileResponse(Path(__file__).with_name("relay.py"), filename="reelwright_relay.py", media_type="text/x-python")
 
 
-app.mount("/files", StaticFiles(directory=PROJECTS), name="files")
+# ---------- storage folder, space saver, removed sources, imported shorts (storage.py) ----------
+
+def _bad(fn, *args):
+    try:
+        return fn(*args)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+
+
+@app.get("/api/storage")
+def storage_status(usage: bool = False):
+    return storage.status(usage)
+
+
+@app.post("/api/storage/check")
+def storage_check(body: dict):
+    """Validate a folder before moving there: {ok, path, free, needed} or {ok: false, error}."""
+    try:
+        p = storage.validate(body.get("path"), "archive" if body.get("purpose") == "archive" else "storage")
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "path": str(p), "free": storage._free(p), "needed": storage.usage()["total"], "missing": storage.missing()}
+
+
+@app.post("/api/storage/move")
+def storage_move(body: dict):
+    _bad(storage.start_move, body.get("path"))
+    return storage.status()
+
+
+@app.post("/api/storage/pick")
+def storage_pick(body: dict):
+    """The desktop app's native picker: {kind: "folder"} → one folder, {kind: "files"} → video files. {paths: []} = canceled."""
+    from . import desktop
+    if desktop.WINDOW is None:
+        raise HTTPException(400, "The native picker is part of the Reelwright desktop app: type the path instead.")
+    import webview
+    if body.get("kind") == "files":
+        exts = ";".join(f"*{e}" for e in sorted(VIDEO_EXT))
+        res = desktop.WINDOW.create_file_dialog(webview.FileDialog.OPEN, allow_multiple=True, file_types=(f"Videos ({exts})",))
+    else:
+        res = desktop.WINDOW.create_file_dialog(webview.FileDialog.FOLDER)
+    return {"paths": [str(p) for p in (res or [])]}
+
+
+@app.get("/api/storage/cleanup")
+def cleanup_preview():
+    """What "Clean up now" would delete or archive right now, and what it skips (with why)."""
+    return storage.preview()
+
+
+@app.post("/api/storage/cleanup")
+def cleanup_now():
+    if not storage.policy()["mode"]:
+        raise HTTPException(409, "Turn on the space saver (delete or archive) first.")
+    if why := storage.hold_reason():
+        raise HTTPException(409, why)
+    if pipeline._busy("cleanup"):
+        raise HTTPException(409, "A clean-up is already running (see Activity).")
+    return pipeline.submit("cleanup")
+
+
+@app.post("/api/projects/{pid}/redownload")
+def redownload(pid: str):
+    """Download a source the space saver removed again, from the link it came from (no re-analysis)."""
+    p = _404(store.get("project", pid))
+    url = storage.source_url(p)
+    if not p.get("source_removed"):
+        raise HTTPException(409, "This project still has its source video.")
+    if not url:
+        raise HTTPException(400, "This video wasn't downloaded from a link: re-import the file instead.")
+    if pipeline._project_jobs(pid):
+        raise HTTPException(409, "Wait for this project's running job to finish.")
+    storage.check_writable()
+    store.update("project", pid, {"status": "importing", "stage": "Re-downloading the source", "progress": 0.0})
+    return pipeline.submit("import_url", project_id=pid, url=url, redownload=True)
+
+
+@app.post("/api/projects/{pid}/source")
+def reimport_source(pid: str, file: UploadFile = File(...)):
+    """Put a removed source back from a file (it must be the same video)."""
+    return _bad(storage.reimport, _404(store.get("project", pid)), file.file, file.filename or "")
+
+
+@app.post("/api/shorts")
+def import_short(file: UploadFile = File(...), video_type: str = Form("auto"), sub_genre: str = Form("")):
+    """One old short from the browser: its own project, analysed, one whole clip. {project} or {duplicate}."""
+    return _bad(storage.import_short_upload, file.file, file.filename or "", _video_type(video_type, sub_genre))
+
+
+@app.post("/api/shorts/paths")
+def import_short_paths(body: dict):
+    """Old shorts already on this PC (files and/or folders, from the desktop picker): {added, duplicates, skipped}."""
+    paths = body.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(400, "Send the files or folders to import as a list of paths.")
+    return storage.import_short_paths(paths, _video_type(body.get("video_type"), body.get("sub_genre")))
+
+
+class _ProjectFiles:
+    """/files/<project id>/...: the project folders, served from whichever storage folder is chosen right now (re-created
+    when it changes, so a move needs no restart). Only project-id folders: never anything else the folder holds."""
+
+    def __init__(self):
+        self.root, self.files = None, None
+
+    async def __call__(self, scope, receive, send):
+        from starlette.responses import PlainTextResponse
+        root = config.projects_dir()
+        if root != self.root:
+            self.root, self.files = root, StaticFiles(directory=root, check_dir=False)
+        first = Path(self.files.get_path(scope)).parts[:1]  # after StaticFiles' own normalisation ("a/../b" is "b")
+        if not first or not storage.ID_RE.fullmatch(first[0]) or not root.is_dir():
+            return await PlainTextResponse("Not Found", 404)(scope, receive, send)
+        await self.files(scope, receive, send)
+
+
+app.include_router(remote.router)  # /api/remote*: before the mounts below, which would swallow it
+from .routes_live import router as _live_router  # noqa: E402  live & integrations (OBS marks, telemetry, HUD, MCP)
+app.include_router(_live_router)
+app.include_router(__import__(f"{__package__}.routes_signals", fromlist=["router"]).router)  # /api/signals* (WP1)
+app.include_router(__import__(f"{__package__}.routes_learn", fromlist=["router"]).router)  # /api/learn/* (WP4: Lab insights, evals)
+app.include_router(__import__(f"{__package__}.routes_render", fromlist=["router"]).router)  # proxies, encoders (WP2: render & QA)
+app.include_router(__import__(f"{__package__}.routes_publish", fromlist=["router"]).router)  # /api/vault*, templates (WP3)
+app.include_router(__import__(f"{__package__}.routes_editor", fromlist=["router"]).router)  # /api/triage, NLE export (WP5)
+app.include_router(__import__(f"{__package__}.routes_models", fromlist=["router"]).router)  # /api/models/* (model marketplace)
+from .routes_training import router as _training_router  # noqa: E402  /api/training/* (Model Lab; static import: packaged)
+app.include_router(_training_router)
+app.mount("/files", _ProjectFiles(), name="files")
 app.mount("/assets", StaticFiles(directory=assets.ASSETS), name="assets")  # read-only files; no listing
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="ui")

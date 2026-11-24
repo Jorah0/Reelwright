@@ -1,0 +1,50 @@
+{
+  "about": "Hand-made FPS stream: lobby chatter, a 1v3 clutch that needs its setup, a brb break, a running-gag fail.",
+  "video_type": "gaming",
+  "duration": 130.0,
+  "lengths": [15, 30, 45],
+  "segments": [
+    {"start": 0.0, "end": 4.6, "text": "Alright chat, we are back in the lobby."},
+    {"start": 4.8, "end": 9.5, "text": "Remember to follow if you are new here."},
+    {"start": 9.7, "end": 14.2, "text": "Okay, ranked match, let's lock in."},
+    {"start": 14.4, "end": 19.0, "text": "I'm taking the long route to the bomb site."},
+    {"start": 19.2, "end": 23.8, "text": "There's two of them on the balcony."},
+    {"start": 24.0, "end": 28.5, "text": "No way, my whole team just died."},
+    {"start": 28.7, "end": 33.4, "text": "It is me against three, with forty health."},
+    {"start": 33.6, "end": 38.0, "text": "And I have one bullet left in this pistol."},
+    {"start": 38.2, "end": 42.6, "text": "Okay, okay, okay, stay calm."},
+    {"start": 42.8, "end": 47.0, "text": "One down! He didn't even see me!"},
+    {"start": 47.2, "end": 51.4, "text": "Two! Where is the last guy?"},
+    {"start": 51.6, "end": 55.9, "text": "He's planting, he's planting!"},
+    {"start": 56.1, "end": 60.0, "text": "Knife him, knife him, LET'S GO!"},
+    {"start": 60.2, "end": 65.0, "text": "I just won a one versus three with one bullet!"},
+    {"start": 65.2, "end": 70.1, "text": "Chat is going crazy right now."},
+    {"start": 70.3, "end": 75.0, "text": "Okay, I need some water after that."},
+    {"start": 75.2, "end": 80.0, "text": "Brb, grabbing a drink."},
+    {"start": 90.0, "end": 94.6, "text": "Back. Where were we?"},
+    {"start": 94.8, "end": 99.5, "text": "Let's queue up again."},
+    {"start": 99.7, "end": 104.4, "text": "This next map is the one I always lose on."},
+    {"start": 104.6, "end": 109.0, "text": "Watch, I bet I fall off the map again."},
+    {"start": 109.2, "end": 113.8, "text": "Wait, wait, that jump is impossible."},
+    {"start": 114.0, "end": 118.5, "text": "And there I go, falling off the map. Again."},
+    {"start": 118.7, "end": 123.0, "text": "Every single time, this map hates me."},
+    {"start": 123.2, "end": 128.0, "text": "Alright, chat, that's it for today."}
+  ],
+  "signals": {"loud": [{"t": 43.0, "energy": 0.9}, {"t": 56.5, "energy": 1.0}, {"t": 60.5, "energy": 0.8}, {"t": 114.5, "energy": 0.7}],
+              "scenes": [], "chat": [2, 2, 3, 3, 9, 14, 16, 6, 1, 2, 3, 8, 4]},
+  "gold": {
+    "good": [
+      {"start": 24.0, "end": 65.0, "setup": 24.0, "payoff": 60.0, "why": "team dies, one bullet, LET'S GO"},
+      {"start": 99.7, "end": 123.0, "setup": 99.7, "payoff": 118.5, "why": "predicts the fall, falls"}
+    ],
+    "bad": [
+      {"start": 4.8, "end": 9.5, "why": "follow reminder"},
+      {"start": 70.3, "end": 90.0, "why": "brb break"}
+    ]
+  },
+  "stub": [
+    {"start": 33.6, "end": 65.0, "score": 92, "title": "1v3 with one bullet"},
+    {"start": 104.6, "end": 123.0, "score": 78, "title": "This map hates me"},
+    {"start": 70.3, "end": 86.0, "score": 60, "title": "Water break"}
+  ]
+}

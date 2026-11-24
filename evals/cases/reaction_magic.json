@@ -1,0 +1,38 @@
+{
+  "about": "Hand-made reaction video: one magic reveal that needs the signed card, then a boring segment.",
+  "video_type": "reaction",
+  "duration": 84.0,
+  "lengths": [15, 30, 45],
+  "segments": [
+    {"start": 0.0, "end": 4.7, "text": "Okay, this video has been all over my feed."},
+    {"start": 4.9, "end": 9.8, "text": "A street magician and a really skeptical guy."},
+    {"start": 10.0, "end": 14.5, "text": "Let's see if he can fool him."},
+    {"start": 14.7, "end": 19.4, "text": "He shuffles the deck, pretty normal so far."},
+    {"start": 19.6, "end": 24.0, "text": "The guy picks a card and signs it."},
+    {"start": 24.2, "end": 29.1, "text": "Wait, pause, watch the magician's left hand."},
+    {"start": 29.3, "end": 33.8, "text": "Did you see that? He palmed something."},
+    {"start": 34.0, "end": 38.6, "text": "Okay, play it again, slow motion."},
+    {"start": 38.8, "end": 43.5, "text": "Yes! He had the signed card the whole time!"},
+    {"start": 43.7, "end": 48.0, "text": "It was in his sleeve since the shuffle!"},
+    {"start": 48.2, "end": 53.0, "text": "That is the cleanest sleight of hand I've ever seen."},
+    {"start": 53.2, "end": 58.0, "text": "Chat, did anyone else catch that?"},
+    {"start": 58.2, "end": 63.0, "text": "Moving on, the next video is about cooking."},
+    {"start": 63.2, "end": 68.0, "text": "This guy is making a sandwich, I guess."},
+    {"start": 68.2, "end": 73.0, "text": "Yeah, it's a sandwich. Nothing happens."},
+    {"start": 73.2, "end": 78.0, "text": "Skip, skip, this is boring."},
+    {"start": 78.2, "end": 83.0, "text": "Okay last one for today."}
+  ],
+  "signals": {"loud": [{"t": 39.0, "energy": 1.0}, {"t": 44.0, "energy": 0.7}], "scenes": [58.1]},
+  "gold": {
+    "good": [
+      {"start": 19.6, "end": 53.0, "setup": 19.6, "payoff": 48.0, "why": "signed card, the palm, the reveal"}
+    ],
+    "bad": [
+      {"start": 58.2, "end": 78.0, "why": "boring sandwich video"}
+    ]
+  },
+  "stub": [
+    {"start": 24.2, "end": 53.0, "score": 86, "title": "He had the card all along"},
+    {"start": 63.2, "end": 78.0, "score": 45, "title": "Sandwich time"}
+  ]
+}

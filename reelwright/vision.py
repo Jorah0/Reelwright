@@ -53,12 +53,17 @@ def _per_second(x, n_s: int):
 
 
 def _smooth(x, k: int):
-    return np.convolve(x, np.ones(k) / k, mode="same")
+    return np.convolve(x, np.ones(k) / k, mode="same") if len(x) >= k else x  # "same" would lengthen a tiny series
 
 
-def analyze(src, meta: dict, progress=None, faces: bool = True) -> dict:
-    """{"motion": [per s], "face": [per s, 0..1 or empty], "spikes": [{t, kind, strength}]}."""
+def analyze(src, meta: dict, progress=None, faces: bool = True, scenes: bool = False, hud=None) -> dict:
+    """{"motion": [per s], "face": [per s, 0..1 or empty], "spikes": [{t, kind, strength}]}.
+    scenes=True also returns "scenes" (cut times, exactly as media.scenes finds them) from the same decode: decoding is
+    nearly all of the cost, so sharing it makes this analyzer almost free on top of scene detection.
+    hud: taught screen events (hud.active()) matched in the same frames; adds "hud": [{t, kind: "hud:<name>", label,
+    strength, d}]. Without it nothing changes."""
     import cv2
+    import tempfile
 
     sw, sh, dur = int(meta.get("width") or 0), int(meta.get("height") or 0), float(meta.get("duration") or 0)
     if not (sw and sh and dur > 0):
@@ -70,9 +75,19 @@ def analyze(src, meta: dict, progress=None, faces: bool = True) -> dict:
         from . import track
         yunet, anime = track._detectors(w, h)
     detect = yunet is not None or anime is not None
-    p = subprocess.Popen([media.FFMPEG, "-v", "error", "-i", str(src), "-an", "-sn", "-dn", "-vf",
-                          f"fps={RATE},scale={w}:{h}:flags=area", "-pix_fmt", "bgr24", "-f", "rawvideo", "-"],
-                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=media.NO_WINDOW)
+    hm = hs = None
+    if hud:
+        from . import hud as hudmod
+        hm, hs = hudmod.matchers(hud, w, h), []
+    ours = f"fps={RATE},scale={w}:{h}:flags=area,format=bgr24"
+    if scenes:  # media.scenes' exact filter chain on one branch, ours on the other
+        cmd = [media.FFMPEG, "-hide_banner", "-hwaccel", "auto", "-i", str(src), "-an", "-sn", "-dn", "-filter_complex",
+               f"[0:v]scale=320:-2,split[a][b];[a]select='gt(scene,{media.SCENE_THRESHOLD})',showinfo[s];[b]{ours}[v]",
+               "-map", "[s]", "-f", "null", "-", "-map", "[v]", "-f", "rawvideo", "-"]
+    else:
+        cmd = [media.FFMPEG, "-v", "error", "-i", str(src), "-an", "-sn", "-dn", "-vf", ours, "-f", "rawvideo", "-"]
+    errf = tempfile.TemporaryFile()  # showinfo lines; a file (not a pipe) so ffmpeg can never block on a full stderr
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, creationflags=media.NO_WINDOW)
     size = w * h * 3
     diff, bright, sat, face, fmove = [], [], [], [], []
     prev = box = None
@@ -102,6 +117,8 @@ def analyze(src, meta: dict, progress=None, faces: bool = True) -> dict:
                     roi = d[max(0, y0):y1, max(0, x0):x1]
                     move = float(roi.mean()) / 255 if roi.size else 0.0
                 fmove.append(move)
+            if hm:
+                hs.append(hudmod.scores(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), hm))
             if progress and i % 240 == 0:
                 progress(min(i / RATE / dur, 1.0))
     finally:
@@ -109,6 +126,9 @@ def analyze(src, meta: dict, progress=None, faces: bool = True) -> dict:
         if p.poll() is None:
             p.kill()
         p.wait()
+        errf.seek(0)
+        err = errf.read().decode("utf-8", "replace")
+        errf.close()
     n = len(bright)
     if n < 2:
         raise RuntimeError("couldn't decode the video")
@@ -153,5 +173,10 @@ def analyze(src, meta: dict, progress=None, faces: bool = True) -> dict:
         ftop = float(fm.max()) or 1.0
         for i in _peaks(fm, max(2.5 * fmed, 0.02), 8, limit):
             spikes.append({"t": float(i), "kind": "face_reaction", "strength": round(float(fm[i]) / ftop, 2)})
-    return {"motion": [round(float(v), 4) for v in m1], "face": [round(float(v), 2) for v in face_s],
-            "spikes": sorted(spikes, key=lambda s: s["t"])}
+    out = {"motion": [round(float(v), 4) for v in m1], "face": [round(float(v), 2) for v in face_s],
+           "spikes": sorted(spikes, key=lambda s: s["t"])}
+    if scenes:
+        out["scenes"] = media.scene_times(err)
+    if hud:
+        out["hud"] = hudmod.events(hs, hm, RATE)
+    return out

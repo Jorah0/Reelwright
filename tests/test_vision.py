@@ -136,3 +136,11 @@ def test_no_speech_clips_are_cut_around_visual_spikes():
     picks = pipeline.visual_picks(spikes, 30, 400.0)
     assert [(p["start"], p["end"]) for p in picks] == [(95.0, 125.0), (295.0, 325.0)]  # the overlapping weaker one is dropped
     assert picks[0]["score"] > picks[1]["score"] and "Action" in picks[0]["title"] and "flash" in picks[1]["reason"]
+
+
+def test_shared_decode_returns_the_same_scene_cuts_and_spikes(clip):
+    alone = vision.analyze(clip, media.probe(clip), faces=False)
+    both = vision.analyze(clip, media.probe(clip), faces=False, scenes=True)
+    assert both.pop("scenes") == media.scenes(clip) != []
+    assert [s["kind"] for s in both["spikes"]] == [s["kind"] for s in alone["spikes"]]
+    assert all(abs(a["t"] - b["t"]) <= 0.5 for a, b in zip(both["spikes"], alone["spikes"]))

@@ -151,7 +151,8 @@ def test_old_youtube_sign_ins_are_asked_to_reconnect_for_new_permissions(tmp_pat
     tok = tmp_path / "t.json"
     tok.write_text(json.dumps({"scopes": youtube.SCOPES[:2]}), "utf-8")
     monkeypatch.setattr(youtube, "YT_TOKEN", tok)
-    assert youtube.missing_scopes() == ["https://www.googleapis.com/auth/youtube.force-ssl"]
+    assert youtube.missing_scopes() == ["https://www.googleapis.com/auth/youtube.force-ssl",
+                                        "https://www.googleapis.com/auth/yt-analytics.readonly"]
     with pytest.raises(RuntimeError, match="reconnect YouTube"):
         youtube.set_publish_at("vid", "2031-01-01T10:00:00+00:00")
     tok.write_text(json.dumps({"scopes": youtube.SCOPES}), "utf-8")
@@ -200,7 +201,7 @@ def test_project_paths_cannot_escape_the_projects_folder():
     for bad in ("..", "../x", "a/b", "", ".", "..\\x"):
         with pytest.raises(ValueError):
             pipeline.pdir(bad)
-    assert pipeline.pdir("abc123def456").parent == pipeline.PROJECTS
+    assert pipeline.pdir("abc123def456").parent == pipeline.config.projects_dir()
     from fastapi.testclient import TestClient
     from reelwright.server import app
     c = TestClient(app, base_url="http://127.0.0.1:8765")
@@ -220,3 +221,17 @@ def test_app_shell_loads_nothing_from_the_internet():
     static = Path(media.__file__).parent / "static"
     for name in ("index.html", "styles.css"):
         assert not re.findall(r"https?://", (static / name).read_text("utf-8")), name
+
+
+def test_desktop_moves_off_a_port_another_program_holds(monkeypatch):
+    from reelwright import desktop
+    busy = {8765, 8767}  # another app (e.g. a different local tool) has the default port
+    mine = set()
+    monkeypatch.setattr(desktop, "_port_in_use", lambda p: p in busy or p in mine)
+    monkeypatch.setattr(desktop, "_is_reelwright", lambda p: p in mine)
+    assert desktop.pick_port(8765) == (8768, False)  # skips 8766 (the LAN receiver's default) and the busy 8767
+    mine.add(8768)
+    assert desktop.pick_port(8765) == (8768, True)   # a second launch finds the running copy instead of starting another
+    mine.clear()
+    mine.add(8765)
+    assert desktop.pick_port(8765) == (8765, True)

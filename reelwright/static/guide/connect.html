@@ -23,7 +23,7 @@
 <h1>Connecting your accounts</h1>
 <p class="meta">Every permission Reelwright asks for, why, and how to set each developer portal up. Reelwright runs on your computer and
 uses developer apps that you create, so each platform's permissions are granted to <b>your</b> app.</p>
-<nav><a href="#claude">Claude</a><a href="#youtube">YouTube</a><a href="#tiktok">TikTok</a><a href="#instagram">Instagram</a><a href="#obs">OBS</a><a href="#urls">Policy URLs</a></nav>
+<nav><a href="#claude">Claude</a><a href="#youtube">YouTube</a><a href="#tiktok">TikTok</a><a href="#instagram">Instagram</a><a href="#accounts">More accounts</a><a href="#obs">OBS</a><a href="#phone">Phone remote</a><a href="#urls">Policy URLs</a></nav>
 
 <h2 id="claude">Claude (Anthropic)</h2>
 <p>No permissions to configure: an API key is all it needs.</p>
@@ -40,14 +40,17 @@ uses developer apps that you create, so each platform's permissions are granted 
   <tr><td><code>https://www.googleapis.com/auth/youtube.upload</code></td><td>Uploading videos and setting custom thumbnails</td></tr>
   <tr><td><code>https://www.googleapis.com/auth/youtube.readonly</code></td><td>Showing your channel and reading view/like counts (learning from results)</td></tr>
   <tr><td><code>https://www.googleapis.com/auth/youtube.force-ssl</code></td><td>Moving the publish time of a video that is already uploaded and scheduled</td></tr>
+  <tr><td><code>https://www.googleapis.com/auth/yt-analytics.readonly</code></td><td>Reading where viewers stop watching your posts
+    (audience retention), so new clips get to the point sooner (Virality Lab → What works for you)</td></tr>
 </table></div>
 <h3>Setup</h3>
 <ol>
   <li>Open <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a> and create a project (any name).</li>
-  <li><b>APIs &amp; Services → Library</b> → search <b>YouTube Data API v3</b> → <b>Enable</b>.</li>
+  <li><b>APIs &amp; Services → Library</b> → search <b>YouTube Data API v3</b> → <b>Enable</b>. Then search
+    <b>YouTube Analytics API</b> → <b>Enable</b> (for audience retention).</li>
   <li><b>Google Auth Platform → Branding</b> (the OAuth consent screen): app name, your support email, developer contact. Audience:
     <b>External</b>.</li>
-  <li><b>Data Access → Add or remove scopes</b>: add the three scopes above (filter by “youtube”).</li>
+  <li><b>Data Access → Add or remove scopes</b>: add the four scopes above (filter by “youtube”).</li>
   <li><b>Audience → Test users → Add users</b>: add the Google account that owns your channel.</li>
   <li><b>Clients → Create client</b> → Application type <b>Desktop app</b> → Create → <b>Download JSON</b>.</li>
   <li>Reelwright → <b>Publish → YouTube → Upload client JSON</b> → <b>Sign in with Google</b> → approve every permission.</li>
@@ -61,7 +64,8 @@ uses developer apps that you create, so each platform's permissions are granted 
       audit from the YouTube API Services form linked in Google Cloud.</li>
     <li>Custom thumbnails need a channel verified by phone (youtube.com/verify).</li>
     <li>The API has a daily quota (10,000 units by default) and uploads use a large share of it; request more in Google Cloud if you post a lot.</li>
-    <li>Connected before this version? Reelwright shows a notice: Disconnect and sign in again to grant <code>youtube.force-ssl</code>.</li>
+    <li>Connected before this version? Reelwright shows a notice on that channel: click <b>Reconnect</b> and approve <code>youtube.force-ssl</code> and <code>yt-analytics.readonly</code> (until then,
+      posting works as before; only moving or deleting posted videos and the retention learning wait for it).</li>
   </ul></div>
 
 <h2 id="tiktok">TikTok</h2>
@@ -70,6 +74,9 @@ uses developer apps that you create, so each platform's permissions are granted 
   <tr><th>Scope</th><th>Product</th><th>Used for</th></tr>
   <tr><td><code>user.info.basic</code></td><td>Login Kit</td><td>Your display name and avatar</td></tr>
   <tr><td><code>video.publish</code></td><td>Content Posting API (Direct Post)</td><td>Posting videos to your profile, reading your posting options and post status</td></tr>
+  <tr><td><code>video.list</code> <i>(optional)</i></td><td>Display API</td><td>Reading the view, like, comment and share counts of
+    the videos Reelwright posted, so it learns what works on TikTok. Only requested after you turn on <b>Ask TikTok for view
+    counts</b> in the Virality Lab; add the Display API to your app first (it is part of TikTok's app review), then Reconnect.</td></tr>
 </table></div>
 <h3>Setup</h3>
 <ol>
@@ -96,6 +103,8 @@ ways to get a token; Reelwright accepts either.</p>
   <tr><th>Permission</th><th>Used for</th></tr>
   <tr><td><code>instagram_business_basic</code></td><td>Your username, picture, follower count, account ID</td></tr>
   <tr><td><code>instagram_business_content_publish</code></td><td>Publishing Reels</td></tr>
+  <tr><td><code>instagram_business_manage_insights</code> <i>(optional)</i></td><td>Reading your Reels' views, reach, saves, shares
+    and average watch time, so Reelwright learns what works on Instagram</td></tr>
 </table></div>
 <ol>
   <li>At <a href="https://developers.facebook.com/apps" target="_blank">developers.facebook.com/apps</a> → <b>Create app</b> → choose the
@@ -118,6 +127,8 @@ ways to get a token; Reelwright accepts either.</p>
   <tr><th>Permission</th><th>Used for</th></tr>
   <tr><td><code>instagram_basic</code></td><td>Reading your Instagram account</td></tr>
   <tr><td><code>instagram_content_publish</code></td><td>Publishing Reels</td></tr>
+  <tr><td><code>instagram_manage_insights</code> <i>(optional)</i></td><td>Reading your Reels' views, reach, saves, shares and average
+    watch time (learning what works on Instagram)</td></tr>
   <tr><td><code>pages_read_engagement</code></td><td>Required by Meta for publishing through a Page-linked account</td></tr>
   <tr><td><code>pages_show_list</code></td><td>Only to look up your Instagram account ID (step 4)</td></tr>
   <tr><td><code>business_management</code></td><td>Only if your Page is managed in a Meta Business portfolio (Business Suite): without it
@@ -141,6 +152,34 @@ ways to get a token; Reelwright accepts either.</p>
   fresh token. With <b>Standard access</b> your app can publish to accounts that have a role on the app (yours). Publishing for other people's
   accounts needs <b>Advanced access</b> through Meta App Review. Meta allows 100 API posts per account per 24 hours.</div>
 
+<h2 id="accounts">More than one account per platform</h2>
+<p>You can link several YouTube channels, TikTok accounts and Instagram accounts. Each one keeps its own sign-in, and each one is
+<b>okayed separately</b> before anything is posted to it.</p>
+<ol>
+  <li><b>Publish</b> page → the platform's card → <b>+ Add another account</b>. It runs the same sign-in as the first one, and the new
+    login always becomes a <b>new</b> account: it never replaces one you already linked (signing in as an account that is already linked just
+    refreshes that account's sign-in).</li>
+  <li><b>Pick the other account while signing in.</b> The browser signs in whoever is logged in there:
+    <ul>
+      <li><b>YouTube</b>: Google shows its account chooser; pick the other Google account (or the Brand Account that owns the other channel).
+        Every Google account you add must also be a <b>test user</b> of your Google Cloud app while it is in Testing.</li>
+      <li><b>TikTok</b>: log out on tiktok.com (or switch accounts there) first, then click Add; TikTok always shows its authorization page.
+        In <b>Sandbox</b>, every account must be added as a sandbox target user, and until the audit at most 5 accounts can post per day.</li>
+      <li><b>Instagram</b>: every account needs <b>its own access token</b> (Generate token for that account in Route A). With a Route B
+        (Facebook Login) token that can see several Page-linked accounts, Reelwright picks the next one that isn't linked yet; type an
+        account ID to choose a specific one. Each account needs a role on your Meta app (Standard access).</li>
+    </ul></li>
+  <li><b>Approve it.</b> A newly linked account shows <b>Approved for uploads</b> switched off: nothing is posted to it, by you or by
+    Autopilot, until you switch it on. <b>Allow Autopilot to post here</b> is a second switch (off by default): Autopilot only posts to
+    accounts with both switches on. Reelwright itself refuses a post to an account that isn't approved, so this also protects posts
+    scheduled earlier.</li>
+  <li><b>Choose where each clip goes.</b> The publish dialog lists your approved accounts; tick several to post the same clip to each (two
+    channels = two separate uploads). The Schedule page shows each post's account and can move a post to another approved account.</li>
+</ol>
+<div class="note"><b>Removing an account</b> deletes its sign-in from this PC. Its posts that haven't gone out are stopped and say why —
+  they are <b>never</b> moved to another account on their own; move them on the Schedule page or delete them. If you connected one
+  account per platform before this version, it was moved into the first account of that platform automatically and stays approved.</div>
+
 <h2 id="obs">OBS (optional)</h2>
 <ol>
   <li>In OBS: <b>Tools → WebSocket Server Settings → Enable WebSocket server</b> (port <code>4455</code>), and keep authentication on.</li>
@@ -148,6 +187,20 @@ ways to get a token; Reelwright accepts either.</p>
   <li>Reelwright → <b>OBS link → Connect OBS directly</b>: the PC's address, port and password. OBS on another PC: also allow port 4455 through
     that PC's firewall, and either map its recording folder or use the Relay (instructions on the OBS link page).</li>
 </ol>
+
+<h2 id="phone">Phone remote (optional)</h2>
+<ol>
+  <li>Reelwright → <b>Settings → Phone remote</b>: turn on <b>Let my phone control Reelwright over Wi-Fi</b> (port <code>8810</code>
+    unless you change it). If Windows asks, allow Reelwright on <b>private</b> networks only.</li>
+  <li>Press <b>Pair a phone</b> and scan the QR code with the phone's camera (same Wi-Fi as the PC), then press <b>Pair</b> on the phone.
+    The code is for one phone and expires after 15 minutes if unused.</li>
+  <li>Add it to the Home Screen. <b>iPhone</b>: Safari → Share → Add to Home Screen; the first time you open it from the Home Screen, paste
+    this phone's key (Safari: ⋯ → Copy this phone's key), because iPhone keeps Home Screen apps' storage separate from Safari.
+    <b>Android</b>: Chrome → ⋮ → Add to Home screen.</li>
+</ol>
+<div class="note">The phone app uses no app store and no outside server: it is served by Reelwright on your network, and it only answers
+  paired phones on private addresses. Away from home it needs a VPN to your home network (for example Tailscale). Push notifications need
+  HTTPS, so new activity shows in the app while it is open. Revoke a phone in Settings → Phone remote and it stops working at once.</div>
 
 <h2 id="urls">Public Terms and Privacy Policy URLs</h2>
 <p>TikTok and Meta ask for public links to your Terms of Service and Privacy Policy (Google asks for a privacy policy before verification).

@@ -21,19 +21,35 @@ def _check(name, fn):
     return {"name": name, "status": status, "detail": detail, "fix": fix}
 
 
+# filters renders, analysis and QA run (boxblur and eq are GPL-only: LGPL builds get substitutes, see media._blur/_eq);
+# lut3d and arnndn are for LUTs and voice clean-up
+NEEDED_FILTERS = ("subtitles", "loudnorm", "sidechaincompress", "amix", "zoompan", "silencedetect", "ebur128", "astats",
+                  "blackdetect", "freezedetect", "lut3d", "arnndn")
+
+
 def _ffmpeg():
     try:
         out = subprocess.run([media.FFMPEG, "-hide_banner", "-version"], capture_output=True, text=True,
                              creationflags=media.NO_WINDOW, timeout=15).stdout
     except (OSError, subprocess.SubprocessError):
         return FAIL, "ffmpeg not found", "Install ffmpeg and put ffmpeg/ffprobe on PATH (the packaged .exe bundles them)."
-    return OK, out.split("\n", 1)[0][:90], ""
+    detail = f"{out.splitlines()[0][:70] if out else 'ffmpeg'} ({media.licence()} build)"
+    missing = [f for f in NEEDED_FILTERS if f not in media._filter_names()]
+    if missing:
+        return FAIL, f"{detail}; missing filters: {', '.join(missing)}", \
+            "Use a full ffmpeg build (gyan.dev 'full', or BtbN's win64 gpl/lgpl builds)."
+    return OK, detail, ""
 
 
-def _nvenc():
-    if media._has_nvenc():
-        return OK, "NVIDIA hardware encoding (NVENC) available", ""
-    return WARN, "rendering uses the CPU (x264): works, slower", "An NVIDIA GPU with a current driver enables NVENC."
+def _encoders():
+    names = [n for n, _ in media.encoders()]
+    if not names:
+        return FAIL, "no usable H.264 encoder: renders fail", \
+            "Update the graphics driver, or use an ffmpeg build with libx264 or OpenH264."
+    if set(names) & media.HW_ENCODERS:
+        return OK, f"usable: {', '.join(names)} (hardware first)", ""
+    return WARN, f"CPU encoding only ({', '.join(names)}): works, slower", \
+        "A current NVIDIA, Intel or AMD graphics driver enables hardware encoding."
 
 
 def _cuda():
@@ -71,10 +87,13 @@ def _claude_live():
 
 
 def _disk():
-    free = shutil.disk_usage(config.DATA).free / 1e9
+    where = config.projects_dir()  # renders and VOD downloads land in the storage folder (Settings › Storage)
+    if not where.is_dir():
+        return FAIL, f"the storage folder {where} isn't available", "Reconnect its drive, or pick another folder in Settings › Storage."
+    free = shutil.disk_usage(where).free / 1e9
     if free < 5:
-        return FAIL, f"{free:.1f} GB free at {config.DATA}", "Free disk space: renders and VOD downloads need room."
-    return (WARN if free < 25 else OK), f"{free:.0f} GB free at {config.DATA}", "Long VODs need ~2-6 GB per hour." if free < 25 else ""
+        return FAIL, f"{free:.1f} GB free at {where}", "Free disk space: renders and VOD downloads need room."
+    return (WARN if free < 25 else OK), f"{free:.0f} GB free at {where}", "Long VODs need ~2-6 GB per hour." if free < 25 else ""
 
 
 def _ytdlp():
@@ -125,7 +144,7 @@ def _learning():
     return OK, detail, ""
 
 
-CHECKS = [("FFmpeg", _ffmpeg), ("GPU encoding", _nvenc), ("GPU transcription", _cuda), ("Claude", _claude),
+CHECKS = [("FFmpeg", _ffmpeg), ("Video encoders", _encoders), ("GPU transcription", _cuda), ("Claude", _claude),
           ("Disk space", _disk), ("Video downloader", _ytdlp), ("OBS link", _obs), ("Publishing", _publishing),
           ("Learning", _learning)]
 

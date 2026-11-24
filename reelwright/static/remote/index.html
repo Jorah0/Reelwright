@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0c10">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Reelwright">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="icon" href="icon-192.png" type="image/png">
+  <link rel="stylesheet" href="styles.css">
+  <title>Reelwright Remote</title>
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="#home"><img src="icon-192.png" alt=""><span>Reel<b>wright</b></span></a>
+    <span class="grow"></span>
+    <button class="icon" id="bell" type="button" aria-label="Activity">🔔<b class="badge" id="bell-n" hidden></b></button>
+    <button class="icon" id="menu" type="button" aria-label="Menu">⋯</button>
+  </header>
+  <main id="view" tabindex="-1"></main>
+  <nav class="tabs" id="tabs" aria-label="Sections">
+    <a href="#home" data-tab="home"><i aria-hidden="true">⌂</i><span>Home</span></a>
+    <a href="#review" data-tab="review"><i aria-hidden="true">✓</i><span>Review</span><b class="badge" id="rev-n" hidden></b></a>
+    <a href="#projects" data-tab="projects"><i aria-hidden="true">▦</i><span>Projects</span></a>
+    <a href="#board" data-tab="board"><i aria-hidden="true">⇶</i><span>Board</span></a>
+    <a href="#obs" data-tab="obs"><i aria-hidden="true">⏺</i><span>OBS</span></a>
+  </nav>
+  <div id="sheet-root"></div>
+  <div id="toasts" aria-live="polite"></div>
+  <script src="hmac.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

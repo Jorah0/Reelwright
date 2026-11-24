@@ -1,0 +1,270 @@
+{
+ "mode": "offline",
+ "guard": true,
+ "at": "2026-11-24T15:12:13+00:00",
+ "cases": [
+  "chatting_printer",
+  "gaming_clutch",
+  "podcast_frogs",
+  "reaction_magic",
+  "tutorial_potatoes",
+  "vlog_hotel"
+ ],
+ "finders": {
+  "stub": {
+   "summary": {
+    "precision_at_k": 1.0,
+    "iou": 0.915,
+    "complete": 0.417,
+    "bad_rate": 0.306
+   },
+   "cases": {
+    "chatting_printer": {
+     "precision_at_k": 1.0,
+     "iou": 0.9272997032640949,
+     "complete": 0.5,
+     "bad_rate": 0.3333333333333333
+    },
+    "gaming_clutch": {
+     "precision_at_k": 1.0,
+     "iou": 0.8948497854077255,
+     "complete": 0.5,
+     "bad_rate": 0.3333333333333333
+    },
+    "podcast_frogs": {
+     "precision_at_k": 1.0,
+     "iou": 1.0,
+     "complete": 1.0,
+     "bad_rate": 0.3333333333333333
+    },
+    "reaction_magic": {
+     "precision_at_k": 1.0,
+     "iou": 0.8622754491017964,
+     "complete": 0.0,
+     "bad_rate": 0.5
+    },
+    "tutorial_potatoes": {
+     "precision_at_k": 1.0,
+     "iou": 0.9161073825503356,
+     "complete": 0.5,
+     "bad_rate": 0.3333333333333333
+    },
+    "vlog_hotel": {
+     "precision_at_k": 1.0,
+     "iou": 0.8881278538812786,
+     "complete": 0.0,
+     "bad_rate": 0.0
+    }
+   },
+   "picks": {
+    "chatting_printer": [
+     {
+      "start": 14.7,
+      "end": 43.5,
+      "title": "I quit over a printer"
+     },
+     {
+      "start": 77.2,
+      "end": 100.5,
+      "title": "My cat muted me"
+     },
+     {
+      "start": 48.4,
+      "end": 67.4,
+      "title": "Back from break"
+     }
+    ],
+    "gaming_clutch": [
+     {
+      "start": 24.0,
+      "end": 65.0,
+      "title": "1v3 with one bullet"
+     },
+     {
+      "start": 104.6,
+      "end": 123.0,
+      "title": "This map hates me"
+     },
+     {
+      "start": 70.3,
+      "end": 86.0,
+      "title": "Water break"
+     }
+    ],
+    "podcast_frogs": [
+     {
+      "start": 35.2,
+      "end": 74.2,
+      "title": "The frog basement"
+     },
+     {
+      "start": 100.3,
+      "end": 119.8,
+      "title": "400 burned croissants"
+     },
+     {
+      "start": 14.8,
+      "end": 30.9,
+      "title": "CloudVault"
+     }
+    ],
+    "reaction_magic": [
+     {
+      "start": 24.2,
+      "end": 53.0,
+      "title": "He had the card all along"
+     },
+     {
+      "start": 63.2,
+      "end": 83.0,
+      "title": "Sandwich time"
+     }
+    ],
+    "tutorial_potatoes": [
+     {
+      "start": 14.4,
+      "end": 54.0,
+      "title": "The crispy potato secret"
+     },
+     {
+      "start": 64.2,
+      "end": 89.0,
+      "title": "Lump-free gravy"
+     },
+     {
+      "start": 0.0,
+      "end": 19.3,
+      "title": "Welcome back"
+     }
+    ],
+    "vlog_hotel": [
+     {
+      "start": 14.6,
+      "end": 53.5,
+      "title": "The bed was in the bathroom"
+     },
+     {
+      "start": 58.6,
+      "end": 78.0,
+      "title": "Beach day"
+     }
+    ]
+   }
+  },
+  "heuristic": {
+   "summary": {
+    "precision_at_k": 0.75,
+    "iou": 0.596,
+    "complete": 0.417,
+    "bad_rate": 0.0
+   },
+   "cases": {
+    "chatting_printer": {
+     "precision_at_k": 1.0,
+     "iou": 0.8590504451038575,
+     "complete": 0.5,
+     "bad_rate": 0.0
+    },
+    "gaming_clutch": {
+     "precision_at_k": 0.5,
+     "iou": 0.2804878048780488,
+     "complete": 0.0,
+     "bad_rate": 0.0
+    },
+    "podcast_frogs": {
+     "precision_at_k": 0.5,
+     "iou": 0.5,
+     "complete": 1.0,
+     "bad_rate": 0.0
+    },
+    "reaction_magic": {
+     "precision_at_k": 1.0,
+     "iou": 0.7125748502994013,
+     "complete": 0.0,
+     "bad_rate": 0.0
+    },
+    "tutorial_potatoes": {
+     "precision_at_k": 0.5,
+     "iou": 0.5539325842696629,
+     "complete": 1.0,
+     "bad_rate": 0.0
+    },
+    "vlog_hotel": {
+     "precision_at_k": 1.0,
+     "iou": 0.6712328767123288,
+     "complete": 0.0,
+     "bad_rate": 0.0
+    }
+   },
+   "picks": {
+    "chatting_printer": [
+     {
+      "start": 77.2,
+      "end": 100.5,
+      "title": "She muted me for ten whole minutes. And nobody in chat told\u2026"
+     },
+     {
+      "start": 14.7,
+      "end": 38.9,
+      "title": "That printer jammed every single morning for three years. On\u2026"
+     }
+    ],
+    "gaming_clutch": [
+     {
+      "start": 38.2,
+      "end": 60.0,
+      "title": "One down! He didn't even see me! Two! Where is the last guy?\u2026"
+     },
+     {
+      "start": 24.0,
+      "end": 47.0,
+      "title": "It is me against three, with forty health. And I have one bu\u2026"
+     }
+    ],
+    "podcast_frogs": [
+     {
+      "start": 35.2,
+      "end": 74.2,
+      "title": "And it is not water, it is hundreds of tiny frogs. Hundreds\u2026"
+     },
+     {
+      "start": 60.6,
+      "end": 89.5,
+      "title": "For his nephew's science fair, he said! I still cannot hear\u2026"
+     }
+    ],
+    "reaction_magic": [
+     {
+      "start": 24.2,
+      "end": 48.0,
+      "title": "Did you see that? He palmed something. Okay, play it again,\u2026"
+     }
+    ],
+    "tutorial_potatoes": [
+     {
+      "start": 14.4,
+      "end": 54.0,
+      "title": "It roughs up the outside and makes a crust. Then shake them\u2026"
+     },
+     {
+      "start": 44.5,
+      "end": 64.0,
+      "title": "Those fluffy edges turn into the crunchiest bits. Listen to\u2026"
+     }
+    ],
+    "vlog_hotel": [
+     {
+      "start": 14.6,
+      "end": 44.0,
+      "title": "And the lady at the desk just laughs at us. We open the door\u2026"
+     },
+     {
+      "start": 39.2,
+      "end": 58.4,
+      "title": "Not next to the bathroom. Inside it. There is a shower curta\u2026"
+     }
+    ]
+   }
+  }
+ }
+}

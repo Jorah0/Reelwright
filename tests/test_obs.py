@@ -18,9 +18,19 @@ PASSWORD, SALT, CHALLENGE = "hunter2", "c2FsdA==", "Y2hhbGxlbmdl"
 
 
 def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A port free for TCP *and* UDP: the receiver needs both, and a busy PC (or a parallel test run) often has the
+    UDP side of a TCP-free number taken, which silently turned discovery off and made the relay test flaky."""
+    for _ in range(50):
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+                u.bind(("", port))
+            return port
+        except OSError:
+            continue
+    raise RuntimeError("no port free for both TCP and UDP")
 
 
 @pytest.fixture
@@ -95,7 +105,7 @@ def test_obs_event_imports_through_folder_mapping(tmp_path, monkeypatch):
     clip = tmp_path / "Replay 2.mkv"
     clip.write_bytes(b"x" * 100)
     calls = []
-    monkeypatch.setattr(pipeline, "ingest_file", lambda path, name, origin, ap=None: calls.append((path, name, origin)) or {"id": "p"})
+    monkeypatch.setattr(pipeline, "ingest_file", lambda path, name, origin, ap=None, markers=None: calls.append((path, name, origin)) or {"id": "p"})
     conn = store.put("obs", {"name": "Gaming PC", "host": "192.168.1.9", "enabled": False,
                              "path_map": [["D:/OBS", str(tmp_path)]], "autopilot": {"enabled": False}})
     obs.handle_file(conn, "D:\\OBS\\Replay 2.mkv", "replay")
@@ -127,7 +137,9 @@ def receiver(monkeypatch):
 def test_relay_to_receiver_end_to_end(receiver, tmp_path):
     server, port, submitted = receiver
     assert lan.status()["running"]
-    found = relay.discover(timeout=2, port=port)  # UDP discovery answers on the same port number, via whichever NIC
+    # UDP discovery answers on the same port number, via whichever NIC; 5 s because a loaded test run can miss a 2 s window
+    # (discover returns as soon as it gets an answer, so this only costs time when it fails)
+    found = relay.discover(timeout=5, port=port)
     assert found and found.endswith(f":{port}") and relay.ping(found, "secret-token")["ok"]
     assert relay.ping(server, "secret-token")["app"] == "reelwright"
     with pytest.raises(RuntimeError, match="rejected the token"):
@@ -261,3 +273,17 @@ def test_lessons_record_trim_and_edits_and_feed_house_style(monkeypatch):
     store.update("clip", c["id"], {"title": "renamed later"})
     pipeline.remember(store.get("clip", c["id"]), "refresh")
     assert store.get("feedback", c["id"])["title"] == "renamed later" and store.get("feedback", c["id"])["signal"] == 1
+
+
+def test_receiver_says_when_discovery_cant_listen(monkeypatch):
+    port = _free_port()
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    blocker.bind(("", port))  # something else already holds the discovery (UDP) port
+    try:
+        config.save({"lan_receive": True, "lan_port": port, "lan_token": "secret-token"})
+        st = lan.apply()
+        assert st["running"] and st["discovery"] is False and "discovery" in st["error"].lower()
+    finally:
+        blocker.close()
+        config.save({"lan_receive": False})
+        lan.apply()

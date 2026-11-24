@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ROOT / "dist" / "Reelwright" / "Reelwright.exe"
 SOURCES = [ROOT / "reelwright", ROOT / "Reelwright.pyw", ROOT / "requirements.txt", ROOT / "scripts" / "build_exe.py", ROOT / "assets"]
-API = "http://127.0.0.1:8765"
+PORTS = [8765, *range(8767, 8800)]  # desktop.pick_port: 8765, or a fallback when another program holds it
 
 
 def newest_source(paths=SOURCES) -> float:
@@ -30,17 +30,35 @@ def outdated(exe: Path = EXE, paths=SOURCES) -> bool:
     return not exe.exists() or exe.stat().st_mtime < newest_source(paths)
 
 
-def _get(path: str):
-    req = urllib.request.Request(API + path, headers={"Host": "127.0.0.1:8765"})
+def _get(path: str, port: int):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"Host": f"127.0.0.1:{port}"})
     with urllib.request.urlopen(req, timeout=3) as r:
         return json.loads(r.read())
 
 
+def _app_port() -> int | None:
+    """The port the running Reelwright answers on (another app on 8765 answers differently and is skipped)."""
+    sys.path.insert(0, str(ROOT))
+    from reelwright.desktop import _port_in_use  # instant bind test; a request to a closed port costs ~2 s on Windows
+    for port in PORTS:
+        if not _port_in_use(port):
+            continue
+        try:
+            if isinstance(_get("/api/jobs", port), list):
+                return port
+        except (OSError, ValueError):
+            pass
+    return None
+
+
 def busy() -> list[str] | None:
     """What the running app is doing (None = not running)."""
+    port = _app_port()
+    if port is None:
+        return None
     try:
-        jobs, ups = _get("/api/jobs"), _get("/api/uploads")
-    except OSError:
+        jobs, ups = _get("/api/jobs", port), _get("/api/uploads", port)
+    except (OSError, ValueError):
         return None
     return ([f"{j['kind']} ({j['status']})" for j in jobs if j["status"] in ("running", "queued")]
             + [f"{u.get('platform')} upload" for u in ups if u.get("status") == "uploading"])

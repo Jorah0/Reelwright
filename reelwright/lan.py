@@ -22,7 +22,7 @@ from .relay import DISCOVER_MAGIC, server_proof, sign
 MAX_BYTES = 64 * 1024 ** 3  # 64 GB: a long recording, not an attack on the disk
 DISK_RESERVE = 5 * 1024 ** 3  # never let a received file eat the last 5 GB (projects + database live there)
 CLOCK_SKEW_S = 600            # signed requests are valid for ±10 min (PCs on one LAN are rarely further apart)
-_state: dict = {"http": None, "port": None, "stop": None, "error": ""}
+_state: dict = {"http": None, "port": None, "stop": None, "error": "", "discovery": False}
 _lock = threading.Lock()
 _uploads = threading.BoundedSemaphore(3)  # parallel uploads; more get 503 and the relay retries
 _nonces: dict[str, float] = {}
@@ -115,7 +115,8 @@ class Handler(BaseHTTPRequestHandler):
         nonce = verify(self.headers, "GET", "/ping")
         if not nonce:
             return self._send(401, {"detail": "Wrong token, reused request, or clocks too far apart"})
-        room = max(0, min(MAX_BYTES, shutil.disk_usage(pipeline.PROJECTS).free - DISK_RESERVE))
+        root = config.projects_dir()  # the chosen storage folder; 0 room while its drive is unplugged
+        room = max(0, min(MAX_BYTES, shutil.disk_usage(root).free - DISK_RESERVE)) if root.is_dir() else 0
         self._send(200, {"ok": True, "app": "reelwright", "name": socket.gethostname(), "max_bytes": room,
                          "proof": server_proof(config.load()["lan_token"], nonce)})
 
@@ -142,7 +143,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(411, {"detail": "Content-Length required"})
         if not 0 < length <= MAX_BYTES:
             return self._send(413, {"detail": "File is empty or too large"})
-        if shutil.disk_usage(pipeline.PROJECTS).free < length + DISK_RESERVE:
+        from . import storage
+        if storage.hold_reason():  # storage drive unplugged or a move running: the relay retries later
+            return self._send(503, {"detail": "Reelwright's storage folder isn't available right now; try again later"})
+        if shutil.disk_usage(config.projects_dir()).free < length + DISK_RESERVE:
             return self._send(507, {"detail": "Not enough disk space on the Reelwright PC for this clip"})
         source = urllib.parse.unquote(self.headers.get("X-Source", ""))[:60] or self.client_address[0]
         kind = self.headers.get("X-Kind", "file") if self.headers.get("X-Kind") in ("replay", "recording", "file") else "file"
@@ -214,7 +218,7 @@ def apply() -> dict:
             _state["stop"].set()
             _state["http"].shutdown()
             _state["http"].server_close()
-            _state.update(http=None, port=None, stop=None)
+            _state.update(http=None, port=None, stop=None, discovery=False)
         if want and not _state["http"]:
             token()
             try:
@@ -225,8 +229,11 @@ def apply() -> dict:
             srv.daemon_threads = True
             stop = threading.Event()
             threading.Thread(target=srv.serve_forever, daemon=True).start()
-            threading.Thread(target=_udp_loop, args=(_udp_socket(want), want, stop), daemon=True).start()
-            _state.update(http=srv, port=want, stop=stop, error="")
+            udp = _udp_socket(want)
+            threading.Thread(target=_udp_loop, args=(udp, want, stop), daemon=True).start()
+            _state.update(http=srv, port=want, stop=stop, discovery=udp is not None,
+                          error="" if udp else f"Receiving works, but automatic discovery is off: UDP port {want} is used by "
+                                               "another program. Point the relay at this PC's address with --server instead.")
         if not want:
             _state["error"] = ""
     return status()
@@ -235,4 +242,5 @@ def apply() -> dict:
 def status() -> dict:
     s = config.load()
     return {"enabled": s["lan_receive"], "running": bool(_state["http"]), "port": s["lan_port"], "token": s["lan_token"],
-            "ips": local_ips(), "error": _state["error"], "autopilot": s["obs_autopilot"]}
+            "ips": local_ips(), "error": _state["error"], "autopilot": s["obs_autopilot"],
+            "discovery": bool(_state["http"]) and _state["discovery"]}

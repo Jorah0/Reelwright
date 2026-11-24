@@ -49,19 +49,22 @@ def summary(days: int = 30) -> dict:
     since = time.time() - days * 86400
     rows = [r for r in store.find("usage") if r["at"] >= since]
     by: dict = {}
+    by_model: dict = {}  # other providers record "ollama:<model>" / "openai:<model>"; their cost is None (unpriced/local)
     for r in rows:
-        k = by.setdefault(r["kind"], {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "cost": 0.0, "unpriced": 0})
-        k["calls"] += 1
-        for f in ("input", "output", "cache_read"):
-            k[f] += r[f]
-        if r["cost"] is None:
-            k["unpriced"] += 1
-        else:
-            k["cost"] += r["cost"]
+        for k in (by.setdefault(r["kind"], {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "cost": 0.0, "unpriced": 0}),
+                  by_model.setdefault(r.get("model") or "?", {"calls": 0, "input": 0, "output": 0, "cache_read": 0, "cost": 0.0, "unpriced": 0})):
+            k["calls"] += 1
+            for f in ("input", "output", "cache_read"):
+                k[f] += r[f]
+            if r["cost"] is None:
+                k["unpriced"] += 1
+            else:
+                k["cost"] += r["cost"]
     fresh = sum(r["input"] + r["cache_write"] for r in rows)
     cached = sum(r["cache_read"] for r in rows)
     return {"days": days, "calls": len(rows), "cost_usd": round(sum(r["cost"] or 0 for r in rows), 6),
             "unpriced_calls": sum(r["cost"] is None for r in rows),
             "input_tokens": fresh + cached, "output_tokens": sum(r["output"] for r in rows),
             "cache_hit_ratio": round(cached / (fresh + cached), 3) if fresh + cached else None,
-            "by_kind": dict(sorted(by.items(), key=lambda kv: -kv[1]["cost"]))}
+            "by_kind": dict(sorted(by.items(), key=lambda kv: -kv[1]["cost"])),
+            "by_model": dict(sorted(by_model.items(), key=lambda kv: -kv[1]["calls"]))}

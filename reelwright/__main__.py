@@ -1,5 +1,6 @@
 """`python -m reelwright` — start the app and open it in the browser.
-`python -m reelwright doctor` — check the toolchain.  `python -m reelwright relay ...` — run the OBS relay on this PC."""
+`python -m reelwright doctor` — check the toolchain.  `python -m reelwright relay ...` — run the OBS relay on this PC.
+`python -m reelwright mcp` — the MCP server for Claude Desktop."""
 import os
 import sys
 import threading
@@ -11,6 +12,9 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "doctor":
         from .doctor import main
+        sys.exit(main())
+    if cmd == "mcp":  # Claude Desktop's MCP server (stdio), talking to the running app
+        from .mcp_server import main
         sys.exit(main())
     if cmd == "relay":
         from .relay import main

@@ -32,16 +32,27 @@ computer, and are sent only to the services you choose to connect, when you use 
 or the <code>data</code> folder when run from source):</p>
 <ul>
   <li><b>Your media and edits:</b> videos you import or receive from OBS, thumbnails, rendered clips, cover images, music you add,
-    transcripts (speech-to-text), detected audio, scene, on-screen activity and chat signals, and your clip edits.</li>
-  <li><b>Settings and credentials:</b> your Anthropic API key, the OAuth tokens for the YouTube, TikTok and Instagram accounts you
-    connect, OBS WebSocket passwords you enter, and the pairing token for receiving clips from other PCs. These are stored
+    transcripts (speech-to-text), detected audio, scene, on-screen activity and chat signals, and your clip edits. These project
+    files live in the data folder's <code>projects</code> folder, or in another folder you choose under Settings › Storage (for
+    example on a second drive); your clip edits themselves stay in the data folder.</li>
+  <li><b>Space saver archives:</b> if you turn on the space saver's archive mode, past-due videos and renders are moved to the
+    archive folders you choose, each with a small <code>.json</code> file holding its title, caption, hashtags and post links. In
+    delete mode they are deleted from your computer instead. Nothing is archived or deleted unless you switch the space saver on.</li>
+  <li><b>Settings and credentials:</b> your Anthropic API key, keys for other AI providers you add, the OAuth tokens for the YouTube, TikTok and Instagram accounts you
+    connect, OBS WebSocket passwords you enter, the pairing token for receiving clips from other PCs, and one signing key per phone you
+    pair with the phone remote (with the name you gave the phone and when it was last seen), and the Client ID and Client secret of a
+    Twitch app if you add one for viewer clips (Settings → Signals). These are stored
     unencrypted in files that, by default, only your user account can read; protect your computer accordingly.</li>
+  <li><b>Live chat log:</b> if you name a Twitch channel under Settings → Signals → “Record my Twitch chat live”, the public chat
+    messages of that channel are saved while Reelwright runs, each with the time Twitch sent it and its text but no username
+    (<code>chatlogs</code> folder). They are used only to measure chat reactions in your own recordings and VODs. Clear the setting
+    to stop; delete the folder to remove what was saved.</li>
   <li><b>Learning memory:</b> to improve clip picks, Reelwright keeps a record of your feedback — clips you rate, publish or delete —
     including each clip's title, up to 1,500 characters of its transcript, measured traits (length, loudness, pacing), your edit
     choices, and the view and like counts of your published posts. This record is kept even after you delete the clip or project, so
     the lessons are not lost. You can export it, import it or delete all of it at any time (Virality Lab → “What Reelwright has
     learned”).</li>
-  <li><b>Diagnostics:</b> a local event log (<code>events.log</code>, rotated at 2 MB) and a record of Claude API usage (token counts and
+  <li><b>Diagnostics:</b> a local event log (<code>events.log</code>, rotated at 2 MB) and a record of AI usage per provider (token counts and
     estimated cost per feature, without prompt contents).</li>
 </ul>
 <p>Speech transcription (Whisper), on-screen activity analysis and face detection run entirely on your computer. Reelwright contains no analytics,
@@ -58,28 +69,89 @@ data under its own terms and privacy policy.</p>
     <td>Transcript text and timing, audio, scene, on-screen activity and chat signals, clip titles and edit settings, your style-profile
       notes and interview answers, titles and view counts of reference videos, and examples from your learning memory. When ranking
       clips from long videos with “Let Claude see a few small frames” on (Settings → Claude AI), a few small still images (about
-      4 per candidate clip, 384 px wide) are also sent. Video and audio files are not sent.
+      4 per candidate clip, 384 px wide) are also sent. When a video is analyzed, unless you picked its video type yourself, its
+      title or file name, its source link and channel metadata, and 6 small still images (256 px wide) spread across it are sent
+      to detect the type of video (gaming, podcast, tutorial…). Video and audio files are not sent.
       Requests use your own API key and are governed by your agreement with Anthropic.</td></tr>
+  <tr><td><b>Other AI providers you choose</b><br>OpenAI (api.openai.com), OpenRouter (openrouter.ai), Google Gemini
+      (generativelanguage.googleapis.com), Groq (api.groq.com) or any OpenAI-compatible service</td>
+    <td>Only if you set one up in Settings → AI and route an AI task to it, or pick it for the two-AI consensus mode.</td>
+    <td>The same data the Anthropic row lists for the tasks you route to that provider (still images only when that provider
+      handles a task that uses them). Requests go to the <b>base URL</b> you enter, with your own key for that service, and are
+      governed by your agreement with it. A custom base URL sends this data wherever it points — only enter one you trust.
+      <b>Ollama</b> (and other local servers such as LM Studio) at 127.0.0.1 run on your own computer: nothing leaves it.</td></tr>
   <tr><td><b>Google / YouTube</b><br><a href="https://policies.google.com/privacy">privacy policy</a></td>
     <td>If you connect a YouTube channel.</td>
     <td>Videos you publish, with their title, description, tags, category, privacy setting and schedule, and their cover image as a
-      thumbnail. Reelwright reads your channel's name and picture and the view and like counts of the videos it published for you.</td></tr>
+      thumbnail. Reelwright reads your channel's name and picture and the view, like and comment counts of the videos it published for
+      you, and (YouTube Analytics API, youtubeanalytics.googleapis.com) their audience-retention curve: what share of viewers is still
+      watching at each point of the video.</td></tr>
   <tr><td><b>TikTok</b><br><a href="https://www.tiktok.com/legal/privacy-policy">privacy policy</a></td>
     <td>If you connect a TikTok account.</td>
     <td>Videos you publish, with their caption, privacy setting and cover frame. Reelwright reads your display name, avatar and the
-      privacy options TikTok allows for your account.</td></tr>
+      privacy options TikTok allows for your account, and, only if you turn on “Ask TikTok for view counts”, the view, like, comment
+      and share counts of the videos it posted for you.</td></tr>
   <tr><td><b>Meta / Instagram</b><br><a href="https://privacycenter.instagram.com/policy">privacy policy</a></td>
     <td>If you connect an Instagram professional account.</td>
-    <td>Reels you publish, with their caption. Reelwright reads your username, profile picture and follower count.</td></tr>
+    <td>Reels you publish, with their caption. Reelwright reads your username, profile picture and follower count, and, when your
+      token has an insights permission, the views, reach, saves, shares and average watch time of the Reels it posted for you.</td></tr>
   <tr><td><b>Video sites</b> (YouTube, Twitch, Kick and other sites supported by yt-dlp)</td>
     <td>When you import a link, connect a channel to list its videos, or run a virality comparison.</td>
     <td>Standard web requests to download the video (and YouTube live-chat replay when available) or to read public listings and search
       results. The sites see your IP address, as with any visit.</td></tr>
   <tr><td><b>GitHub</b> (github.com, raw.githubusercontent.com)</td><td>The first time face detection or subject tracking is used.</td>
     <td>One-time downloads of open-source detection models (a face detector and an anime/VTuber face detector). Nothing is sent.</td></tr>
+  <tr><td><b>Hugging Face</b> (huggingface.co and its download servers, *.hf.co)</td><td>The first time a video is analyzed with
+      “Detect laughter, screams…” on (Settings → Signals).</td>
+    <td>A one-time download of an open-source sound-tagging model (about 27 MB, Apache-2.0), checked against a fixed SHA-256.
+      Your audio is analyzed on your computer; nothing is sent.</td></tr>
+  <tr><td><b>Hugging Face model search</b> (huggingface.co/api/models)</td><td>Only when you search the Hub on the Models page
+      (or open a Hub model's details).</td>
+    <td>Your search words and filters; public model metadata comes back and is cached on your computer. No account or key is used,
+      and no model weights are downloaded. Installing a model is done by Ollama on your PC (it downloads from its own registry or hf.co).</td></tr>
+  <tr><td><b>Model Lab downloads</b> (pypi.org and files.pythonhosted.org, download.pytorch.org, github.com and its download servers
+      codeload.github.com / *.githubusercontent.com, huggingface.co)</td>
+    <td>Only when you press “Set up training environment”, or train on a Hugging Face base model or a pinned tokenizer.</td>
+    <td>Pinned versions of PyTorch, transformers and PEFT (from pypi.org and download.pytorch.org) are installed into a separate folder
+      you choose; a pinned llama.cpp release (its GGUF converter and llama-quantize, checked against a fixed SHA-256) comes from
+      github.com; the base model's weights and tokenizer come from huggingface.co, under that model's own licence (shown before
+      you train). These are downloads: nothing about you or your videos is sent. Training runs on your PC (or a host you enter),
+      only on projects whose decisions you confirmed; the model it makes stays on your PC and in your Ollama.</td></tr>
+  <tr><td><b>Model Lab teacher labels</b> (Anthropic)</td><td>Only when you press “Label with Claude” and confirm its cost estimate.</td>
+    <td>The same data a clip search sends (the Anthropic row above), for the confirmed projects you picked.</td></tr>
+  <tr><td><b>Twitch</b> (id.twitch.tv, api.twitch.tv, irc.chat.twitch.tv)<br><a href="https://www.twitch.tv/p/legal/privacy-notice/">privacy notice</a></td>
+    <td>Only if you add a Twitch app or name a channel for live chat under Settings → Signals.</td>
+    <td>Viewer clips: your Twitch app's Client ID and Client secret go to id.twitch.tv for an app token; api.twitch.tv is then asked
+      for the VOD's details and the channel's public clips when a Twitch VOD is analyzed. Live chat: Reelwright joins the channel's
+      public chat anonymously and read-only (irc.chat.twitch.tv); it never signs in and never sends chat messages. Twitch sees your IP
+      address.</td></tr>
   <tr><td><b>Your own computers (OBS link)</b></td><td>Only if you turn on the OBS features.</td>
     <td>Reelwright talks to OBS over your local network and can receive clips from the Reelwright Relay on your other PCs. This traffic
       stays on your network; requests are signed with your pairing token, which is never sent in readable form.</td></tr>
+  <tr><td><b>Your phone (phone remote)</b></td><td>Only if you turn on Settings → Phone remote and pair a phone.</td>
+    <td>Reelwright serves its phone app on your local network and answers only phones you paired, from private network addresses.
+      A paired phone can <b>see</b> project and clip titles, transcript snippets, clip previews and posters, scheduled and published posts
+      with their links, running jobs, free disk space, OBS connection names and status, and the names of accounts approved for uploads. It
+      can <b>do</b>: keep or skip clips, render, publish or schedule clips to approved accounts, delete clips, pause or resume Autopilot,
+      import a video link, search for more clips, and start or stop OBS recording, save the replay buffer and add markers. It never
+      receives your API keys, account tokens, settings, passwords or file paths. Every request is signed with the phone's own key, which is
+      never sent over the network. This traffic stays on your network (or the VPN you connect the phone with): nothing goes through
+      servers of ours.</td></tr>
+  <tr><td><b>Games and VTube Studio on your own computer (live integrations)</b></td>
+    <td>Only if you turn them on in Settings → Live integrations, and only while an OBS connection is recording.</td>
+    <td>All local, at 127.0.0.1 on this computer: nothing leaves it. Reelwright reads League of Legends' Live Client Data
+      (https://127.0.0.1:2999: game events such as kills, deaths and objectives), receives the game state CS2 and Dota 2 send to
+      a listener on 127.0.0.1 through Valve's Game State Integration (checked against a token you generate), and connects to
+      VTube Studio's plugin API (ws://127.0.0.1:8001) after you allow it there, to note hotkeys, item drops and face-tracking loss.
+      Only the time and kind of each event are kept, as markers on the recording. No game memory is read and nothing is drawn
+      over a game. An optional global hotkey only marks the running recording.</td></tr>
+  <tr><td><b>Claude Desktop (MCP link)</b></td>
+    <td>Only if you add Reelwright to Claude Desktop's configuration (Settings → Claude Desktop).</td>
+    <td>Claude Desktop starts Reelwright's MCP helper on this computer, which talks to the running app at 127.0.0.1. What its
+      tools return (project and clip titles, hooks, scores, transcript snippets of clips awaiting review, job and post status,
+      and the names of accounts allowed for Autopilot) becomes part of your Claude conversation, which Claude Desktop sends to
+      Anthropic under your own Claude account and its terms. It never receives your API keys, account tokens, settings or
+      passwords, and its posts follow your Autopilot permissions.</td></tr>
 </table></div>
 
 <h2>3. Google API Services: Limited Use disclosure</h2>
@@ -103,11 +175,16 @@ sent to a third-party service (for example, a published video) is kept by that s
   <li><b>Remove your API key</b> in Settings to stop all Claude requests.</li>
   <li><b>Reset, export or import</b> the learning memory in Virality Lab.</li>
   <li><b>Turn off</b> the OBS network receiver at any time on the OBS link page.</li>
+  <li><b>Turn off</b> the phone remote, or <b>revoke</b> a paired phone (it stops working at once), in Settings → Phone remote.</li>
 </ul>
 
 <h2>6. Security</h2>
 <p>Reelwright's main interface can only be reached from your own computer. The optional network receiver for OBS clips accepts only
-signed, time-limited requests, can only create new projects, and never publishes the clips it receives publicly. No method of storage
+signed, time-limited requests, can only create new projects, and never publishes the clips it receives publicly. The optional phone remote
+listens separately, is off until you turn it on, refuses addresses outside your private network, accepts only requests signed by a phone
+you paired (each one usable once), proves its answers to the phone, and serves videos only through links signed for that phone that expire
+after 30 minutes. It uses plain HTTP on your network, so anyone on that network can see that the traffic exists and what it contains
+(titles, previews), but cannot read the phone's key or act as the phone. No method of storage
 or transmission is completely secure, and your credentials are stored on your computer, so keep your computer and accounts protected.</p>
 
 <h2>7. Children</h2>

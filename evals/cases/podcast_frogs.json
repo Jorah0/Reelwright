@@ -1,0 +1,51 @@
+{
+  "about": "Hand-made podcast: a sponsor read, a long setup-payoff story, a short work story.",
+  "video_type": "podcast",
+  "duration": 136.0,
+  "lengths": [15, 30, 45],
+  "segments": [
+    {"start": 0.0, "end": 4.5, "text": "Welcome back to the show, everybody."},
+    {"start": 4.7, "end": 9.8, "text": "Today I have my old roommate Dana with me."},
+    {"start": 10.0, "end": 14.6, "text": "Thanks for having me, this is going to be fun."},
+    {"start": 14.8, "end": 20.2, "text": "Before we start, this episode is sponsored by CloudVault."},
+    {"start": 20.4, "end": 25.6, "text": "CloudVault backs up your files every single night."},
+    {"start": 25.8, "end": 30.9, "text": "Use code SHOW for twenty percent off your first year."},
+    {"start": 31.1, "end": 35.0, "text": "Okay, so Dana, tell them about the apartment."},
+    {"start": 35.2, "end": 40.1, "text": "Our first apartment had the worst landlord in the city."},
+    {"start": 40.3, "end": 45.4, "text": "He would only ever call us at three in the morning."},
+    {"start": 45.6, "end": 50.8, "text": "One night he calls and says the basement is flooding."},
+    {"start": 51.0, "end": 55.7, "text": "So we run downstairs in our pajamas with buckets."},
+    {"start": 55.9, "end": 60.4, "text": "And it is not water, it is hundreds of tiny frogs."},
+    {"start": 60.6, "end": 64.8, "text": "Hundreds of frogs, hopping everywhere!"},
+    {"start": 65.0, "end": 69.9, "text": "He had been breeding them down there for a science fair."},
+    {"start": 70.1, "end": 74.2, "text": "For his nephew's science fair, he said!"},
+    {"start": 74.4, "end": 79.0, "text": "I still cannot hear a frog without laughing."},
+    {"start": 79.2, "end": 84.0, "text": "Anyway, we moved out three weeks later."},
+    {"start": 84.2, "end": 89.5, "text": "Let's talk about your new job though."},
+    {"start": 89.7, "end": 94.8, "text": "I started managing a bakery last spring."},
+    {"start": 95.0, "end": 100.1, "text": "The hardest part is waking up at four every day."},
+    {"start": 100.3, "end": 105.6, "text": "My first week I burned four hundred croissants."},
+    {"start": 105.8, "end": 110.4, "text": "The owner walked in and just stared at the oven."},
+    {"start": 110.6, "end": 115.2, "text": "Then she said, well, at least the smoke alarm works."},
+    {"start": 115.4, "end": 119.8, "text": "I almost quit right there."},
+    {"start": 120.0, "end": 125.0, "text": "But she kept me on, and now I run the place."},
+    {"start": 125.2, "end": 130.0, "text": "That is a great comeback story."},
+    {"start": 130.2, "end": 135.0, "text": "Alright, we are going to take a quick break."}
+  ],
+  "signals": {"loud": [{"t": 61.0, "energy": 0.9}, {"t": 71.0, "energy": 0.8}, {"t": 112.0, "energy": 0.6}], "scenes": []},
+  "gold": {
+    "good": [
+      {"start": 35.2, "end": 74.2, "setup": 35.2, "payoff": 74.2, "why": "landlord setup, frogs payoff"},
+      {"start": 100.3, "end": 119.8, "setup": 100.3, "payoff": 115.2, "why": "croissants, smoke-alarm punchline"}
+    ],
+    "bad": [
+      {"start": 14.8, "end": 30.9, "why": "sponsor read"},
+      {"start": 130.2, "end": 136.0, "why": "break"}
+    ]
+  },
+  "stub": [
+    {"start": 51.0, "end": 74.2, "score": 88, "title": "The frog basement"},
+    {"start": 100.3, "end": 119.8, "score": 80, "title": "400 burned croissants"},
+    {"start": 14.8, "end": 30.9, "score": 55, "title": "CloudVault"}
+  ]
+}

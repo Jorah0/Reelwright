@@ -8,7 +8,19 @@ os.environ["REELWRIGHT_DATA"] = os.environ.get("REELWRIGHT_DATA") or tempfile.mk
 import httpx  # noqa: E402
 import pytest  # noqa: E402
 
-from reelwright import config, pipeline, platforms, store  # noqa: E402
+from reelwright import accounts, config, pipeline, platforms, store  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def own_accounts(tmp_path, monkeypatch):
+    """Sign-ins live in accounts.json (one entry per linked account) since multi-account support: each test gets its own."""
+    monkeypatch.setattr(accounts, "FILE", tmp_path / "accounts.json")
+    monkeypatch.setattr(accounts, "LEGACY_CONN", tmp_path / "connections.json")
+    monkeypatch.setattr(accounts, "LEGACY_YT", tmp_path / "youtube_token.json")
+
+
+def _saved(platform):
+    return accounts.all_accounts(platform)[0]
 
 
 class Net:
@@ -45,7 +57,7 @@ def video(tmp_path, monkeypatch):
 
 @pytest.fixture
 def ig(monkeypatch):
-    platforms._save_platform("instagram", {"access_token": "IGTOKEN", "ig_user_id": "1784"})
+    accounts.add("instagram", access_token="IGTOKEN", ig_user_id="1784", approved=True)
     monkeypatch.setattr(platforms.time, "sleep", lambda s: None)
     yield
     platforms._save_platform("instagram", None)
@@ -83,8 +95,8 @@ def test_instagram_login_tokens_use_graph_instagram_and_find_the_account_id(vide
     net = Net(monkeypatch, {("GET", "graph.instagram.com/v27.0/me"): (200, {"user_id": "1784", "username": "me_ig"}),
                             ("GET", "graph.instagram.com/v27.0/1784"): (200, {"username": "me_ig"})})
     info = platforms.instagram_set("IGAA" + "x" * 120, "")  # Instagram-Login token, no account id typed
-    assert info["username"] == "me_ig" and platforms._load()["instagram"]["host"] == "instagram"
-    assert platforms._load()["instagram"]["ig_user_id"] == "1784"
+    assert info["username"] == "me_ig" and _saved("instagram")["host"] == "instagram"
+    assert _saved("instagram")["ig_user_id"] == "1784"
     routes = {k: v for k, v in ig_routes().items()}
     routes = {(m, "graph.instagram.com/v27.0" + f if f.startswith("/") else f): v for (m, f), v in routes.items()}
     net = Net(monkeypatch, routes)
@@ -109,7 +121,7 @@ def test_connecting_survives_accounts_without_optional_profile_fields(monkeypatc
     for m in ("get", "post"):
         monkeypatch.setattr(platforms.httpx, m, handler(m))
     info = platforms.instagram_set("IGAA" + "x" * 120, "")
-    saved = platforms._load()["instagram"]
+    saved = _saved("instagram")
     assert info["username"] == "me_ig" and saved["ig_user_id"] == "1784" and saved["followers"] == 42 and saved["avatar"] is None
     platforms._save_platform("instagram", None)
 
@@ -140,7 +152,7 @@ def test_facebook_login_finds_the_instagram_account_itself(monkeypatch):
     _fb_net(monkeypatch, pages)
     for typed in ("", "555"):  # blank, or the Facebook user id by mistake
         info = platforms.instagram_set(FB_TOKEN, typed)
-        saved = platforms._load()["instagram"]
+        saved = _saved("instagram")
         assert info["username"] == "my_ig" and saved["ig_user_id"] == "17841400000000001" and saved["host"] == "facebook"
     platforms._save_platform("instagram", None)
 
@@ -210,7 +222,7 @@ def test_facebook_login_token_falls_back_cleanly(video, monkeypatch):
     Net(monkeypatch, {("GET", "graph.facebook.com/v27.0/1784"): (200, {"username": "fb_ig"}),
                       ("GET", "graph.instagram.com/v27.0/me"): (400, {"error": {"message": "Cannot parse access token", "code": 190}})})
     assert platforms.instagram_set("EAA" + "y" * 120, "1784")["username"] == "fb_ig"
-    assert platforms._load()["instagram"]["host"] == "facebook"  # (blank ID: found via the Page, see the tests below)
+    assert _saved("instagram")["host"] == "facebook"  # (blank ID: found via the Page, see the tests below)
     platforms._save_platform("instagram", None)
 
 
@@ -240,8 +252,8 @@ CREATOR = {"creator_username": "clipper", "creator_nickname": "Clipper",
 
 @pytest.fixture
 def tt(monkeypatch):
-    platforms._save_platform("tiktok", {"client_key": "k", "client_secret": "s", "access_token": "TT", "refresh_token": "R",
-                                        "expires_at": 9e12})
+    platforms._save_platform("tiktok", {"client_key": "k", "client_secret": "s"})  # the app; the sign-in is an account
+    accounts.add("tiktok", access_token="TT", refresh_token="R", expires_at=9e12, approved=True)
     monkeypatch.setattr(platforms.time, "sleep", lambda s: None)
     yield
     platforms._save_platform("tiktok", None)
@@ -314,7 +326,7 @@ def test_tiktok_large_file_chunking_matches_docs():
 def test_publish_passes_tiktok_options_through(monkeypatch, video):
     seen = {}
     monkeypatch.setattr(platforms, "tiktok_upload",
-                        lambda p, cap, opts, prog=None, cover_t=None: seen.update(opts=opts, cover_t=cover_t) or {})
+                        lambda p, cap, opts, prog=None, cover_t=None, **kw: seen.update(opts=opts, cover_t=cover_t) or {})
     platforms.publish("tiktok", video, {"title": "t", "privacy": "public", "tiktok": {"privacy_level": "SELF_ONLY"}, "cover_t": 3.0})
     assert seen == {"opts": {"privacy_level": "SELF_ONLY"}, "cover_t": 3.0}
     platforms.publish("tiktok", video, {"title": "t", "privacy": "private"})  # Autopilot: maps the generic privacy

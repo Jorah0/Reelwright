@@ -137,6 +137,7 @@ function loadFonts(force = false) {
   }));
 }
 function tsDefaults(kind, e, OW, OH) { // mirrors media.build_ass defaults
+  if (kind === "headline") return hlTsDefaults(e); // the theme's look
   const fs = Math.round(Math.min(OW, OH) * (OH > OW ? 0.078 : 0.06)), clean = e?.caption_style === "clean";
   const base = { font: "Arial Black", size: fs, weight: "bold", color: "#FFFFFF", outline: Math.max(Math.floor(fs / 12), 3), outline_color: "#000000", shadow: 2, spacing: 0 };
   if (kind === "caption") return { ...base, font: clean ? "Arial" : "Arial Black", size: Math.round(fs * (clean ? 0.9 : 1)), outline: clean ? 2 : base.outline, shadow: clean ? 2 : 3 };
@@ -241,6 +242,137 @@ function textStyleEditor(box, { get, set, def, sample = "Sample text" }) {
   draw();
 }
 document.addEventListener("mousedown", (e) => $$(".fp-pop:not([hidden])").forEach((p) => { if (!p.parentElement.contains(e.target)) p.hidden = true; }));
+
+// ---------- headline banner: themes from /api/headline/themes; spec/fit/layout mirror media.headline_spec/fit_headline/headline_layout ----------
+const HL = { themes: null, auto: {}, custom: null, default_on: false, vt: "" }; // vt = the open project's video type (theme "auto")
+const HL_DEF = { on: false, text: "", kicker: "", theme: "auto", position: "top", show: "whole", seconds: 3, push: false };
+let hlP = null;
+const loadHeadline = (force = false) => { if (force) hlP = null; return (hlP ||= api("/api/headline/themes").then((d) => Object.assign(HL, d)).catch(() => HL)); };
+const vtOf = (p) => (typeof p?.video_type === "string" ? p.video_type : p?.video_type?.type) || "";
+const hlId = (h) => (h.theme === "auto" ? HL.auto[HL.vt] || "bold_bar" : h.theme);
+const hlTheme = (id) => ({ ...HL.themes.bold_bar, ...(id === "custom" ? HL.custom || {} : HL.themes[id] || {}) });
+const hlName = (id) => (id === "auto" ? `Auto (${hlTheme(HL.auto[HL.vt] || "bold_bar").name})` : id === "custom" ? "My theme" : HL.themes?.[id]?.name || id);
+function hlSpec(e, force = false) { // force: draw even when off or empty (gallery cards)
+  const h = { ...HL_DEF, ...(e?.headline || {}) };
+  if (!HL.themes || (!force && (!h.on || !String(h.text || "").trim()))) return null;
+  const over = Object.fromEntries(TS_KEYS.filter((k) => e?.[`headline_${k}`] != null).map((k) => [k, e[`headline_${k}`]]));
+  return { ...hlTheme(hlId(h)), ...over, ...h, theme: hlId(h) };
+}
+const hlTsDefaults = (e) => { const th = HL.themes ? hlTheme(hlId({ ...HL_DEF, ...(e?.headline || {}) })) : tsDefaults("title", e, 1080, 1920); return Object.fromEntries(TS_KEYS.map((k) => [k, th[k]])); };
+function hlFit(text, size, cw, maxW) {
+  const words = text.split(/\s+/).filter(Boolean), low = Math.round(size * 0.5);
+  let s = Math.round(size), n = 1, lines = [];
+  for (;;) {
+    n = Math.max(Math.floor(maxW / (s * cw)), 1);
+    lines = words.reduce((a, w) => { if (a.length && a.at(-1).length + 1 + w.length <= n) a[a.length - 1] += " " + w; else a.push(w); return a; }, []);
+    if ((lines.length <= 2 && lines.every((l) => l.length <= n)) || s <= low) break;
+    s = Math.max(low, Math.floor(s * 0.92));
+  }
+  if (lines.length > 2 || lines.some((l) => l.length > n)) { lines = lines.slice(0, 2).map((l) => l.slice(0, n)); lines[lines.length - 1] = lines.at(-1).slice(0, Math.max(n - 1, 1)).trimEnd() + "…"; }
+  return [lines, s];
+}
+function hlLayout(sp, W, H, seam) {
+  const k = W / 1080, up = (s) => (sp.uppercase ? s.toUpperCase() : s), even = (v) => Math.max(Math.round(v) - (Math.round(v) % 2), 2);
+  const text = up(String(sp.text || "").trim()), kick = up(String(sp.kicker || "").trim());
+  const m = Math.round(40 * k), pad = Math.round(sp.pad * k), gap = Math.round(H * 0.02), kfs = Math.round(Math.max(sp.size * (sp.kicker_scale || 0.5), 32) * k);
+  const [kw, kh] = kick ? [Math.round(kick.length * kfs * 0.66 + kfs * 1.2), Math.round(kfs * 1.55)] : [0, 0];
+  const left = !!kick && sp.kicker_layout === "left", bx = m, bw = W - 2 * m, tx = bx + pad + (left ? kw + pad : 0);
+  const [lines, fs] = hlFit(text, sp.size * k, sp.cw, bx + bw - pad - tx);
+  const bh = Math.max(Math.round(lines.length * fs * 1.18 + 2 * pad), left ? kh + 2 * pad : 0);
+  const lift = kick && !left ? (sp.kicker_bg ? Math.round(kh * 0.6) : kh) : 0, pos = sp.position === "seam" && !seam ? "top" : sp.position;
+  let by, band = null;
+  if (pos === "seam") by = Math.round(seam * H - bh / 2);
+  else if (sp.push) { const b = even(bh + lift + 2 * gap); band = pos === "top" ? [0, b] : [H - b, b]; by = band[0] + gap + lift; }
+  else by = pos === "bottom" ? H - Math.round(H * 0.07) - bh : Math.round(H * 0.07) + lift;
+  by = Math.min(Math.max(by, lift), H - bh);
+  return { k, lines, fs, kick, kfs, kh, left, tx, band, bar: [bx, by, bw, bh], kbox: left ? [bx, by, kw + pad, bh] : kick ? [Math.floor((W - kw) / 2), by - lift, kw, kh] : null };
+}
+// Draws the banner into el (an absolutely-positioned layer over a W-wide output frame); s = screen px per output px.
+function hlRender(el, sp, L, s) {
+  const px = (v) => (v * s).toFixed(1) + "px", [x, y, w, h] = L.bar, r = sp.radius * L.k * s;
+  const rgba = (hex, a) => { const n = parseInt(hexOr(hex, "#000000").slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; };
+  const box = (b) => `left:${px(b[0])};top:${px(b[1])};width:${px(b[2])};height:${px(b[3])}`;
+  const bar = sp.bar ? `<div class="hl-bar" style="${box(L.bar)};border-radius:${r}px;background:${sp.bar2 ? `linear-gradient(90deg,${rgba(sp.bar, sp.bar_opacity)},${rgba(sp.bar2, sp.bar_opacity)})` : rgba(sp.bar, sp.bar_opacity)};${
+    sp.bar_border ? `border:${px(sp.bar_border * L.k)} solid ${hexOr(sp.bar_border_color, "#000000")};` : ""}${sp.glow ? `box-shadow:0 0 ${px(sp.glow * 4 * L.k)} ${hexOr(sp.bar_border_color, "#ffffff")};` : ""}${sp.blur ? "backdrop-filter:blur(8px);" : ""}">${
+    sp.accent ? `<i style="background:${hexOr(sp.accent, "#ffffff")};${sp.accent_side === "left" ? `left:0;top:0;bottom:0;width:${px(10 * L.k)}` : `left:0;right:0;bottom:0;height:${px(7 * L.k)}`}"></i>` : ""}</div>` : "";
+  const kb = L.kbox, kick = kb ? `<div class="hl-kick" style="${box(kb)};border-radius:${L.left ? r : (kb[3] * s) / 2}px;${sp.kicker_bg ? `background:${hexOr(sp.kicker_bg, "#000000")}` : ""}"><span>${esc(L.kick)}</span></div>` : "";
+  const txt = `<div class="hl-txt${L.left ? " left" : ""}" style="left:${px(L.left ? L.tx : x)};top:${px(y)};width:${px(L.left ? x + w - L.tx : w)};height:${px(h)}"><span>${L.lines.map(esc).join("<br>")}</span></div>`;
+  const band = L.band ? `<div class="hl-band" style="left:0;right:0;top:${px(L.band[0])};height:${px(L.band[1])}"></div>` : "";
+  el.innerHTML = `${band}<div class="hl-g" style="transform-origin:${px(x + w / 2)} ${px(y + h / 2)};${sp.tilt ? `transform:rotate(${-sp.tilt}deg)` : ""}">${bar}${kick}${txt}</div>`;
+  // ASS s is the full line cell; CSS font-size the em box (smaller), so ~0.72 of it (measured against a render) draws the same glyph size as the render
+  styleText($(".hl-txt span", el), { font: sp.font, size: L.fs * 0.72, weight: sp.weight, color: sp.color, outline: sp.outline * L.k, outline_color: sp.outline_color, shadow: sp.shadow * L.k, spacing: sp.spacing * L.k }, s);
+  if (sp.glow) $(".hl-txt span", el).style.textShadow = `0 0 ${px(sp.glow * 2)} ${hexOr(sp.outline_color, "#ffffff")}`;
+  if (kb) styleText($(".hl-kick span", el), { font: sp.kicker_font, size: L.kfs * 0.72, weight: "bold", color: sp.kicker_color, outline: sp.kicker_bg ? 0 : Math.max(sp.outline, 2) * L.k, outline_color: sp.outline_color, shadow: sp.kicker_bg ? 0 : 2 * L.k, spacing: 0 }, s);
+}
+// Theme gallery card: the theme drawn live (its fonts, colours, bar) on a small stand-in frame.
+function hlCard(el, id, text, kicker) {
+  const sp = { ...hlTheme(id === "auto" ? HL.auto[HL.vt] || "bold_bar" : id), text: text || "Your headline here", kicker: kicker || "TOP LINE", position: "top", push: false };
+  const W = 1080, H = 640, s = (el.clientWidth || 130) / W;
+  hlRender(el, sp, hlLayout(sp, W, H, null), s);
+}
+// The headline controls (Studio section, or compact in the Editor). clip() = the live clip; set(editPatch, delay) saves edit keys.
+function headlineEditor(box, { clip, set, compact = false }) {
+  if (!box) return;
+  const h = () => ({ ...HL_DEF, ...(clip().edit.headline || {}) });
+  const put = (p, d = 250) => set({ headline: { ...(clip().edit.headline || {}), ...p } }, d);
+  const draw = () => {
+    const H = h(), ids = ["auto", ...Object.keys(HL.themes || {}), ...(HL.custom ? ["custom"] : [])], cur = H.theme;
+    const segH = (key, opts) => `<div class="seg">${opts.map(([v, l]) => `<button type="button" class="${String(H[key]) === v ? "on" : ""}" data-hset="${key}" data-v="${v}">${l}</button>`).join("")}</div>`;
+    box.innerHTML = `<label class="switch"><input type="checkbox" data-h="on" ${H.on ? "checked" : ""}> Show a headline banner</label>
+      <label class="field">Headline<input type="text" data-h="text" maxlength="90" value="${esc(H.text)}" placeholder="${esc(clip().hook || clip().title || "The hook, in a few words")}"></label>
+      <label class="field">Top line (kicker: a name, “PART 2”, a date)<input type="text" data-h="kicker" maxlength="40" value="${esc(H.kicker)}" placeholder="Optional"></label>
+      <div class="row wrap"><button type="button" class="btn sm" data-ha="write" title="Claude suggests 3 honest headlines from the transcript">✨ Write headline</button><span class="muted grow" style="font-size:12px" data-hmsg></span></div>
+      <div class="chips hl-opts" data-hopts></div>
+      ${compact ? `<label class="field">Theme<select data-h="theme">${ids.map((id) => `<option value="${esc(id)}" ${cur === id ? "selected" : ""}>${esc(hlName(id))}</option>`).join("")}</select></label>`
+        : `<div class="hl-gallery" role="listbox" aria-label="Headline themes">${ids.map((id) => `<button type="button" role="option" class="hl-card" aria-selected="${cur === id}" data-ht="${esc(id)}" title="${esc(hlName(id))}"><div class="hl-mini" data-hmini="${esc(id)}"></div><span>${esc(hlName(id))}</span></button>`).join("")}</div>`}
+      ${segH("position", [["top", "Top"], ["seam", "At seam"], ["bottom", "Bottom"]])}
+      ${compact ? "" : `<div class="row wrap">${segH("show", [["whole", "Whole clip"], ["first_n_seconds", "First seconds"]])}${H.show !== "whole" ? `<label class="field" style="flex-direction:row;align-items:center;gap:6px">for <input type="number" data-h="seconds" min="0.5" max="30" step="0.5" value="${+H.seconds}" style="width:72px"> s</label>` : ""}</div>
+        <label class="switch"><input type="checkbox" data-h="push" ${H.push ? "checked" : ""}> Push the video down (reserve a band so the banner covers nothing)</label>
+        <div class="row wrap"><button type="button" class="btn xs" data-ha="save-theme" title="Save this look (theme + font and colour changes) as “My theme”">★ Save as my theme</button>
+          <label class="switch" style="font-size:12px"><input type="checkbox" data-ha="default" ${HL.default_on ? "checked" : ""}> Headline on new clips (each clip's hook)</label></div>`}`;
+    const t = clip().edit.headline || {};
+    $$("[data-hmini]", box).forEach((el) => hlCard(el, el.dataset.hmini, t.text, t.kicker));
+  };
+  const busy = (b, on) => { b.disabled = on; };
+  box.oninput = (e) => { e.stopPropagation(); const k = e.target.dataset.h; if (k === "text" && e.target.value.trim()) $("[data-h=on]", box).checked = true; if (k === "text" || k === "kicker") put({ [k]: e.target.value, ...(k === "text" && e.target.value.trim() ? { on: true } : {}) }, 600); };
+  box.onchange = async (e) => {
+    e.stopPropagation();
+    const t = e.target, k = t.dataset.h;
+    if (k === "on" || k === "push") put({ [k]: t.checked });
+    else if (k === "theme") put({ theme: t.value });
+    else if (k === "seconds") put({ seconds: Math.min(Math.max(+t.value || 3, 0.5), 30) });
+    else if (t.dataset.ha === "default") {
+      try { await new Promise((r) => setTimeout(r, 700)); await api(`/api/clips/${clip().id}/headline/default`, { body: { on: t.checked } }); HL.default_on = t.checked; toast(t.checked ? "New clips will get this headline look with their own hook." : "New clips start without a headline.", "ok"); }
+      catch (err) { t.checked = !t.checked; fail(err); }
+      return;
+    } else if (k === "text" || k === "kicker") return; // saved on input; a redraw here would swallow the click that blurred it
+    draw();
+  };
+  box.onclick = async (e) => {
+    e.stopPropagation();
+    const b = e.target.closest("[data-ht],[data-hset],[data-ha],[data-hpick],[data-hkick]");
+    if (!b) return;
+    if (b.dataset.ht) { put({ theme: b.dataset.ht }); return draw(); }
+    if (b.dataset.hset) { put({ [b.dataset.hset]: b.dataset.v }); return draw(); }
+    if (b.dataset.hpick != null) { put({ text: b.dataset.hpick, on: true }); return draw(); }
+    if (b.dataset.hkick != null) { put({ kicker: b.dataset.hkick }); return draw(); }
+    if (b.dataset.ha === "write") {
+      const msg = $("[data-hmsg]", box); busy(b, true); msg.textContent = "Writing…";
+      try {
+        const r = await api(`/api/clips/${clip().id}/headline/write`, { method: "POST" });
+        $("[data-hopts]", box).innerHTML = r.options.map((o) => `<button type="button" class="chip" data-hpick="${esc(o)}">${esc(o)}</button>`).join("")
+          + (r.kicker ? `<button type="button" class="chip" data-hkick="${esc(r.kicker)}">Top line: ${esc(r.kicker)}</button>` : "");
+        msg.textContent = !r.options.length ? "Nothing to suggest yet — type a headline." : r.ai ? "Pick one:" : "AI unavailable — the clip's hook and title:";
+      } catch (err) { msg.textContent = ""; fail(err); } finally { busy(b, false); }
+    }
+    if (b.dataset.ha === "save-theme") {
+      busy(b, true);
+      try { await new Promise((r) => setTimeout(r, 700)); HL.custom = await api(`/api/clips/${clip().id}/headline/theme`, { method: "POST" }); put({ theme: "custom" }); draw(); toast("Saved as “My theme”.", "ok"); } // ponytail: waits out the debounced edit saves (≤ 600 ms) so the server sees the latest look
+      catch (err) { fail(err); } finally { busy(b, false); }
+    }
+  };
+  loadHeadline().then(draw);
+}
 // Caption chunks as the renderer groups them: up to 3 words (vertical) or 6, broken at pauses and sentence ends.
 function chunkWords(words, vertical) {
   const max = vertical ? 3 : 6, out = [];
@@ -310,6 +442,7 @@ async function sideStatus() {
   try {
     const [settings, conn, jobs] = await Promise.all([api("/api/settings"), api("/api/connections"), api("/api/jobs")]);
     S.settings = settings; S.conn = conn;
+    storageNotice(settings); // unplugged storage drive banner; the first-run space saver choice
     if (!S.uiLoaded) { S.uiLoaded = true; applyUi(settings.ui_scale); } // once at boot; afterwards this page is the source of truth
     const running = jobs.filter((j) => j.status === "running" || j.status === "queued").length;
     const b = $("#jobs-badge"); b.hidden = !running; b.textContent = running;
@@ -327,12 +460,21 @@ async function sideStatus() {
 // ---------- autopilot form (shared) ----------
 const AP_DEFAULT = { enabled: false, top_n: 3, first_publish: "", interval_hours: 24, privacy: "public", aspect: "9:16", captions: true, jump_cuts: false, mode: "publish_at", platforms: ["youtube"], timing: "best" };
 const apLoad = () => { try { return { ...AP_DEFAULT, ...JSON.parse(localStorage.autopilot || "{}") }; } catch { return { ...AP_DEFAULT }; } };
+// Autopilot posts only to accounts approved for uploads AND allowed for Autopilot (both switches on the Publish page).
+function apAccounts(ap) {
+  const all = Object.keys(PLATFORM).flatMap((p) => S.conn?.[p]?.accounts || []);
+  if (!all.length) return `<div class="plats">${Object.entries(PLATFORM).map(([k, v]) => `<label><input type="checkbox" class="ap-plat" value="${k}" ${ap.platforms.includes(k) ? "checked" : ""}> ${v}</label>`).join("")}</div>
+    <p class="dim" style="font-size:11.5px;margin:0">Link accounts on the Publish page and turn on “Allow Autopilot to post here”: Autopilot only posts to those.</p>`;
+  const can = (a) => a.approved && a.autopilot;
+  return `<div class="plats">${all.map((a) => `<label ${can(a) ? "" : 'style="opacity:.45" title="Turn on “Approved for uploads” and “Allow Autopilot to post here” for this account on the Publish page"'}>
+      <input type="checkbox" class="ap-acc" value="${esc(a.id)}" data-plat="${a.platform}" ${!can(a) ? "disabled" : (ap.accounts ? ap.accounts.includes(a.id) : ap.platforms.includes(a.platform)) ? "checked" : ""}> ${platTag(a.platform)} ${esc(a.name || a.handle || "")}</label>`).join("")}</div>`;
+}
 function apForm(ap, withToggle = true) {
   return `
   ${withToggle ? `<div class="row"><h2 class="grow" style="margin:0">⚡ Autopilot</h2><label class="switch"><input type="checkbox" id="ap-enabled" ${ap.enabled ? "checked" : ""}></label></div>
   <p class="muted" style="margin:6px 0 14px;font-size:12.5px">When the scan finishes, the top clips are rendered and scheduled to your channels automatically.</p>` : ""}
   <div class="ap-body stack">
-    <div class="plats">${Object.entries(PLATFORM).map(([k, v]) => `<label><input type="checkbox" class="ap-plat" value="${k}" ${ap.platforms.includes(k) ? "checked" : ""}> ${v}</label>`).join("")}</div>
+    ${apAccounts(ap)}
     <label class="field">Clips to publish<input type="number" id="ap-top" min="1" max="30" value="${ap.top_n}"></label>
     <label class="field">When<select id="ap-timing">
       <option value="best" ${ap.timing !== "fixed" ? "selected" : ""}>Best times for each platform (learned from your results + live research)</option>
@@ -359,6 +501,11 @@ function apRead(root) {
     mode: $("#ap-mode", root).value, captions: $("#ap-cap", root).checked, jump_cuts: $("#ap-jc", root).checked, timing: $("#ap-timing", root).value,
     platforms: $$(".ap-plat", root).filter((c) => c.checked).map((c) => c.value),
   };
+  const accs = $$(".ap-acc", root);
+  if (accs.length) { // accounts listed: they decide (their platforms are kept for older readers)
+    ap.accounts = accs.filter((c) => c.checked).map((c) => c.value);
+    ap.platforms = [...new Set(accs.filter((c) => c.checked).map((c) => c.dataset.plat))];
+  }
   // only the Library card's own switch changes whether Autopilot is on for new imports
   localStorage.autopilot = JSON.stringify({ ...ap, enabled: $("#ap-enabled", root) ? ap.enabled : apLoad().enabled });
   return { ...ap, first_publish: fromLocalInput(ap.first_publish) };
@@ -399,6 +546,236 @@ async function openReport(id) {
 // ======================================================================
 // Library
 // ======================================================================
+// video types — ponytail: mirrors ai.VIDEO_TYPES / SUB_GENRES (the server validates); option value "type" or "gaming:sub"
+const VTYPES = [["gaming", "Gaming"], ["gaming:fps", "Gaming — FPS / competitive"], ["gaming:horror", "Gaming — Horror"],
+  ["gaming:variety", "Gaming — Variety / casual"], ["gaming:speedrun", "Gaming — Speedrun"], ["vtuber", "VTuber"],
+  ["just_chatting", "Just chatting / IRL"], ["podcast", "Podcast / interview"], ["reaction", "Reaction"], ["tutorial", "Tutorial / educational"],
+  ["sports", "Sports"], ["music", "Music / performance"], ["vlog", "Vlog"], ["comedy", "Comedy / sketch"], ["other", "Other"]];
+const vtKey = (vt) => (vt?.type ? vt.type + (vt.sub_genre ? ":" + vt.sub_genre : "") : "auto");
+const vtLabel = (vt) => (VTYPES.find(([k]) => k === vtKey(vt)) || [, vt?.type || ""])[1];
+const vtOptions = (sel, autoLabel = "Auto-detect type") => `<option value="auto">${autoLabel}</option>`
+  + VTYPES.map(([k, l]) => `<option value="${k}" ${k === sel ? "selected" : ""}>${l}</option>`).join("");
+const vtBody = (key) => { const [video_type, sub_genre = ""] = key.split(":"); return { video_type, sub_genre }; };
+const vtTip = (vt) => !vt ? "Detected during analysis" : vt.source === "user" ? "Set by you" : `Detected (${vt.source === "ai" ? "AI" : "offline guess"}, ${Math.round((vt.confidence || 0) * 100)}% sure)${vt.reasons?.length ? ": " + vt.reasons.join("; ") : ""}`;
+
+// ---------- storage & space saver (storage.py): Keep pins, due dates, removed sources, imported shorts ----------
+Object.assign(JOB_LABEL, { cleanup: "Space saver clean-up" });
+const VIDEO_RE = /\.(mp4|mov|mkv|webm|avi|m4v|mts|ts|flv|wmv)$/i; // mirrors media.VIDEO_EXT
+const gb = (n) => `${((+n || 0) / 1e9).toFixed(1)} GB`;
+function dueText(d, src = false) {
+  if (!d?.at) return "";
+  const days = Math.ceil((new Date(d.at) - Date.now()) / 864e5), arch = d.action === "archive";
+  const at = days <= 0 ? "at the next clean-up" : days === 1 ? "in 1 day" : `in ${days} days`;
+  return src ? `Source ${arch ? "moves to archive" : "deleted"} ${at}` : `${arch ? "Moves to archive" : "Removed"} ${at}`;
+}
+const dueChip = (d, src = false) => (d?.at ? `<span class="chip due" title="Space saver (Settings › Storage). 📌 Keep exempts it.">${esc(dueText(d, src))}</span>` : "");
+const keepBtn = (kind, id, on, label) => `<button class="btn xs keep${on ? " on" : ""}" data-keep="${esc(kind)}:${esc(id)}" aria-pressed="${!!on}"
+  title="${on ? "Kept: the space saver never removes or archives this. Click to un-pin." : "Keep: the space saver never removes or archives this"}">${label || (on ? "📌 Kept" : "📌 Keep")}</button>`;
+async function toggleKeep(btn) { // a [data-keep] button anywhere: pin / un-pin (Keep on an expired item restores it)
+  const [kind, id] = btn.dataset.keep.split(":"), on = !btn.classList.contains("on");
+  const url = { project: `/api/projects/${id}`, clip: `/api/clips/${id}`, longform: `/api/longform/${id}` }[kind];
+  btn.disabled = true;
+  try {
+    await api(url, { method: "PATCH", body: { keep: on } });
+    toast(on ? "Kept: the space saver won't touch it." : "No longer pinned.", "ok", 1800);
+    if (btn.isConnected) btn.outerHTML = keepBtn(kind, id, on);
+  } catch (e) { fail(e); btn.disabled = false; }
+}
+function sourceNote(p) { // a source the space saver removed, and the way back
+  if (p.source_state !== "removed") return "";
+  const r = p.source_removed || {};
+  return `<div class="src-gone"><b>Source removed</b> <span class="dim">to save space${r.archive ? ` — archived to ${esc(r.archive)}` : ""}</span>
+    ${p.can_redownload ? `<button class="btn xs" data-redl="${esc(p.id)}">Re-download</button>` : `<button class="btn xs" data-reimp="${esc(p.id)}">Re-import file</button>`}
+    ${r.error ? `<div style="color:var(--err);font-size:11.5px">${esc(r.error)}</div>` : ""}</div>`;
+}
+async function sourceAction(target, done) { // [data-redl] / [data-reimp] anywhere; true when it handled the click
+  const re = target.closest("[data-redl]"), ri = target.closest("[data-reimp]");
+  if (re) {
+    re.disabled = true;
+    try { await api(`/api/projects/${re.dataset.redl}/redownload`, { method: "POST" }); toast("Re-downloading the source — clips and analysis stay as they are.", "ok"); done?.(); }
+    catch (e) { fail(e); re.disabled = false; }
+    return true;
+  }
+  if (!ri) return false;
+  const inp = Object.assign(document.createElement("input"), { type: "file", accept: "video/*,.mkv" });
+  inp.onchange = async () => {
+    const fd = new FormData(); fd.append("file", inp.files[0]);
+    ri.disabled = true; ri.innerHTML = `<span class="spin"></span> Uploading…`;
+    try { await api(`/api/projects/${ri.dataset.reimp}/source`, { body: fd }); toast("Source restored.", "ok"); done?.(); }
+    catch (e) { fail(e); ri.disabled = false; ri.textContent = "Re-import file"; }
+  };
+  inp.click();
+  return true;
+}
+async function pickPath(kind = "folder", current = "") { // the desktop app's native picker, else a typed path
+  const app = S.app || (S.app = await api("/api/app").catch(() => ({})));
+  if (!app.desktop) { const v = prompt(kind === "folder" ? "Folder path (e.g. D:\\Reelwright):" : "File path:", current); return v ? [v.trim()] : []; }
+  return (await api("/api/storage/pick", { body: { kind } })).paths;
+}
+function openShortImport(vt, done) {
+  modal(`<h2>Import shorts</h2><p class="muted">Shorts you made before: each becomes its own project with <b>one whole clip</b>, analysed as usual (captions, headline, layouts all work), ready to re-edit and post. The same video is never imported twice. Your originals stay where they are and the space saver never deletes imported originals unless you opt in.</p>
+    <div class="row wrap"><button class="btn primary" id="sh-files">Choose videos…</button><button class="btn" id="sh-dir">Choose a folder…</button>
+      <input type="file" id="sh-fi" accept="video/*,.mkv" multiple hidden><input type="file" id="sh-di" webkitdirectory hidden></div>
+    <div id="sh-out" class="stack" style="margin-top:12px;font-size:12.5px"></div><div class="foot"><button class="btn" data-close>Close</button></div>`, async (m) => {
+    const out = $("#sh-out", m);
+    const report = (r) => {
+      out.innerHTML = `<div><b>${r.added.length}</b> short${r.added.length === 1 ? "" : "s"} imported: analysis runs one at a time (see the Library), then each opens in the Studio.</div>`
+        + (r.duplicates.length ? `<div class="dim">${r.duplicates.length} already imported: ${r.duplicates.map((d) => esc(d.name)).join(", ")}</div>` : "")
+        + (r.skipped.length ? `<div style="color:var(--err)">${r.skipped.length} skipped: ${r.skipped.map((s) => `${esc(s.path)} (${esc(s.reason)})`).join("; ")}</div>` : "");
+      done();
+    };
+    const app = S.app || (S.app = await api("/api/app").catch(() => ({})));
+    if (app.desktop) { // native pickers: the files are copied in on this PC (no upload)
+      const go = async (kind) => {
+        try { const paths = await pickPath(kind); if (!paths.length) return; out.innerHTML = `<span class="spin"></span> Checking ${paths.length === 1 ? "" : paths.length + " "}selection for duplicates…`; report(await api("/api/shorts/paths", { body: { paths, ...vt } })); }
+        catch (e) { out.textContent = ""; fail(e); }
+      };
+      $("#sh-files", m).onclick = () => go("files"); $("#sh-dir", m).onclick = () => go("folder");
+      return;
+    }
+    $("#sh-files", m).onclick = () => $("#sh-fi", m).click(); $("#sh-dir", m).onclick = () => $("#sh-di", m).click();
+    const send = async (list) => { // the browser uploads them one after another
+      const files = [...list].filter((f) => VIDEO_RE.test(f.name)), res = { added: [], duplicates: [], skipped: [] };
+      for (const [i, f] of files.entries()) {
+        out.innerHTML = `<div>Importing ${i + 1} of ${files.length} — ${esc(f.name)}</div>${bar(i / files.length)}`;
+        const fd = new FormData(); fd.append("file", f); Object.entries(vt).forEach(([k, v]) => fd.append(k, v));
+        try { const r = await api("/api/shorts", { body: fd }); r.duplicate ? res.duplicates.push({ name: f.name }) : res.added.push(r.project); }
+        catch (e) { res.skipped.push({ path: f.name, reason: e.message }); }
+      }
+      report(res);
+    };
+    $("#sh-fi", m).onchange = (e) => send(e.target.files); $("#sh-di", m).onchange = (e) => send(e.target.files);
+  });
+}
+
+function storageNotice(s) { // from sideStatus: a banner while the storage drive is away; the one-time space saver choice
+  let b = $("#storage-banner");
+  if (s.storage_missing) {
+    if (!b) { b = Object.assign(document.createElement("div"), { id: "storage-banner", className: "storage-banner" }); b.setAttribute("role", "alert"); document.body.append(b); }
+    b.innerHTML = `⚠ The storage folder <b>${esc(s.storage_dir || "(default)")}</b> isn't connected. Renders, imports and uploads wait until it's back — nothing was moved or deleted. <a href="#/settings">Storage settings</a>`;
+  } else b?.remove();
+  if (s.retention_mode === "" && !$("#modal-root").innerHTML) retentionPrompt();
+}
+
+function retentionPrompt() { // first run after the update: a choice is required before any clean-up can run
+  const opt = (v, title, sub, on) => `<label class="row" style="gap:10px;align-items:flex-start;cursor:pointer"><input type="radio" name="rtf" value="${v}" ${on ? "checked" : ""}>
+    <span><b>${title}</b><br><span class="dim" style="font-size:12.5px">${sub}</span></span></label>`;
+  modal(`<div id="rt-first"><h2>Save disk space automatically?</h2>
+    <p class="muted">Downloaded streams and rendered clips fill a drive fast. Reelwright can clean them up 14 days after you're done with them.
+      <b>Nothing already on this PC is touched today</b>: every item's 14 days start now. Clips, transcripts, posts and what Reelwright learned always stay,
+      anything waiting to render or post is never touched, and anything you pin with 📌 Keep is kept.</p>
+    <div class="stack" style="gap:10px">${opt("delete", "Delete after 14 days", "Downloaded long videos and clip renders are deleted. A removed download can be downloaded again from its link.", true)}
+      ${opt("archive", "Archive to a folder", "Moved to folders you choose in Settings › Storage, with readable names. Nothing moves until you pick them.")}
+      ${opt("off", "Keep everything", "Nothing is ever removed. Change this any time in Settings › Storage.")}</div>
+    <div class="foot"><button class="btn primary" id="rtf-ok">Continue</button></div></div>`, (m, close) => {
+    $(".modal-bg").addEventListener("mousedown", (e) => e.target === e.currentTarget && e.stopImmediatePropagation(), true); // no click-away
+    $("#rtf-ok", m).onclick = async () => {
+      const v = $("input[name=rtf]:checked", m).value;
+      try {
+        S.settings = await api("/api/settings", { method: "PUT", body: { retention_mode: v } });
+        close();
+        toast(v === "archive" ? "Choose the archive folders in Settings › Storage." : v === "delete" ? "Space saver on: nothing is removed for 14 days." : "Keeping everything.", "ok", 6000);
+        if (v === "archive") location.hash = "#/settings";
+      } catch (e) { fail(e); }
+    };
+  });
+}
+
+async function openCleanup() { // "Clean up now": always a preview first
+  const pv = await api("/api/storage/cleanup");
+  if (!pv.mode) return toast("Turn the space saver on (Delete or Archive) and save it first.", "err");
+  const KIND = { source: "Source video", clip: "Clip", longform: "Long form" };
+  const row = (it) => `<tr><td style="width:96px">${KIND[it.kind] || esc(it.kind)}</td><td>${esc(it.title)}</td><td class="mono" style="width:70px">${gb(it.bytes)}</td>${it.reason ? `<td class="dim">${esc(it.reason)}</td>` : ""}</tr>`;
+  const total = pv.items.reduce((a, it) => a + it.bytes, 0), verb = pv.mode === "archive" ? "Archive" : "Delete";
+  modal(`<h2>Clean up now?</h2>${pv.items.length ? `<p class="muted">${verb}s ${pv.items.length} item${pv.items.length === 1 ? "" : "s"} past their date (${gb(total)}):</p>
+      <table style="width:100%;font-size:12.5px"><tbody>${pv.items.map(row).join("")}</tbody></table>` : `<p class="muted">Nothing is due right now.</p>`}
+    ${pv.blocked.length ? `<h3 style="margin-top:14px">Skipped for now (${pv.blocked.length})</h3><table style="width:100%;font-size:12.5px"><tbody>${pv.blocked.map(row).join("")}</tbody></table>` : ""}
+    <div class="foot"><button class="btn" data-close>Cancel</button>${pv.items.length ? `<button class="btn primary danger" id="cl-go">${verb} ${pv.items.length}</button>` : ""}</div>`, (m, close) => {
+    const go = $("#cl-go", m);
+    if (go) go.onclick = async () => { close(); try { await api("/api/storage/cleanup", { method: "POST" }); toast("Cleaning up — follow it in Activity.", "ok"); } catch (e) { fail(e); } };
+  }, true);
+}
+
+function storageCards() { // Settings › Storage + Space saver, inserted above "App window & startup"
+  const anchor = $("#appwin", view);
+  if (!anchor || $("#storage-card", view)) return;
+  anchor.insertAdjacentHTML("beforebegin", `<div class="card stack" style="margin-top:20px" id="storage-card"><span class="dim">Loading storage…</span></div>
+    <div class="card stack" style="margin-top:20px" id="saver-card"></div>`);
+  const sc = $("#storage-card", view), sv = $("#saver-card", view);
+  let st = null, timer = 0;
+  const drawStorage = () => {
+    const u = st.usage, m = st.move || {};
+    sc.innerHTML = `<div class="row wrap"><h2 class="grow" style="margin:0">Storage</h2>${st.missing ? '<span class="pill err">not connected</span>' : ""}</div>
+      <p class="muted" style="margin:0;font-size:12.5px">Your projects' videos live here: sources, renders and analysis. Settings, the database and the asset library stay in <span class="mono">${esc(st.data)}</span>. A big second drive keeps long videos off your system disk.</p>
+      <div class="row wrap"><div class="grow"><div class="mono" style="word-break:break-all">${esc(st.path)}</div><div class="dim" style="font-size:12px">${st.custom ? "Your chosen folder" : "The default folder"}</div></div>
+        <button class="btn sm" id="st-change" ${m.active ? "disabled" : ""}>Change folder…</button></div>
+      ${st.missing ? `<div style="color:var(--err);font-size:12.5px">This folder isn't available (is the drive connected?). Renders, imports and uploads wait until it's back; nothing was moved or deleted. Reconnect it, or pick another folder (projects stored here stay here).</div>`
+        : `<div style="font-size:13px">Free: <b>${gb(st.free)}</b>${u ? ` · Reelwright uses <b>${gb(u.total)}</b> — sources ${gb(u.sources)}, renders ${gb(u.renders)}, other ${gb(u.other)}` : ""}</div>`}
+      ${m.active ? `<div style="font-size:12.5px">${esc(m.message || "Moving…")} → <span class="mono">${esc(m.to)}</span></div>${bar(m.progress)}
+          <div class="dim" style="font-size:12px">Renders, imports and uploads wait until the move finishes. Closing Reelwright is safe: the move continues next time.</div>`
+        : m.error ? `<div style="color:var(--err);font-size:12.5px">The move stopped: ${esc(m.error)} ${m.phase === "cleanup"
+          ? "Your projects are safe in the new folder; some old copies may be left in the old one." : "Nothing was deleted; your projects are still in the old folder."}</div>`
+        : m.message ? `<div class="dim" style="font-size:12.5px">${esc(m.message)}</div>` : ""}`;
+  };
+  const load = async () => {
+    st = await api(`/api/storage?usage=${st?.move?.active ? "false" : "true"}`).then((x) => ({ ...x, usage: x.usage || st?.usage }));
+    if (sc.isConnected) drawStorage();
+    clearTimeout(timer);
+    if (st.move?.active && sc.isConnected) timer = setTimeout(() => load().catch(() => {}), 2000);
+  };
+  sc.onclick = async (e) => {
+    if (e.target.id !== "st-change") return;
+    try {
+      const [path] = await pickPath("folder", st.path);
+      if (!path) return;
+      const chk = await api("/api/storage/check", { body: { path } });
+      if (!chk.ok) return toast(chk.error, "err", 7000);
+      const ok = await confirmBox(chk.missing ? "Switch the storage folder?" : "Move your projects?", chk.missing
+        ? `The current folder isn't connected, so nothing can be moved: Reelwright switches to ${chk.path}. Projects on the old drive stay there; switch back once it's connected.`
+        : `Your projects (${gb(chk.needed)}) are copied to ${chk.path} (${gb(chk.free)} free), every copy is checked, and only then are the originals removed. Renders, imports and uploads wait meanwhile.`,
+        chk.missing ? "Switch" : "Move");
+      if (!ok) return;
+      st = { ...st, ...(await api("/api/storage/move", { body: { path: chk.path } })) };
+      await load();
+      sideStatus();
+    } catch (err) { fail(err); }
+  };
+  const SCOPES = [["sources", "Downloaded long videos (links and channel imports)"], ["unfinished", "Unfinished clips' renders (rendered, never uploaded)"],
+    ["uploaded", "Uploaded clips' renders"], ["longform", "Long-form exports"], ["local_sources", "Originals from OBS, the network receiver, files you added and imported shorts"]];
+  const ARCH = [["archive_uploaded_dir", "Uploaded clips go to"], ["archive_unfinished_dir", "Unfinished clips go to"], ["archive_other_dir", "Sources & long forms go to (blank = the uploaded-clips folder)"]];
+  const drawSaver = () => {
+    const s = S.settings, mode = s.retention_mode || "off";
+    const sc0 = { sources: true, unfinished: true, uploaded: true, longform: true, local_sources: false, ...(s.retention_scope || {}) };
+    sv.innerHTML = `<h2 style="margin:0">Space saver</h2>
+      <p class="muted" style="margin:0;font-size:12.5px">After the days below, Reelwright deletes past-due videos and renders, or moves them to archive folders. Clips, transcripts, posts and what Reelwright learned always stay. Never touched: anything pinned with 📌 Keep (a clip, long form or whole project) and anything waiting to render or post.</p>
+      <div class="row wrap" style="gap:14px">${[["off", "Off — keep everything"], ["delete", "Delete"], ["archive", "Archive to folders"]].map(([v, l]) => `<label class="row" style="gap:6px"><input type="radio" name="rt-mode" value="${v}" ${mode === v ? "checked" : ""}> ${l}</label>`).join("")}
+        <label class="row" style="gap:6px">after <input type="number" id="rt-days" min="1" max="3650" value="${+s.retention_days || 14}" style="width:80px"> days</label></div>
+      <div class="stack" style="gap:4px">${SCOPES.map(([k, l]) => `<label class="row" style="gap:8px;font-size:13px"><input type="checkbox" data-scope="${k}" ${sc0[k] ? "checked" : ""}> ${l}</label>`).join("")}</div>
+      <div class="stack" id="rt-arch" style="gap:6px" ${mode === "archive" ? "" : "hidden"}>${ARCH.map(([k, l]) => `<div class="row wrap" style="gap:6px"><label class="field grow">${l}<input type="text" data-arch="${k}" value="${esc(s[k] || "")}" placeholder="e.g. D:\\Reelwright archive"></label><button class="btn sm" type="button" data-pick="${k}" style="align-self:flex-end">Choose…</button></div>`).join("")}
+        <p class="dim" style="margin:0;font-size:12px">Archived files get readable names (date, title, platform) and a small .json beside each with the title, caption, hashtags and post links. Each copy is checked before the original is removed; while a folder isn't set or connected, nothing is deleted instead.</p></div>
+      <p class="dim" style="margin:0;font-size:12px">The clock: a downloaded video counts from its import, an unfinished clip from its last render, a posted clip or long form from its last upload — never from before you switched the space saver on${s.retention_since ? ` (${esc(when(s.retention_since))})` : ""}. Cards show the date (“Removed in 3 days”). It runs a few minutes after Reelwright starts, then daily.</p>
+      <div class="row wrap"><button class="btn sm primary" type="button" id="rt-save">Save space saver</button><button class="btn sm" type="button" id="rt-clean">Clean up now…</button>
+        <span class="dim" style="font-size:12px">${s.retention_at ? `Last clean-up ${esc(when(s.retention_at))}` : ""}</span></div>`;
+  };
+  sv.onchange = (e) => { if (e.target.name === "rt-mode") $("#rt-arch", sv).hidden = e.target.value !== "archive"; };
+  sv.onclick = async (e) => {
+    const pk = e.target.closest("[data-pick]");
+    try {
+      if (pk) { const inp = $(`[data-arch="${pk.dataset.pick}"]`, sv); const [path] = await pickPath("folder", inp.value); if (path) inp.value = path; return; }
+      if (e.target.id === "rt-clean") return openCleanup();
+      if (e.target.id !== "rt-save") return;
+      S.settings = await api("/api/settings", { method: "PUT", body: {
+        retention_mode: $("input[name=rt-mode]:checked", sv)?.value || "off", retention_days: +$("#rt-days", sv).value || 14,
+        retention_scope: Object.fromEntries($$("[data-scope]", sv).map((c) => [c.dataset.scope, c.checked])),
+        ...Object.fromEntries($$("[data-arch]", sv).map((i) => [i.dataset.arch, i.value.trim()])) } });
+      toast("Space saver saved.", "ok");
+      drawSaver();
+    } catch (err) { fail(err); }
+  };
+  drawSaver();
+  load().catch((err) => { sc.innerHTML = `<h2 style="margin:0">Storage</h2><span class="dim">${esc(err.message)}</span>`; });
+}
+
 function Library() {
   this.mount = async () => {
     const ap = apLoad();
@@ -408,9 +785,11 @@ function Library() {
         <div class="drop" id="drop">
           <div class="big">Drop a video here</div>
           <div class="muted">MP4, MOV, MKV, WebM… any length. Processing happens on this computer.</div>
-          <button class="btn primary" id="browse">Choose file</button><input type="file" id="file" accept="video/*,.mkv" hidden multiple>
+          <div class="row wrap" style="justify-content:center"><button class="btn primary" id="browse">Choose file</button><input type="file" id="file" accept="video/*,.mkv" hidden multiple>
+            <button class="btn" id="shorts" type="button" title="Shorts you made before: each becomes its own project with one whole clip, ready to re-edit and post">⇪ Import shorts…</button></div>
           <div class="or">or import a link — YouTube, Twitch, Kick VODs &amp; clips, 1,000+ sites</div>
           <form id="urlform"><input type="url" id="url" placeholder="https://www.twitch.tv/videos/…" required><button class="btn">Import</button></form>
+          <label class="muted" style="font-size:12.5px" title="The type steers what the AI looks for (e.g. kills and callouts in an FPS, quotable lines in a podcast). Auto-detect looks at the title and a few frames first.">Video type <select id="vtype">${vtOptions(localStorage.vtype || "auto", "Auto-detect (recommended)")}</select></label>
           <a href="#/sources" class="muted" style="font-size:12.5px">Connect a Twitch / Kick / YouTube channel to auto-import every new stream →</a>
           <div id="upl" class="stack" style="width:100%;max-width:460px"></div>
         </div>
@@ -420,16 +799,18 @@ function Library() {
       <div id="projects" class="grid"></div></div>`;
     const drop = $("#drop"), file = $("#file");
     $("#browse").onclick = () => file.click();
+    $("#shorts").onclick = () => openShortImport(vtBody($("#vtype").value), () => this.refresh());
     file.onchange = () => [...file.files].forEach(upload);
     ["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
     ["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
     drop.addEventListener("drop", (e) => [...e.dataTransfer.files].forEach(upload));
     $("#ap-enabled").onchange = (e) => { $("#ap").classList.toggle("off", !e.target.checked); apRead($("#ap")); };
     $("#ap").addEventListener("change", () => apRead($("#ap")));
+    $("#vtype").onchange = (e) => { try { localStorage.vtype = e.target.value; } catch {} };
     $("#urlform").onsubmit = async (e) => {
       e.preventDefault();
       try {
-        const p = await api("/api/projects/url", { body: { url: $("#url").value, autopilot: apRead($("#ap")) } });
+        const p = await api("/api/projects/url", { body: { url: $("#url").value, autopilot: apRead($("#ap")), ...vtBody($("#vtype").value) } });
         $("#url").value = ""; toast("Import started — analysis begins when the download finishes.", "ok"); this.refresh();
         localStorage.lastProject = p.id;
       } catch (err) { fail(err); }
@@ -444,6 +825,7 @@ function Library() {
     const fd = new FormData();
     fd.append("file", f);
     fd.append("autopilot", JSON.stringify(apRead($("#ap"))));
+    Object.entries(vtBody($("#vtype").value)).forEach(([k, v]) => fd.append(k, v));
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/projects");
     xhr.upload.onprogress = (e) => { const p = e.loaded / e.total; $(".pct", row).textContent = `${Math.round(p * 100)}%`; $(".bar div", row).style.width = `${p * 100}%`; };
@@ -470,12 +852,20 @@ function Library() {
         <div class="body">
           <div class="name" title="${esc(p.name)}">${esc(p.name)}</div>
           <div class="row wrap">${pill(PROJECT_STATUS, p.status)}<span class="muted grow" style="font-size:12px">${p.status === "ready" ? `${p.clip_count} clips` : esc(p.stage || "")}</span>
-            ${p.viral ? `<span class="vbadge" title="Virality score">✦ ${+p.viral.score}</span>` : ""}${p.origin ? `<span class="chip">${esc(p.origin.platform)}</span>` : ""}
+            ${p.viral ? `<span class="vbadge" title="Virality score">✦ ${+p.viral.score}</span>` : ""}${p.origin?.platform ? `<span class="chip">${esc(p.origin.platform)}</span>` : p.origin?.kind === "imported_short" ? '<span class="chip">Imported short</span>' : ""}
+            ${p.video_type ? `<span class="chip" title="${esc(vtTip(p.video_type))}">${esc(vtLabel(p.video_type))}</span>` : ""}
             ${p.autopilot?.enabled ? '<span class="pill run" title="Autopilot on">Autopilot</span>' : ""}</div>
           ${p.status !== "ready" && p.status !== "failed" ? bar(p.progress) : ""}
           ${p.error ? `<div style="color:var(--err);font-size:12px">${esc(p.error).slice(0, 180)}</div>` : ""}
+          ${sourceNote(p)}
+          <div class="row wrap" style="gap:6px">${keepBtn("project", p.id, p.keep)}${dueChip(p.source_due, true)}
+            ${p.origin?.kind === "imported_short" && p.status === "ready" && p.first_clip ? `<a class="btn xs primary" href="#/studio/${esc(p.first_clip)}">Open in Studio</a>` : ""}</div>
         </div></div>`).join("");
     el.onclick = async (e) => {
+      const kb = e.target.closest("[data-keep]");
+      if (kb) { e.stopPropagation(); await toggleKeep(kb); return this.refresh(); }
+      if (e.target.closest("a")) return; // "Open in Studio"
+      if (await sourceAction(e.target, () => this.refresh())) return;
       const del = e.target.closest("[data-del]");
       if (del) {
         e.stopPropagation();
@@ -501,11 +891,11 @@ function visualStrip(v) {
   const m = v?.motion || [];
   if (!m.length) return null;
   const per = Math.ceil(m.length / 16000), n = Math.ceil(m.length / per); // stay under canvas width limits on long VODs
-  const sorted = [...m].sort((a, b) => a - b), top = sorted[Math.floor(sorted.length * 0.98)] || sorted.at(-1) || 1;
+  const sorted = [...m].sort((a, b) => a - b), top = Math.max(0.02, sorted[Math.floor(sorted.length * 0.98)] || 0); // floor: a static video's noise stays dim
   const c = Object.assign(document.createElement("canvas"), { width: n, height: 1 }), g = c.getContext("2d"), img = g.createImageData(n, 1);
   for (let i = 0; i < n; i++) {
     let x = 0; for (let j = i * per; j < (i + 1) * per && j < m.length; j++) x = Math.max(x, m[j]);
-    const a = Math.min(1, x / (top || 1));
+    const a = Math.min(1, x / top);
     img.data.set([255, 106 + 80 * (1 - a), 61, Math.round(255 * a * a)], i * 4);
   }
   for (const s of v.spikes || []) {
@@ -519,15 +909,25 @@ function visualStrip(v) {
 }
 
 function Editor(pid) {
-  const E = { pid, proj: null, clips: [], segs: [], words: [], signals: {}, sel: null, tab: "clips", zoom: 1, inMark: null, outMark: null, loop: false, pending: {}, sig: "", picked: new Set() };
+  const E = { pid, proj: null, clips: [], segs: [], words: [], signals: {}, sel: null, tab: "clips", zoom: 1, inMark: null, outMark: null, loop: false, pending: {}, sig: "", picked: new Set(),
+    hist: RWUndo.History(100, 1000) }; // undo/redo of the selected clip's edits (selecting another clip starts over)
   let video, canvas, ctx, raf, keyHandler, listeners, ro;
   const dur = () => E.proj?.meta?.duration || 0;
   const selClip = () => E.clips.find((c) => c.id === E.sel);
+  const self = this;
+  const loadProj = async () => { // expired clips (space saver) are listed apart, only when "Show expired" is on
+    const p = await api(`/api/projects/${pid}${E.showExp ? "?expired=1" : ""}`);
+    E.expired = p.clips.filter((c) => c.expired);
+    p.clips = p.clips.filter((c) => !c.expired);
+    return p;
+  };
 
   this.mount = async () => {
-    E.proj = await api(`/api/projects/${pid}`);
+    E.proj = await loadProj();
+    HL.vt = vtOf(E.proj); loadHeadline().then(() => !E.dead && applyPreview());
     localStorage.lastProject = pid;
     $("#nav-editor").hidden = false;
+    if (!E.proj.proxy && E.proj.source_state === "ok") api(`/api/projects/${pid}/proxy`, { method: "POST" }).catch(() => {}); // HEVC/MKV/4K/long: a light preview copy for next time
     E.clips = E.proj.clips;
     if (E.proj.status === "ready" || E.proj.has_transcript) await loadAnalysis();
     if (E.dead) return;
@@ -556,18 +956,24 @@ function Editor(pid) {
         <a class="btn ghost sm" href="#/library">← Library</a>
         <div class="title" title="${esc(p.name)} — click to rename" data-act="rename" style="cursor:text">${esc(p.name)}</div>
         <span id="ed-status">${pill(PROJECT_STATUS, p.status)}</span>
+        <select id="ed-vt" class="chip" title="Video type: ${esc(vtTip(p.video_type))}. It steers what the AI looks for.">${vtOptions(vtKey(p.video_type), p.video_type ? "Auto-detect again on re-analyze" : "Type: auto-detect")}</select>
         ${p.viral ? `<button class="btn xs" data-act="report" data-id="${p.viral.report_id}"><span class="vbadge">✦ ${+p.viral.score}</span> report</button>` : ""}
+        ${keepBtn("project", pid, p.keep)}<span id="ed-due">${dueChip(p.source_due, true)}</span>
         <div class="grow"></div>
         <button class="btn sm" data-act="viral-video" ${ready ? "" : "disabled"} title="Score this whole video for virality against similar videos">✦ Virality</button>
         <button class="btn sm" data-act="autopilot" ${ready ? "" : "disabled"}>⚡ Autopilot</button>
+        <button class="btn sm" data-act="longform" ${ready ? "" : "disabled"} title="A separate landscape edit of the whole video: condensed, highlights or a clip compilation">▬ Long form</button>
+        <button class="btn sm" data-act="add-angle" title="Add another camera's recording of this video: it is lined up by sound, then usable in layouts and angle cuts (Studio)">＋ Camera angle${p.angles?.length ? ` (${p.angles.length})` : ""}</button>
+        <button class="btn sm" data-act="hud" ${p.source && p.source_state !== "removed" ? "" : "disabled"} title="Box something on screen (YOU DIED, a kill feed, VICTORY) and Reelwright finds it in every video">◎ Teach screen event</button>
         <button class="btn sm" data-act="reanalyze">↻ Re-analyze</button>
         <a class="btn sm" href="#/publish">Publish queue</a>
       </div>
       <div class="stage">
         <div class="player">
-          ${p.source ? `<div class="vwrap"><video id="vid" src="/files/${pid}/${esc(p.source)}" preload="auto" playsinline></video>
+          ${p.source_state === "removed" ? `<div class="overlay-msg">${sourceNote(p)}<div class="muted" style="max-width:520px;font-size:12.5px">Your clips, transcript, analysis and post history are all still here. Previews, edits that change the video and renders need the source back.</div></div>` : ""}
+          ${p.source && p.source_state !== "removed" ? `<div class="vwrap"><video id="vid" src="/files/${pid}/${esc(p.proxy || p.source)}" preload="auto" playsinline></video>
             <div class="cambox" id="cam" hidden></div>
-            <div class="cropbox" id="crop"><div class="title-preview" id="tprev" hidden></div><div class="sticker-preview" id="sprev" hidden></div><div class="cap-preview" id="cprev"></div></div></div>` : ""}
+            <div class="cropbox" id="crop"><div class="title-preview" id="tprev" hidden></div><div class="sticker-preview" id="sprev" hidden></div><div class="cap-preview" id="cprev"></div><div class="hl-prev" id="hprev" hidden></div></div></div>` : ""}
           <div class="overlay-msg" id="ovl" ${ready ? "hidden" : ""}></div>
         </div>
         <div class="transport">
@@ -590,6 +996,16 @@ function Editor(pid) {
         <div class="tabs">${["clips", "transcript", "edit"].map((t) => `<button data-tab="${t}" class="${E.tab === t ? "on" : ""}">${{ clips: "AI Clips", transcript: "Transcript", edit: "Edit" }[t]}</button>`).join("")}</div>
         <div class="tab-body" id="tab"></div>
       </div></div>`;
+    $("#ed-vt").onchange = async (e) => {
+      const key = e.target.value, auto = key === "auto";
+      const refind = !auto && E.proj.status === "ready" && await confirmBox("Re-find clips with this type?",
+        `The AI looks again with the ${(VTYPES.find(([k]) => k === key) || [, key])[1]} playbook. AI picks you haven't touched are replaced; rated, edited and posted clips stay. Cancel just saves the type for next time.`, "Re-find clips");
+      try {
+        E.proj = { ...E.proj, ...(await api(`/api/projects/${pid}`, { method: "PATCH", body: { ...vtBody(key), refind } })) };
+        e.target.title = `Video type: ${vtTip(E.proj.video_type)}`;
+        toast(refind ? "Re-finding clips with the new type…" : auto ? "Type will be detected on the next analysis." : "Video type saved.", "ok");
+      } catch (err) { fail(err); e.target.value = vtKey(E.proj.video_type); }
+    };
     video = $("#vid");
     canvas = $("#cv");
     ctx = canvas.getContext("2d");
@@ -622,17 +1038,24 @@ function Editor(pid) {
     else o.innerHTML = `<div class="spin" style="width:28px;height:28px;color:var(--accent)"></div><b>${esc(p.stage || "Working…")}</b><div style="width:min(320px,70vw)">${bar(p.progress)}</div>
       <div class="muted" style="font-size:12px">Transcribing, detecting scenes and energy, and asking AI for the best moments.</div>`;
     $("#ed-status").innerHTML = pill(PROJECT_STATUS, p.status);
+    const due = $("#ed-due"); if (due) due.innerHTML = dueChip(p.source_due, true);
+    const vt = $("#ed-vt");  // detection lands early in the analysis: show it as soon as it does
+    if (vt && document.activeElement !== vt) { vt.value = vtKey(p.video_type); vt.title = `Video type: ${vtTip(p.video_type)}`; }
   }
 
   // ----- refresh loop -----
   this.refresh = async () => {
-    const p = await api(`/api/projects/${pid}`);
-    const wasReady = E.proj.status === "ready";
+    const p = await loadProj();
+    const wasReady = E.proj.status === "ready", wasGone = E.proj.source_state === "removed";
     E.proj = p;
     E.clips = p.clips.map((c) => (E.pending[c.id] ? { ...c, ...E.pending[c.id].local } : c));
-    if (!wasReady && p.status === "ready") { await loadAnalysis(); E.sel = E.sel || E.clips[0]?.id; layout(); toast(`Analysis complete — ${E.clips.length} clips found.`, "ok"); return; }
+    if ((!wasReady || wasGone) && p.status === "ready" && p.source_state !== "removed") {
+      await loadAnalysis(); E.sel = E.sel || E.clips[0]?.id; layout();
+      toast(wasGone ? "Source restored — previews and renders work again." : `Analysis complete — ${E.clips.length} clips found.`, "ok"); return;
+    }
+    if (!wasGone && p.source_state === "removed") return layout(); // the space saver removed it while this was open
     updateOverlay();
-    const sig = JSON.stringify(E.clips.map((c) => [c.id, c.title, c.start, c.end, c.score, c.export?.status, c.export?.rev, c.rev, c.posts, c.viral, c.rating]));
+    const sig = JSON.stringify([E.showExp, E.expired.length, ...E.clips.map((c) => [c.id, c.title, c.start, c.end, c.score, c.export?.status, c.export?.rev, c.rev, c.posts, c.viral, c.rating, c.keep, c.due?.at])]);
     if (sig !== E.sig) { E.sig = sig; if (E.tab === "clips") renderTab(); draw(); }
     if (E.tab === "edit") renderActions();
   };
@@ -651,7 +1074,7 @@ function Editor(pid) {
     if (!e || c.parts || (e.aspect === "source" && (e.zoom || 1) <= 1)) {
       Object.assign(box.style, { left: "0px", top: "0px", width: dw + "px", height: dh + "px", boxShadow: "none", borderColor: "transparent" });
       box.className = "cropbox"; box.dataset.scale = dh / OH;
-    } else if (e.aspect !== "source" && e.fit === "blur" && e.layout !== "split") {
+    } else if (e.aspect !== "source" && (e.layout === "single" ? e.fit === "blur" : !legacySplit(e))) { // multi-region: arranged in the Studio
       Object.assign(box.style, { left: "0px", top: "0px", width: dw + "px", height: dh + "px", boxShadow: "", borderColor: "" });
       box.className = "cropbox blur"; box.dataset.scale = dw / OW;
     } else {
@@ -668,7 +1091,8 @@ function Editor(pid) {
     const scale = +box.dataset.scale, vertical = OH > OW;
     const ts = (kind) => tsOf((k) => e?.[`${kind}_${k}`], tsDefaults(kind, e, OW, OH));
     let mv = CAPTION_POS[e?.caption_pos || "low"][vertical ? 0 : 1] * OH;
-    if (e?.layout === "split" && e.caption_pos === "middle") mv = (1 - e.split - 0.07) * OH;
+    const seamAt = seamOf(e);
+    if (seamAt != null && e.caption_pos === "middle") mv = (1 - seamAt - 0.07) * OH;
     const cp = $("#cprev");
     styleText(cp, ts("caption"), scale);
     cp.style.bottom = Math.max(mv * scale, 4) + "px";
@@ -683,6 +1107,9 @@ function Editor(pid) {
         left: pos.endsWith("left") ? "4%" : pos.endsWith("center") ? "50%" : "", right: pos.endsWith("right") ? "4%" : "",
         transform: pos.endsWith("center") ? "translateX(-50%)" : "" });
     }
+    const hp = $("#hprev"), hs = box.classList.contains("blur") ? null : hlSpec(e); // ponytail: over the crop box like the title card (not when the box is the whole source of a split layout); the Studio's Output view is the exact preview
+    hp.hidden = !hs;
+    if (hs) hlRender(hp, hs, hlLayout(hs, OW, OH, seamAt), scale);
     updateCaption();
   }
 
@@ -757,6 +1184,7 @@ function Editor(pid) {
     }
     ctx.fillStyle = "#0b0c10aa";
     (E.signals.silences || []).forEach(([a, b]) => ctx.fillRect(a * pps, WAVE_Y, (b - a) * pps, WAVE_H));
+    drawSignalLane(ctx, E.signals, pps, WAVE_Y, WAVE_Y + WAVE_H, 3 * TK);
     for (const c of E.clips) {
       if (c.parts) continue;
       const x = c.start * pps, cw = (c.end - c.start) * pps, sel = c.id === E.sel;
@@ -832,9 +1260,12 @@ function Editor(pid) {
     if (play && video) { E.loop = true; video.play(); }
   }
 
-  function patchClip(id, body, delay = 0) {
+  const clipLocked = (c) => !!(c.locked || Object.keys(c.posts || {}).length); // posted: the server answers 409
+  function patchClip(id, body, delay = 0, record = true) {
     const c = E.clips.find((k) => k.id === id);
     if (!c) return;
+    const undo = record && !clipLocked(c) ? RWUndo.inverse(body, c) : null; // before the optimistic update below
+    if (undo) E.hist.push(id, undo, body);
     if (body.edit) c.edit = { ...c.edit, ...body.edit };
     for (const k of ["start", "end", "title", "rating"]) if (k in body) c[k] = body[k];
     const p = (E.pending[id] ||= { body: {}, local: {} });
@@ -845,12 +1276,26 @@ function Editor(pid) {
     p.timer = setTimeout(async () => {
       const send = p.body; delete E.pending[id];
       try { const fresh = await api(`/api/clips/${id}`, { method: "PATCH", body: send }); Object.assign(E.clips.find((k) => k.id === id) || {}, fresh); if (E.tab === "edit") renderActions(); }
-      catch (e) { fail(e); }
+      catch (e) { if (e.status === 409) E.hist.clear(); fail(e); }
     }, delay);
+  }
+  function undoRedo(redo) {
+    const c = selClip();
+    if (!c || c.parts) return;
+    if (clipLocked(c)) return toast("Posted — make a new version to edit it.", "err");
+    const body = redo ? E.hist.redo(c.id) : E.hist.undo(c.id);
+    if (!body) return toast(redo ? "Nothing to redo." : "Nothing to undo.");
+    patchClip(c.id, body, 0, false);
+    if (!c.parts && ("start" in body || "end" in body)) seek(c.start);
+    if (E.tab === "edit" || E.tab === "clips") renderTab();
   }
   const replaceClip = (fresh) => { const c = E.clips.find((k) => k.id === fresh.id); if (c) Object.assign(c, fresh); applyPreview(); draw(); };
 
   async function onClick(ev) {
+    const kb = ev.target.closest("[data-keep]"); // space saver: Keep pins (Keep on an expired clip restores it)
+    if (kb) { await toggleKeep(kb); return self.refresh().catch(fail); }
+    if (ev.target.closest("[data-showexp]")) { E.showExp = !E.showExp; return self.refresh().then(renderTab).catch(fail); }
+    if (await sourceAction(ev.target, () => self.refresh().catch(fail))) return;
     const a = ev.target.closest("[data-act]");
     if (!a) return;
     const act = a.dataset.act, c = selClip();
@@ -859,6 +1304,7 @@ function Editor(pid) {
       switch (act) {
         case "play": if (video) { E.loop = false; video.paused ? video.play() : video.pause(); } break;
         case "playclip": if (c && video && !c.parts) { E.loop = true; seek(c.start); video.play(); } break;
+        case "undo": case "redo": undoRedo(act === "redo"); break;
         case "zin": zoomTo(E.zoom * 1.5); break;
         case "zout": zoomTo(E.zoom / 1.5); break;
         case "in": E.inMark = video.currentTime; draw(); break;
@@ -875,6 +1321,8 @@ function Editor(pid) {
           }
           break;
         case "autopilot": openAutopilot(); break;
+        case "hud": openHudTeach(pid, video?.currentTime || 0); break;
+        case "longform": openLongCapture(pid, [...E.picked].filter((id) => E.clips.some((k) => k.id === id && !k.parts))); break;
         case "viral-video": await api(`/api/projects/${pid}/virality`, { body: {} }); toast("Analyzing virality against similar videos — the report appears in the Virality Lab and here when done.", "ok", 6000); break;
         case "viral-clip": await api(`/api/clips/${c.id}/virality`, { body: {} }); toast("Scoring this clip… the score appears on the clip when done.", "ok"); break;
         case "report": openReport(a.dataset.id).catch(fail); break;
@@ -910,6 +1358,7 @@ function Editor(pid) {
           E.clips.push(nc); E.tab = "edit"; markTab(); select(nc.id); break;
         }
         case "tsk": E.tsk = a.dataset.v; renderTab(); break;
+        case "add-angle": pickAngleFile(pid, async () => { E.proj = { ...E.proj, angles: (await api(`/api/projects/${pid}`)).angles }; a.textContent = `＋ Camera angle (${E.proj.angles.length})`; }); break;
         case "rename": {
           modal(`<h2>Rename project</h2><input type="text" id="rn" maxlength="200" value="${esc(E.proj.name)}"><div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="rn-ok">Rename</button></div>`, (m, close) => {
             const go = async () => {
@@ -927,6 +1376,7 @@ function Editor(pid) {
         case "nudge": { const [k, d] = a.dataset.v.split(","); const v = Math.min(Math.max(c[k] + +d, 0), dur()); patchClip(c.id, { [k]: +v.toFixed(2) }, 500); seek(v); renderTab(); break; }
         case "toplay": { const k = a.dataset.v; patchClip(c.id, { [k]: +video.currentTime.toFixed(2) }, 300); renderTab(); break; }
         case "reframe": busy("Finding faces…"); try { replaceClip(await api(`/api/clips/${c.id}/reframe`, { method: "POST" })); toast("Framed on the speaker.", "ok"); } finally { renderTab(); } break;
+        case "detect-regions": busy("Detecting regions…"); try { replaceClip(await api(`/api/clips/${c.id}/regions/detect`, { method: "POST" })); toast("Regions suggested — fine-tune them in the Studio.", "ok"); } finally { renderTab(); } break;
         case "facecam": busy("Detecting facecam…"); try { replaceClip(await api(`/api/clips/${c.id}/facecam`, { method: "POST" })); toast("Facecam found — split-screen layout applied.", "ok"); } finally { renderTab(); } break;
         case "music": $("#musicf").click(); break;
         case "nomusic": patchClip(c.id, { edit: { music: "" } }); renderTab(); break;
@@ -947,7 +1397,9 @@ function Editor(pid) {
   function onKey(e) {
     if (e.target.closest?.("input, textarea, select") || !video || $("#modal-root").innerHTML) return;
     const c = selClip();
-    if (e.code === "Space") { e.preventDefault(); E.loop = false; video.paused ? video.play() : video.pause(); }
+    const z = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase();
+    if (z === "z" || z === "y") { e.preventDefault(); undoRedo(z === "y" || e.shiftKey); }
+    else if (e.code === "Space") { e.preventDefault(); E.loop = false; video.paused ? video.play() : video.pause(); }
     else if (e.key === "i" || e.key === "I") { E.inMark = video.currentTime; draw(); }
     else if (e.key === "o" || e.key === "O") { E.outMark = video.currentTime; draw(); }
     else if (e.key === "ArrowLeft") seek(video.currentTime - (e.shiftKey ? 1 : fstep()));
@@ -975,14 +1427,14 @@ function Editor(pid) {
         <select id="qlen" title="Clip length for new picks: aims for the first number, never longer than the second" ${ready ? "" : "disabled"}>${FIND_LENGTHS.map(([v, l]) => `<option value="${v}" ${v === (lsGet("findLen") || "") ? "selected" : ""}>${l}</option>`).join("")}</select>
         <button class="btn primary" data-act="find" ${ready ? "" : "disabled"}>Find</button></div>
       ${!S.settings?.anthropic_key_set ? `<div class="card" style="padding:10px 12px;margin-bottom:12px;font-size:12.5px">Clips below come from the offline heuristic. <a href="#/settings">Add a Claude API key</a> for AI-ranked clips, semantic search, the edit assistant, virality scoring and auto-written titles.</div>` : ""}
-      <div class="row" style="margin-bottom:10px;font-size:12px" ${E.picked.size ? "" : "hidden"} id="pickbar"><span class="grow">${E.picked.size} selected</span><button class="btn sm primary" data-act="montage" ${E.picked.size > 1 ? "" : "disabled"}>▤ Make montage</button></div>
+      <div class="row" style="margin-bottom:10px;font-size:12px" ${E.picked.size ? "" : "hidden"} id="pickbar"><span class="grow">${E.picked.size} selected</span><button class="btn sm primary" data-act="montage" ${E.picked.size > 1 ? "" : "disabled"}>▤ Make montage</button><button class="btn sm" data-act="longform" title="Long form from the ticked clips, in the order ticked">▬ Long form</button></div>
       ${sorted.length ? sorted.map((c) => `
         <div class="clip ${c.id === E.sel ? "sel" : ""}" data-act="select" data-id="${c.id}">
           <div class="row"><input type="checkbox" class="pick" data-id="${c.id}" title="Select for a montage" ${E.picked.has(c.id) ? "checked" : ""} ${c.parts ? "disabled" : ""}>
             <div class="t grow">${esc(c.title)}</div>${c.viral ? `<span class="vbadge" title="Virality score">✦${+c.viral.score}</span>` : ""}${c.source !== "manual" && !c.parts ? `<span class="score" title="AI pick score">${+c.score}</span>` : ""}</div>
           ${c.reason ? `<div class="why">${esc(c.reason)}</div>` : ""}
           <div class="meta wrap"><span class="mono">${c.parts ? `${c.parts.length} clips` : `${fmt(c.start)} → ${fmt(c.end)}`}</span><span>${(c.end - c.start).toFixed(1)}s</span>
-            <span class="src-tag">${srcLabel[c.source] || esc(c.source)}</span>${c.features?.motion >= 2 ? `<span class="chip" title="Much more on-screen motion than usual for this video" style="font-size:11px">⚡ action</span>` : ""}${c.features?.flashes > 0 ? `<span class="chip" title="Sudden on-screen flash (explosion, jump scare, hit)" style="font-size:11px">✷ flash</span>` : ""}<span class="grow"></span>
+            <span class="src-tag">${srcLabel[c.source] || esc(c.source)}</span>${c.features?.motion >= 2 ? `<span class="chip" title="Much more on-screen motion than usual for this video" style="font-size:11px">⚡ action</span>` : ""}${c.features?.flashes > 0 ? `<span class="chip" title="Sudden on-screen flash (explosion, jump scare, hit)" style="font-size:11px">✷ flash</span>` : ""}${c.consensus ? consensusChip(c.consensus) : ""}<span class="grow"></span>
             ${Object.entries(c.posts || {}).map(([p, r]) => (/^https:\/\//.test(r.url || "") ? `<a href="${esc(r.url)}" target="_blank" class="plat ${p}">${PLATFORM[p]}</a>` : platTag(p))).join("")}
             ${c.export?.status === "done" && c.export.rev === c.rev ? '<span title="Rendered" style="color:var(--ok)">●</span>' : ""}
             ${c.fit != null ? `<span class="chip" title="How well this matches what you've liked and posted before (learned from your feedback). AI score ${+c.ai_score}." style="font-size:11px">♥ ${+c.fit}% your taste</span>` : ""}
@@ -990,7 +1442,11 @@ function Editor(pid) {
             ${c.parts ? "" : `<a class="btn xs primary" href="#/studio/${c.id}" title="Open in the Clip Studio (or double-click the card)">Edit clip</a>`}
             <button class="btn xs" data-act="edit" data-id="${c.id}" title="Quick inline edits in this panel">Quick</button>
             <button class="btn xs ghost danger" data-act="del" data-id="${c.id}" data-title="${esc(c.title)}">✕</button></div>
-        </div>`).join("") : `<div class="empty"><b>${ready ? "No clips yet" : "Clips appear after analysis"}</b>${ready ? "Search for a moment above, or mark In/Out on the timeline." : ""}</div>`}`;
+          <div class="row wrap" style="gap:6px;margin-top:4px">${keepBtn("clip", c.id, c.keep)}${dueChip(c.due)}</div>
+        </div>`).join("") : `<div class="empty"><b>${ready ? "No clips yet" : "Clips appear after analysis"}</b>${ready ? "Search for a moment above, or mark In/Out on the timeline." : ""}</div>`}
+      ${E.proj.expired_count ? `<button class="btn xs ghost" data-showexp style="margin-top:8px">${E.showExp ? "Hide" : "Show"} expired (${E.proj.expired_count})</button>` : ""}
+      ${E.showExp ? E.expired.map((c) => `<div class="clip expired"><div class="row"><div class="t grow">${esc(c.title)}</div>${keepBtn("clip", c.id, false, "↺ Restore")}</div>
+        <div class="why">Expired ${esc(when(c.expired.at))} — ${c.expired.archive ? `its render was archived to ${esc(c.expired.archive)}` : "its render was deleted to save space"}. Restore it to edit or re-render. Its posts, history and what Reelwright learned from it are kept.</div></div>`).join("") : ""}`;
     el.onkeydown = (e) => { if (e.key === "Enter" && e.target.id === "q") $("[data-act=find]").click(); };
     el.ondblclick = (e) => { // double-click a clip card: open it in the Studio
       const card = e.target.closest(".clip[data-id]");
@@ -1068,22 +1524,26 @@ function Editor(pid) {
       </div>
       <div class="sec"><h3>Frame &amp; layout</h3>
         ${seg("aspect", e.aspect, [["9:16", "9:16"], ["1:1", "1:1"], ["4:5", "4:5"], ["16:9", "16:9"], ["source", "Original"]])}
-        ${reframed ? `${seg("layout", e.layout, [["single", "Single view"], ["split", "Split · facecam + gameplay"]])}
-          ${e.layout === "split" ? `<div class="row wrap"><button class="btn sm" data-act="facecam">◎ Detect facecam</button><span class="muted" style="font-size:12px">Blue = facecam (top panel); orange = main view (bottom).</span></div>
+        ${reframed ? `${seg("layout", e.layout, LAYOUTS)}
+          ${isMulti(e) && !legacySplit(e) ? `<div class="row wrap"><button class="btn sm" data-act="detect-regions">◎ Detect regions</button><a class="btn sm" href="#/studio/${c.id}">Arrange regions in Studio</a></div>` : ""}
+          ${legacySplit(e) ? `<div class="row wrap"><button class="btn sm" data-act="facecam">◎ Detect facecam</button><a class="btn xs ghost" href="#/studio/${c.id}">More regions in Studio</a><span class="muted" style="font-size:12px">Blue = facecam (top panel); orange = main view (bottom).</span></div>
             ${slider("cam_x", "Cam ↔", 0, 1, 0.01, e.cam_x)}${slider("cam_y", "Cam ↕", 0, 1, 0.01, e.cam_y)}${slider("cam_w", "Cam width", 0.05, 1, 0.01, e.cam_w)}${slider("cam_h", "Cam height", 0.05, 1, 0.01, e.cam_h)}${slider("split", "Cam share", 0.2, 0.6, 0.01, e.split)}`
-          : `<div class="row wrap">${seg("fit", e.fit, [["crop", "Crop to fill"], ["blur", "Fit + blur"]])}<button class="btn sm" data-act="reframe" ${e.fit === "blur" ? "disabled" : ""}>◎ Auto-reframe on face</button></div>`}` : ""}
-        ${!reframed || e.fit !== "blur" || e.layout === "split" ? slider("crop_x", "Framing ↔", 0, 1, 0.01, e.crop_x) + slider("crop_y", "Framing ↕", 0, 1, 0.01, e.crop_y) + slider("zoom", "Zoom", 1, 2.5, 0.05, e.zoom, "×") : ""}
+          : e.layout === "single" ? `<div class="row wrap">${seg("fit", e.fit, [["crop", "Crop to fill"], ["blur", "Fit + blur"]])}<button class="btn sm" data-act="reframe" ${e.fit === "blur" ? "disabled" : ""}>◎ Auto-reframe on face</button></div>` : ""}` : ""}
+        ${!reframed || e.fit !== "blur" || e.layout !== "single" ? slider("crop_x", "Framing ↔", 0, 1, 0.01, e.crop_x) + slider("crop_y", "Framing ↕", 0, 1, 0.01, e.crop_y) + slider("zoom", "Zoom", 1, 2.5, 0.05, e.zoom, "×") : ""}
       </div>
       <div class="sec"><h3>Captions &amp; text</h3>
         <label class="switch"><input type="checkbox" data-k="captions" ${e.captions ? "checked" : ""}> Animated captions (word-by-word highlight)</label>
         ${seg("caption_style", e.caption_style, [["bold", "Bold"], ["clean", "Clean"], ["boxed", "Boxed"], ["neon", "Neon"]])}
         ${seg("caption_pos", e.caption_pos, [["low", "Low"], ["middle", e.layout === "split" ? "At seam" : "Middle"], ["high", "High"]])}
+        ${seg("caption_anim", e.caption_anim || "highlight", CAP_ANIMS)}
+        <label class="switch"><input type="checkbox" data-k="caption_emphasis" ${e.caption_emphasis ? "checked" : ""}> Emphasise keywords (numbers, SHOUTING, long words)</label>
         <label class="field">Title card (top of frame)<input type="text" data-k="title_text" value="${esc(e.title_text)}" placeholder="Optional headline overlay"></label>
         <div class="two"><label class="field">Sticker / handle<input type="text" data-k="sticker_text" value="${esc(e.sticker_text)}" placeholder="@yourchannel"></label>
           <label class="field">Sticker spot<select data-k="sticker_pos">${["top-left", "top-center", "top-right", "bottom-left", "bottom-right"].map((p) => `<option ${p === e.sticker_pos ? "selected" : ""}>${p}</option>`).join("")}</select></label></div>
       </div>
       <div class="sec"><h3>Text style</h3>
-        <div class="seg">${[["caption", "Captions"], ["title", "Title card"], ["sticker", "Sticker"]].map(([v, l]) => `<button class="${(E.tsk || "caption") === v ? "on" : ""}" data-act="tsk" data-v="${v}">${l}</button>`).join("")}</div>
+        <div class="seg">${[["caption", "Captions"], ["title", "Title card"], ["sticker", "Sticker"], ["headline", "Headline"]].map(([v, l]) => `<button class="${(E.tsk || "caption") === v ? "on" : ""}" data-act="tsk" data-v="${v}">${l}</button>`).join("")}</div>
+        ${E.tsk === "headline" ? `<div id="ed-hl" class="stack" style="gap:8px"></div><a class="btn xs ghost" href="#/studio/${c.id}">Theme gallery, timing &amp; more in Studio</a>` : ""}
         <div id="ed-ts" class="stack" style="gap:8px"></div>
       </div>
       <div class="sec"><h3>Look</h3>
@@ -1099,6 +1559,8 @@ function Editor(pid) {
         <div class="row wrap"><button class="btn sm" data-act="music">♫ ${e.music ? "Replace music" : "Add background music"}</button>${e.music ? `<span class="muted" style="font-size:12px">${esc(e.music.split("/").pop())}</span><button class="btn xs ghost" data-act="nomusic">Remove</button>` : ""}
           <input type="file" id="musicf" accept="audio/*" hidden></div>
         ${e.music ? slider("music_volume", "Music level", 0, 1, 0.01, e.music_volume) : ""}
+        ${e.music ? `<label class="switch"><input type="checkbox" data-k="music_duck" ${e.music_duck !== false ? "checked" : ""}> Duck the music under the voice</label>` : ""}
+        <div class="row wrap"><span class="muted" style="font-size:12.5px">Bleep swearing</span>${seg("bleep", e.bleep || "off", [["off", "Off"], ["beep", "Beep"], ["mute", "Mute"]])}</div>
       </div>
       <div class="sec"><h3>Motion</h3>
         ${slider("speed", "Speed", 0.5, 2, 0.05, e.speed, "×")}${slider("fade_in", "Fade in", 0, 3, 0.1, e.fade_in, "s")}${slider("fade_out", "Fade out", 0, 3, 0.1, e.fade_out, "s")}
@@ -1131,7 +1593,8 @@ function Editor(pid) {
     $("#askq").onkeydown = (ev) => { if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) $("[data-act=ask]").click(); };
     const kind = E.tsk || "caption", cur = () => selClip() || c, [OW, OH] = SIZES[e.aspect] || [video?.videoWidth || 1920, video?.videoHeight || 1080];
     textStyleEditor($("#ed-ts"), { get: (k) => cur().edit[`${kind}_${k}`], set: (k, v) => patchClip(cur().id, { edit: { [`${kind}_${k}`]: v } }, 450),
-      def: tsDefaults(kind, e, OW, OH), sample: kind === "title" ? e.title_text || "Title card" : kind === "sticker" ? e.sticker_text || "@yourchannel" : "Captions look like this" });
+      def: tsDefaults(kind, e, OW, OH), sample: kind === "title" ? e.title_text || "Title card" : kind === "sticker" ? e.sticker_text || "@yourchannel" : kind === "headline" ? e.headline?.text || "Your headline" : "Captions look like this" });
+    if (kind === "headline") headlineEditor($("#ed-hl"), { clip: cur, compact: true, set: (ed, d) => { const th = cur().edit.headline?.theme; patchClip(cur().id, { edit: ed }, d); if (ed.headline?.theme !== th) renderTab(); } });
     renderActions();
   }
 
@@ -1145,7 +1608,7 @@ function Editor(pid) {
          ${current ? `<a class="btn" href="/files/${pid}/${ex.file}" download="${esc(c.title.replace(/[\\/:*?"<>|]/g, "_"))}.mp4">Download</a>` : ""}
          ${current && ex.cover ? `<a href="/files/${pid}/${ex.cover}?r=${c.rev}" target="_blank" title="Auto-picked cover (YouTube thumbnail / TikTok cover) at ${(+ex.cover_t).toFixed(1)}s"><img src="/files/${pid}/${ex.cover}?r=${c.rev}" alt="Cover" style="height:36px;border-radius:5px;border:1px solid var(--line-2);vertical-align:middle"></a>` : ""}
          ${ex.status === "failed" ? `<span style="color:var(--err);font-size:12px" title="${esc(ex.error)}">Render failed</span>` : ""}
-         <div class="grow"></div><button class="btn primary" data-act="publish">⇪ Publish</button>`;
+         <button class="btn xs ghost" data-act="undo" title="Undo this clip's last edit (Ctrl+Z)">↶</button><button class="btn xs ghost" data-act="redo" title="Redo (Ctrl+Y or Ctrl+Shift+Z)">↷</button>${nleLinks(`/api/clips/${esc(c.id)}`)}<div class="grow"></div><button class="btn primary" data-act="publish">⇪ Publish</button>${current && ex.qa ? qaList(ex.qa) : ""}`;
   }
 
   function openAutopilot() {
@@ -1156,7 +1619,7 @@ function Editor(pid) {
       <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="ap-go">Schedule clips</button></div>`, (m, close) => {
       $("#ap-go", m).onclick = async () => {
         const body = apRead(m);
-        if (!body.platforms.length) return toast("Pick at least one platform.");
+        if (!body.accounts?.length) return toast("Pick at least one account. Autopilot only posts to accounts with “Approved for uploads” and “Allow Autopilot to post here” on (Publish page).", "info", 7000);
         try { await api(`/api/projects/${pid}/autopilot/run`, { body }); close(); toast("Clips are rendering and will be scheduled — follow along on the Publish page.", "ok", 6000); }
         catch (e) { fail(e); }
       };
@@ -1165,14 +1628,22 @@ function Editor(pid) {
 }
 
 // Publish dialog for one clip (used by the Editor and the Clip Studio).
-function openPublish(c, onDone) {
-  const vertical = ["9:16", "4:5"].includes(c.edit.aspect), conn = S.conn || {};
+function openPublish(c, onDone, lf = null) { // lf: a long-form doc → a regular (not #Shorts) video; c = {id, title, edit, hook, hashtags}
+  const vertical = !lf && ["9:16", "4:5"].includes(c.edit.aspect), conn = S.conn || {};
+  const base = lf ? `/api/longform/${encodeURIComponent(lf.id)}` : `/api/clips/${c.id}`, secs = lf ? (lf.current && lf.export?.duration) || lf.length : 0;
+  const tooLong = (a) => (lf && a.platform === "instagram" && secs > 900 ? `Instagram Reels can be at most 15 minutes (this is ${Math.round(secs / 60)} min)` : "");
   const tags = (c.hashtags || []).map((h) => h.replace(/^#/, ""));
-  modal(`<h2>Publish</h2>
+  // only accounts the user approved on the Publish page; tick several to post the clip to each (two channels = two uploads)
+  const all = Object.keys(PLATFORM).flatMap((p) => conn[p]?.accounts || []), ok = all.filter((a) => a.approved);
+  const firstOf = Object.fromEntries(Object.keys(PLATFORM).map((p) => [p, ok.find((a) => a.platform === p && a.connected && !tooLong(a) && (!lf || p === "youtube"))?.id]));
+  const waiting = all.length - ok.length;
+  modal(`<h2>${lf ? "Publish long form" : "Publish"}</h2>
     <div class="stack">
-      <div class="plats">${Object.entries(PLATFORM).map(([k, v]) => `<label title="${conn[k]?.connected ? "Connected" : "Not connected yet — it posts once you connect"}"><input type="checkbox" class="pp" value="${k}" ${k === "youtube" || conn[k]?.connected ? "checked" : ""}> ${v} ${conn[k]?.connected ? '<span style="color:var(--ok)">●</span>' : '<span class="dim">○</span>'}</label>`).join("")}</div>
+      <div class="plats">${ok.length ? ok.map((a) => `<label title="${esc(tooLong(a)) || (a.connected ? "" : "Signed out: reconnect it on the Publish page, or it waits")}" ${tooLong(a) ? 'style="opacity:.45"' : ""}><input type="checkbox" class="pp" value="${esc(a.id)}" data-plat="${a.platform}" ${firstOf[a.platform] === a.id ? "checked" : ""} ${tooLong(a) ? "disabled" : ""}> ${platTag(a.platform)} ${esc(a.name || a.handle || PLATFORM[a.platform])} ${a.connected ? '<span style="color:var(--ok)">●</span>' : '<span class="dim">○</span>'}</label>`).join("")
+        : `<span class="dim" style="font-size:12.5px">No account is approved for uploads yet: link one and turn on “Approved for uploads” on the <a href="#/publish">Publish page</a>.</span>`}</div>
+      ${waiting ? `<p class="dim" style="font-size:11.5px;margin:-4px 0 0">${waiting} linked account${waiting === 1 ? " isn't" : "s aren't"} listed: not approved for uploads yet (Publish page).</p>` : ""}
       <div class="row"><label class="field grow">Title (YouTube)<input type="text" id="pt" maxlength="100" value="${esc(c.title)}"></label>
-        <button class="btn" id="pai" style="align-self:flex-end" ${S.settings?.anthropic_key_set ? "" : "disabled title='Add a Claude key in Settings'"}>✨ Write with AI</button></div>
+        <button class="btn" id="pai" style="align-self:flex-end" ${S.settings?.ai_ready?.meta ? "" : "disabled title='Add a Claude key or route Titles & captions to another AI in Settings'"}>✨ Write with AI</button></div>
       <label class="field">Description (YouTube)<textarea id="pd" rows="4">${esc(c.hook || "")}${vertical ? "\n\n#Shorts" : ""}</textarea></label>
       <label class="field">Caption (TikTok &amp; Instagram)<textarea id="pc" rows="2">${esc(c.title)} ${esc(tags.slice(0, 5).map((t) => "#" + t.replace(/\s+/g, "")).join(" "))}</textarea></label>
       <label class="field">Tags (comma separated)<input type="text" id="ptags" value="${esc(tags.join(", "))}"></label>
@@ -1184,16 +1655,22 @@ function openPublish(c, onDone) {
         <button class="btn" id="pbest" style="align-self:flex-end" title="Best upcoming time for the first selected platform (your results → live research → defaults)">★ Best time</button></div>
       <p class="muted" id="pwhen-help" style="font-size:12px;margin:0"></p>
       <label class="switch"><input type="checkbox" id="pkids"> Made for kids (YouTube)</label>
+      <label class="switch" title="YouTube: altered or synthetic content label. TikTok: AI-generated content label. Instagram's API has no such label: add it in the Instagram app if it applies."><input type="checkbox" id="paic" ${c.ai_media?.length || S.settings?.ai_disclosure === "always" ? "checked" : ""}> Contains AI-generated or altered realistic content <span class="dim">(YouTube &amp; TikTok label; not available for Instagram)</span></label>
+      <label class="switch"><input type="checkbox" id="ptpl" checked> Add each account's description template <span class="dim" id="ptpl-ex"></span></label>
       <div id="ptt" class="card stack" hidden style="padding:12px"></div>
     </div>
     <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="pgo">Queue post</button></div>`, (m, close) => {
     let mode = "now";
+    if (!lf) api(`/api/publish/template?clip_id=${encodeURIComponent(c.id)}`).then((t) => { // what the template adds (edit on the Publish page)
+      const v = t.vars || {};
+      $("#ptpl-ex", m).textContent = v.source_url ? `(source link at ${v.vod_time}: ${v.source_url})` : "(this clip has no source link)";
+    }).catch(() => {});
     const help = { now: "Posts as soon as the render is ready.", publish_at: "YouTube: uploads now as private and goes public at this time. TikTok/Instagram: posted at this time (Reelwright must be running).", upload_at: "Everything stays on this computer and is posted at this time (Reelwright must be running)." };
     const setMode = (v) => { mode = v; $$("#pwhen button", m).forEach((b) => b.classList.toggle("on", b.dataset.v === v)); $("#ptime-l", m).hidden = v === "now"; $("#pwhen-help", m).textContent = help[v]; };
     setMode("now");
     $("#pwhen", m).onclick = (e) => e.target.dataset.v && setMode(e.target.dataset.v);
     $("#pbest", m).onclick = async () => {
-      const plat = $$(".pp", m).find((x) => x.checked)?.value || "youtube";
+      const plat = $$(".pp", m).find((x) => x.checked)?.dataset.plat || "youtube";
       try {
         const r = await api("/api/schedule/suggest", { body: { platform: plat, category_id: $("#pcat", m).value } });
         if (r.times[0]) { $("#ptime", m).value = toLocalInput(new Date(r.times[0])); toast(`Best time for ${PLATFORM[plat]} (${r.source === "yours" ? "from your results" : r.source === "research" ? "from live research" : "default until there's data"}).`); }
@@ -1201,70 +1678,94 @@ function openPublish(c, onDone) {
     };
     // TikTok's posting guidelines: show the account, let the user pick privacy (no default) and interactions (off by default,
     // greyed out when the creator disabled them), commercial-content disclosure, and TikTok's consent line.
-    let tt = null;
-    const ttBox = $("#ptt", m);
-    const renderTT = () => {
-      const on = $$(".pp", m).some((x) => x.checked && x.value === "tiktok");
-      ttBox.hidden = !on;
-      if (!on || !tt) return;
-      if (tt.error) { ttBox.innerHTML = `<div style="color:var(--warn);font-size:12.5px">TikTok: ${esc(tt.error)}</div>`; return; }
+    // One card per ticked TikTok account: each account has its own creator settings (TikTok's posting guidelines).
+    const ttInfo = {}, ttBox = $("#ptt", m);
+    const ttIds = () => $$(".pp", m).filter((x) => x.checked && x.dataset.plat === "tiktok").map((x) => x.value);
+    const ttCard = (el, tt) => {
+      if (tt.error) { el.innerHTML = `<div style="color:var(--warn);font-size:12.5px">TikTok: ${esc(tt.error)}</div>`; return; }
       const LBL = { PUBLIC_TO_EVERYONE: "Everyone", MUTUAL_FOLLOW_FRIENDS: "Friends", FOLLOWER_OF_CREATOR: "Followers", SELF_ONLY: "Only me" };
-      ttBox.innerHTML = `<div class="row"><b>TikTok</b><span class="dim" style="font-size:12.5px">posting as ${esc(tt.creator_nickname || tt.creator_username || "")}</span></div>
-        <label class="field">Who can view this video<select id="tt-priv"><option value="" selected disabled>Choose…</option>${(tt.privacy_level_options || []).map((p) => `<option value="${esc(p)}">${LBL[p] || esc(p)}</option>`).join("")}</select></label>
+      el.innerHTML = `<div class="row"><b>TikTok</b><span class="dim" style="font-size:12.5px">posting as ${esc(tt.creator_nickname || tt.creator_username || "")}</span></div>
+        <label class="field">Who can view this video<select class="tt-priv"><option value="" selected disabled>Choose…</option>${(tt.privacy_level_options || []).map((p) => `<option value="${esc(p)}">${LBL[p] || esc(p)}</option>`).join("")}</select></label>
         <div class="row wrap">${[["allow_comment", "Comment", tt.comment_disabled], ["allow_duet", "Duet", tt.duet_disabled], ["allow_stitch", "Stitch", tt.stitch_disabled]].map(([k, l, off]) =>
-          `<label class="switch" ${off ? 'title="Turned off in your TikTok settings" style="opacity:.45"' : ""}><input type="checkbox" id="tt-${k}" ${off ? "disabled" : ""}> Allow ${l}</label>`).join("")}</div>
-        <label class="switch"><input type="checkbox" id="tt-commercial"> This video promotes a brand, product or service</label>
-        <div id="tt-com" class="stack" hidden style="padding-left:12px">
-          <label class="switch"><input type="checkbox" id="tt-brand_organic"> Your brand <span class="dim">(labelled “Promotional content”)</span></label>
-          <label class="switch"><input type="checkbox" id="tt-brand_content"> Branded content <span class="dim">(labelled “Paid partnership”; can't be Only me)</span></label></div>
-        <p class="dim" style="font-size:11.5px;margin:0" id="tt-consent">By posting, you agree to TikTok's <a href="https://www.tiktok.com/legal/page/global/music-usage-confirmation/en" target="_blank">Music Usage Confirmation</a>.</p>
+          `<label class="switch" ${off ? 'title="Turned off in your TikTok settings" style="opacity:.45"' : ""}><input type="checkbox" class="tt-${k}" ${off ? "disabled" : ""}> Allow ${l}</label>`).join("")}</div>
+        <label class="switch"><input type="checkbox" class="tt-commercial"> This video promotes a brand, product or service</label>
+        <div class="stack tt-com" hidden style="padding-left:12px">
+          <label class="switch"><input type="checkbox" class="tt-brand_organic"> Your brand <span class="dim">(labelled “Promotional content”)</span></label>
+          <label class="switch"><input type="checkbox" class="tt-brand_content"> Branded content <span class="dim">(labelled “Paid partnership”; can't be Only me)</span></label></div>
+        <p class="dim tt-consent" style="font-size:11.5px;margin:0">By posting, you agree to TikTok's <a href="https://www.tiktok.com/legal/page/global/music-usage-confirmation/en" target="_blank">Music Usage Confirmation</a>.</p>
         <p class="dim" style="font-size:11.5px;margin:0">${tt.max_video_post_duration_sec ? `Max length for this account: ${+tt.max_video_post_duration_sec}s. ` : ""}After posting, TikTok can take a few minutes to process the video.</p>`;
-      $("#tt-commercial", ttBox).onchange = (e) => { $("#tt-com", ttBox).hidden = !e.target.checked; };
-      $("#tt-brand_content", ttBox).onchange = () => {
-        $("#tt-consent", ttBox).innerHTML = `By posting, you agree to TikTok's ${$("#tt-brand_content", ttBox).checked ? `<a href="https://www.tiktok.com/legal/page/global/bc-policy/en" target="_blank">Branded Content Policy</a> and ` : ""}<a href="https://www.tiktok.com/legal/page/global/music-usage-confirmation/en" target="_blank">Music Usage Confirmation</a>.`;
+      $(".tt-commercial", el).onchange = (e) => { $(".tt-com", el).hidden = !e.target.checked; };
+      $(".tt-brand_content", el).onchange = () => {
+        $(".tt-consent", el).innerHTML = `By posting, you agree to TikTok's ${$(".tt-brand_content", el).checked ? `<a href="https://www.tiktok.com/legal/page/global/bc-policy/en" target="_blank">Branded Content Policy</a> and ` : ""}<a href="https://www.tiktok.com/legal/page/global/music-usage-confirmation/en" target="_blank">Music Usage Confirmation</a>.`;
       };
     };
+    const renderTT = () => { // keep cards already filled in; add the newly ticked, drop the unticked
+      const ids = ttIds();
+      ttBox.hidden = !ids.length;
+      $$(".tt-acc", ttBox).forEach((el) => { if (!ids.includes(el.dataset.acc)) el.remove(); });
+      for (const id of ids) {
+        if (!ttInfo[id] || $$(".tt-acc", ttBox).some((el) => el.dataset.acc === id)) continue;
+        const el = Object.assign(document.createElement("div"), { className: "tt-acc stack" });
+        el.dataset.acc = id;
+        ttBox.append(el);
+        ttCard(el, ttInfo[id]);
+      }
+    };
     const loadTT = async () => {
-      if (tt || !$$(".pp", m).some((x) => x.checked && x.value === "tiktok")) return renderTT();
-      try { tt = await api("/api/tiktok/creator"); } catch (err) { tt = { error: err.message }; }
+      for (const id of ttIds()) {
+        if (ttInfo[id]) continue;
+        try { ttInfo[id] = await api(`/api/tiktok/creator?account_id=${encodeURIComponent(id)}`); } catch (err) { ttInfo[id] = { error: err.message }; }
+      }
       renderTT();
     };
     $$(".pp", m).forEach((x) => x.addEventListener("change", loadTT));
+    if (lf) $$('.pp[data-plat="tiktok"]', m).forEach(async (x) => { // a long form goes to TikTok only within that account's max length
+      try { ttInfo[x.value] ||= await api(`/api/tiktok/creator?account_id=${encodeURIComponent(x.value)}`); } catch (err) { ttInfo[x.value] = { error: err.message }; }
+      const max = +ttInfo[x.value].max_video_post_duration_sec || 0;
+      if (max && secs > max) { x.checked = false; x.disabled = true; x.parentElement.style.opacity = ".45"; x.parentElement.title = `TikTok allows this account up to ${Math.round(max / 60)} min; this is ${Math.round(secs / 60)} min.`; renderTT(); }
+    });
     loadTT();
     const ttRead = () => {
-      if (!$$(".pp", m).some((x) => x.checked && x.value === "tiktok") || !tt || tt.error) return { ok: true };
-      const priv = $("#tt-priv", ttBox).value, commercial = $("#tt-commercial", ttBox).checked;
-      const opts = { privacy_level: priv, ...Object.fromEntries(["allow_comment", "allow_duet", "allow_stitch", "brand_organic", "brand_content"].map((k) => [k, !!$(`#tt-${k}`, ttBox)?.checked])) };
-      if (!priv) return { error: "Choose who can view the video on TikTok." };
-      if (commercial && !opts.brand_organic && !opts.brand_content) return { error: "Pick Your brand and/or Branded content, or turn off the promotion switch." };
-      if (opts.brand_content && priv === "SELF_ONLY") return { error: "Branded content can't be set to Only me on TikTok." };
-      if (!commercial) opts.brand_organic = opts.brand_content = false;
-      return { ok: true, opts };
+      const byAcc = {};
+      for (const el of $$(".tt-acc", ttBox)) {
+        const tt = ttInfo[el.dataset.acc], who = tt?.creator_nickname || tt?.creator_username || "TikTok";
+        if (!tt || tt.error) continue;
+        const priv = $(".tt-priv", el).value, commercial = $(".tt-commercial", el).checked;
+        const opts = { privacy_level: priv, ...Object.fromEntries(["allow_comment", "allow_duet", "allow_stitch", "brand_organic", "brand_content"].map((k) => [k, !!$(`.tt-${k}`, el)?.checked])) };
+        if (!priv) return { error: `Choose who can view the video on TikTok (${who}).` };
+        if (commercial && !opts.brand_organic && !opts.brand_content) return { error: `Pick Your brand and/or Branded content for ${who}, or turn off the promotion switch.` };
+        if (opts.brand_content && priv === "SELF_ONLY") return { error: "Branded content can't be set to Only me on TikTok." };
+        if (!commercial) opts.brand_organic = opts.brand_content = false;
+        byAcc[el.dataset.acc] = opts;
+      }
+      return { ok: true, byAcc };
     };
     $("#pai", m).onclick = async (e) => {
       const b = e.currentTarget; b.disabled = true; b.innerHTML = `<span class="spin"></span> Writing…`;
       try {
-        const md = await api(`/api/clips/${c.id}/metadata`, { method: "POST" });
+        const md = await api(`${base}/metadata`, { method: "POST" });
         $("#pt", m).value = md.title; $("#pd", m).value = md.description; $("#ptags", m).value = md.tags.join(", "); $("#pc", m).value = md.social_caption || md.title;
         if (CATEGORIES[md.category_id]) $("#pcat", m).value = md.category_id;
       } catch (err) { fail(err); }
       b.disabled = false; b.textContent = "✨ Write with AI";
     };
     $("#pgo", m).onclick = async () => {
-      const t = fromLocalInput($("#ptime", m).value), plats = $$(".pp", m).filter((x) => x.checked).map((x) => x.value);
-      if (!plats.length) return toast("Pick at least one platform.");
+      const t = fromLocalInput($("#ptime", m).value), picked = $$(".pp", m).filter((x) => x.checked);
+      if (!picked.length) return toast("Pick at least one account.");
       if (mode !== "now" && (!t || new Date(t) < new Date())) return toast("Pick a time in the future.");
       const body = {
-        platforms: plats, title: $("#pt", m).value.trim(), description: $("#pd", m).value, caption: $("#pc", m).value.trim(),
+        accounts: picked.map((x) => x.value), title: $("#pt", m).value.trim(), description: $("#pd", m).value, caption: $("#pc", m).value.trim(),
         tags: $("#ptags", m).value.split(",").map((s) => s.trim()).filter(Boolean),
         category_id: $("#pcat", m).value, privacy: $("#ppriv", m).value, made_for_kids: $("#pkids", m).checked,
+        ai_content: $("#paic", m).checked, template: $("#ptpl", m).checked,
         publish_at: mode === "publish_at" ? t : null, upload_at: mode === "upload_at" ? t : null,
       };
       if (!body.title) return toast("Add a title.");
       const t2 = ttRead();
       if (t2.error) return toast(t2.error, "err");
-      if (t2.opts) body.tiktok = t2.opts;
-      try { await api(`/api/clips/${c.id}/upload`, { body }); close(); toast(mode === "now" ? `Queued for ${plats.map((p) => PLATFORM[p]).join(", ")} — posts when the render finishes.` : `Scheduled for ${when(t)}.`, "ok"); onDone?.(); }
+      body.tiktok_by_account = t2.byAcc;
+      const names = picked.map((x) => ok.find((a) => a.id === x.value)?.name || PLATFORM[x.dataset.plat]);
+      try { await api(`${base}/upload`, { body }); close(); toast(mode === "now" ? `Queued for ${names.join(", ")} — posts when the render finishes.` : `Scheduled for ${when(t)}.`, "ok"); onDone?.(); }
       catch (err) { fail(err); }
     };
   });
@@ -1318,6 +1819,89 @@ function cropWin(sw, sh, aspect, zoom, cx, cy) {
   return { x: x / sw, y: y / sh, w: w / sw, h: h / sh };
 }
 
+// ---------- split-screen layouts: regions (0..1 boxes of the source) placed by the layout; mirrors media.layout_slots ----------
+const LAYOUTS = [["single", "Single"], ["split", "Stack"], ["split_rev", "Stack flipped"], ["stack3", "Three tiers"], ["pip", "Corner cam"],
+  ["duo", "Duo + main"], ["blurcam", "Blur fit + cam"], ["free", "Freeform"]];
+const ROLES = ["main", "cam", "chat", "guest", "extra"];
+const ROLE_COLOR = { main: "#ff6a3d", cam: "#6aa8ff", chat: "#37d39a", guest: "#ffc247", extra: "#b07cff" };
+const CAMS = ["cam", "guest", "extra", "chat"];
+const LAYOUT_DEFAULTS = { split: 0.4, split2: 0.25, pip_corner: "tr", pip_size: 0.38, pip_radius: 0.15, pip_border: 6 };
+const FREE_OUT = { x: 0.05, y: 0.05, w: 0.9, h: 0.3 }, FULL_BOX = { x: 0, y: 0, w: 1, h: 1 };
+const isMulti = (e) => !!e && e.aspect !== "source" && !!e.layout && e.layout !== "single";
+const legacySplit = (e) => e.layout === "split" && !e.regions?.length; // an old split clip: cam_* sliders still drive it
+const seamOf = (e) => (e && e.aspect !== "source" && ["split", "split_rev", "stack3", "duo"].includes(e.layout) ? (e.layout === "split_rev" ? 1 - e.split : +e.split) : null);
+const evenPx = (v) => { v = Math.round(v); return Math.max(v - (v % 2), 2); };
+function clampBox(b) {
+  const w = Math.min(Math.max(+b.w, 0.02), 1), h = Math.min(Math.max(+b.h, 0.02), 1);
+  return { x: Math.min(Math.max(+b.x, 0), 1 - w), y: Math.min(Math.max(+b.y, 0), 1 - h), w, h };
+}
+function regionsOf(e) {
+  const rs = (e.regions?.length ? e.regions : [{ id: "cam", role: "cam", x: e.cam_x, y: e.cam_y, w: e.cam_w, h: e.cam_h }]).map((r) => ({ follow: false, ...r }));
+  if (!rs.some((r) => r.role === "main")) rs.push({ id: "main", role: "main", ...FULL_BOX, follow: false });
+  return rs.map((r) => ({ ...r, ...clampBox(r) }));
+}
+function cropPx(sw, sh, ratio, cx, cy, zoom = 1) { // media.crop_box: [w, h, x, y]
+  const z = Math.max(+zoom || 1, 1);
+  let w, h;
+  if (sw / sh > ratio) { h = sh / z; w = h * ratio; } else { w = sw / z; h = w / ratio; }
+  w = Math.round(w); h = Math.round(h); w -= w % 2; h -= h % 2;
+  return [w, h, Math.min(Math.max(Math.round(sw * cx - w / 2), 0), sw - w), Math.min(Math.max(Math.round(sh * cy - h / 2), 0), sh - h)];
+}
+function regionCrop(r, ratio, sw, sh, ax = 0.5, ay = 0.5, zoom = 1) {
+  const rx = Math.round(r.x * sw), ry = Math.round(r.y * sh);
+  const rw = Math.min(Math.max(Math.round(r.w * sw), 2), sw - rx), rh = Math.min(Math.max(Math.round(r.h * sh), 2), sh - ry);
+  const [w, h, x, y] = cropPx(rw, rh, ratio, ax, ay, zoom);
+  return [w, h, rx + x, ry + y];
+}
+function layoutSlots(edit, W, H, sw, sh, sizeOf = () => [sw, sh]) { // {base: null | "main" | "blur", items: [{r, box [x, y, w, h], crop [w, h, x, y], pip}]}
+  // sizeOf(r): the frame size of the camera a region reads (a camera angle's own size; media.layout_slots does the same)
+  const e = { ...LAYOUT_DEFAULTS, ...edit }, rs = regionsOf(e), used = new Set(), lay = e.layout;
+  const pick = (roles) => { for (const role of roles) for (const r of rs) if (!used.has(r) && r.role === role) { used.add(r); return r; } return null; };
+  const main = pick(["main"]), s = evenPx(H * e.split), slots = [];
+  let base = null;
+  if (lay === "split_rev") slots.push([main, [0, 0, W, H - s]], [pick(CAMS) || main, [0, H - s, W, s]]);
+  else if (lay === "pip" || lay === "blurcam") {
+    const cam = pick(CAMS);
+    if (lay === "pip") { base = "main"; slots.push([main, [0, 0, W, H]]); } else {
+      const [mw, mh] = sizeOf(main), ra = (main.w * mw) / (main.h * mh);
+      let fw = W, fh = evenPx(W / ra);
+      if (fh > H) { fw = evenPx(H * ra); fh = H; }
+      base = "blur"; slots.push([main, [Math.floor((W - fw) / 2), Math.floor((H - fh) / 2), fw, fh]]);
+    }
+    if (cam) {
+      const [cw, ch] = sizeOf(cam), ra = (cam.w * cw) / (cam.h * ch), m = evenPx(W * 0.04), c = e.pip_corner;
+      let w = evenPx(W * e.pip_size), h = evenPx(w / ra);
+      if (h > Math.floor(H / 2)) { h = evenPx(H / 2); w = evenPx(h * ra); }
+      slots.push([cam, [c[1] === "l" ? m : W - w - m, c[0] === "t" ? m : H - h - m, w, h], true]);
+    }
+  } else if (lay === "free") {
+    base = "blur";
+    for (const r of [main, ...rs.filter((q) => q !== main)]) {
+      const o = clampBox(r.out || (r === main ? FULL_BOX : FREE_OUT)), x = Math.round(o.x * W), y = Math.round(o.y * H);
+      slots.push([r, [x, y, Math.min(evenPx(o.w * W), W - x - (x % 2)), Math.min(evenPx(o.h * H), H - y - (y % 2))]]);
+    }
+  } else { // split / stack3 / duo: top tier, main, (stack3) bottom tier
+    const cam = pick(CAMS) || main, guest = lay === "duo" ? pick(["guest", "extra", "chat", "cam"]) : null, half = evenPx(W / 2);
+    let third = lay === "stack3" ? pick(["chat", "guest", "extra", "cam"]) : null, t = third ? Math.min(evenPx(H * e.split2), H - s - evenPx(H * 0.15)) : 0;
+    if (t < 2) { third = null; t = 0; }
+    slots.push(...(guest ? [[cam, [0, 0, half, s]], [guest, [half, 0, W - half, s]]] : [[cam, [0, 0, W, s]]]), [main, [0, s, W, H - s - t]]);
+    if (third) slots.push([third, [0, H - t, W, t]]);
+  }
+  const anchor = [+(e.crop_x ?? 0.5), +(e.crop_y ?? 0.5), Math.max(+e.zoom || 1, 1)];
+  return { base, items: slots.map(([r, box, pip]) => ({ r, box, pip: !!pip, crop: regionCrop(r, box[2] / box[3], ...sizeOf(r), ...(r === main ? anchor : [])) })) };
+}
+// gallery thumbnail: the layout drawn with sample regions, coloured by role
+const DEMO_REGIONS = [{ role: "cam", x: 0.7, y: 0.05, w: 0.28, h: 0.32, out: { x: 0.08, y: 0.05, w: 0.55, h: 0.22 } },
+  { role: "guest", x: 0, y: 0.6, w: 0.25, h: 0.4, out: { x: 0.4, y: 0.3, w: 0.55, h: 0.2 } }, { role: "main", x: 0, y: 0, w: 0.75, h: 1 },
+  { role: "chat", x: 0.75, y: 0.4, w: 0.25, h: 0.6, out: { x: 0.08, y: 0.7, w: 0.84, h: 0.24 } }];
+function layoutThumb(lay) {
+  const W = 90, H = 160, rect = ([x, y, w, h], fill, extra) => `<rect x="${x + 2}" y="${y + 2}" width="${Math.max(w - 4, 2)}" height="${Math.max(h - 4, 2)}" rx="6" fill="${fill}" ${extra}/>`;
+  const { base, items } = lay === "single" ? { base: null, items: [{ r: { role: "main" }, box: [0, 0, W, H] }] }
+    : layoutSlots({ layout: lay, regions: DEMO_REGIONS, crop_x: 0.5, crop_y: 0.5, zoom: 1, pip_size: 0.5 }, W, H, 1920, 1080);
+  return `<svg viewBox="0 0 ${W} ${H}" aria-hidden="true">${base === "blur" ? rect([0, 0, W, H], ROLE_COLOR.main, 'opacity=".3"') : ""}${items.map((it) =>
+    rect(it.box, ROLE_COLOR[it.r.role], it.pip ? 'stroke="#fff" stroke-width="4"' : 'opacity=".9"')).join("")}</svg>`;
+}
+
 // The Studio route only carries the clip id: find its project (last opened project first, then the rest).
 async function projectOfClip(cid) {
   const has = async (pid) => { const p = await api(`/api/projects/${pid}`); return p.clips.some((c) => c.id === cid) ? p : null; };
@@ -1330,9 +1914,28 @@ async function projectOfClip(cid) {
   return null;
 }
 
+// "+ Add camera angle": upload another camera's recording of the project; the server lines it up by sound (multicam.py)
+function pickAngleFile(pid, done) {
+  const inp = Object.assign(document.createElement("input"), { type: "file", accept: "video/*,.mkv,.mts,.ts,.flv" });
+  inp.onchange = async () => {
+    const f = inp.files[0];
+    if (!f) return;
+    const fd = new FormData();
+    fd.append("file", f); fd.append("name", f.name.replace(/\.[^.]+$/, ""));
+    toast(`Uploading ${f.name}…`);
+    try { await api(`/api/projects/${pid}/angles`, { body: fd }); toast("Camera angle added — lining it up by sound.", "ok"); await done?.(); } catch (e) { fail(e); }
+  };
+  inp.click();
+}
+
+// NLE export (routes_editor.py): the timeline for Resolve / Final Cut (FCPXML), Premiere (EDL) and its captions (SRT)
+const nleLinks = (base) => `<span class="nle-dl" title="Download the edit as a timeline for another editor: source file, in/out points, cuts, markers">Timeline:
+  ${[["fcpxml", "FCPXML"], ["edl", "EDL"], ["srt", "SRT"]].map(([f, l]) => `<a class="btn xs ghost" href="${base}/nle/${f}" download>${l}</a>`).join("")}</span>`;
+
 function Studio(cid) {
   const T = { proj: null, clip: null, tx: [], words: [], points: [], manual: [], job: null, mode: localStorage.studioMode || "source", drag: null, tdrag: null, range: [0, 1], wi: -1, tmode: "auto", target: null, pick: null, box: null,
-    ovs: [], osel: null, assets: null, akind: "", aq: "", plan: null, picked: new Set(), sounds: new Map(), prevRel: null, rz: null, odrag: null, win: null };
+    ovs: [], osel: null, assets: null, akind: "", aq: "", plan: null, picked: new Set(), sounds: new Map(), prevRel: null, rz: null, odrag: null, win: null,
+    hist: RWUndo.History(100, 1000), srv: null, csel: null };
   let video, ov, octx, tl, tctx, raf, keyHandler, wordTimer;
   const c = () => T.clip;
   const pid = () => T.proj.id;
@@ -1343,6 +1946,14 @@ function Studio(cid) {
   this.mount = async () => {
     T.proj = await projectOfClip(cid);
     T.clip = T.proj?.clips.find((k) => k.id === cid);
+    HL.vt = vtOf(T.proj); await loadHeadline();
+    if (T.clip && T.proj.source_state === "removed") { // the space saver removed the source: say so, offer the way back
+      view.innerHTML = `<div class="page"><a class="btn ghost sm" href="#/editor/${esc(T.proj.id)}">← Back to project</a>
+        <div class="empty"><b>This clip's source video was removed to save space</b>${sourceNote(T.proj)}<div class="muted">The clip, its edits and history are kept: bring the source back to keep editing it.</div></div></div>`;
+      view.onclick = (e) => sourceAction(e.target, () => route());
+      T.clip = null;
+      return;
+    }
     if (!T.clip || T.clip.parts || !T.proj.source) {
       view.innerHTML = `<div class="page"><a class="btn ghost sm" href="${T.proj ? `#/editor/${esc(T.proj.id)}` : "#/library"}">← Back</a>
         <div class="empty"><b>${!T.clip ? "Clip not found" : T.clip.parts ? "Montages can't be opened in the Studio" : "This project has no source video"}</b>${T.clip?.parts ? "Open one of its clips instead." : ""}</div></div>`;
@@ -1352,6 +1963,7 @@ function Studio(cid) {
     }
     localStorage.lastProject = T.proj.id;
     localStorage.lastClip = cid; $("#nav-studio").hidden = false;
+    T.srv = structuredClone(T.clip); // the clip as the server has it: what undo goes back to
     $("#nav-editor").hidden = false;
     const [tr, track, assets] = await Promise.all([
       fetch(`/files/${T.proj.id}/transcript.json`).then((r) => (r.ok ? r.json() : { segments: [] })).catch(() => ({ segments: [] })),
@@ -1374,8 +1986,10 @@ function Studio(cid) {
     if (wordTimer) { clearTimeout(wordTimer); saveWords(); } // don't lose a caption edit still waiting on its debounce
     if (T.ovTimer) { clearTimeout(T.ovTimer); patch({ edit: { overlays: T.ovs } }).catch(fail); }
     if (T.frTimer) { clearTimeout(T.frTimer); saveFraming(); }
+    if (T.rgTimer) { clearTimeout(T.rgTimer); patch({ edit: { regions: regs() } }).catch(fail); } // a region drag still waiting to save
     if (T.tsTimer) { clearTimeout(T.tsTimer); flushEdit(); }
     T.sounds.forEach((au) => au.pause()); view.oninput = null;
+    Object.values(T.av || {}).forEach((v) => { v.pause(); v.removeAttribute("src"); v.load(); });
   };
 
   function setTrack(t) { T.points = [...(t.points || [])].sort((a, b) => a[0] - b[0]); T.manual = [...(t.manual || [])].sort((a, b) => a[0] - b[0]); }
@@ -1409,10 +2023,30 @@ function Studio(cid) {
   const outSize = () => SIZES[c().edit.aspect] || [video?.videoWidth || 1920, video?.videoHeight || 1080];
   const locked = () => !!(T.locked || c().locked || Object.keys(c().posts || {}).length);
   function applyLock() { $(".studio")?.classList.toggle("st-locked", locked()); const b = $("#st-lock"); if (b) b.hidden = !locked(); }
-  async function patch(body) {
-    const fresh = await api(`/api/clips/${cid}`, { method: "PATCH", body }).catch((e) => { if (e.status === 409) { T.locked = true; applyLock(); } throw e; });
-    if (fresh && fresh.id) T.clip = { ...c(), ...fresh };
+  async function patch(body, record = true) {
+    const undo = record && !locked() ? RWUndo.inverse(body, T.srv || c()) : null; // posted clips refuse edits: nothing to undo
+    const fresh = await api(`/api/clips/${cid}`, { method: "PATCH", body }).catch((e) => { if (e.status === 409) { T.locked = true; T.hist.clear(); applyLock(); } throw e; });
+    if (fresh && fresh.id) { T.clip = { ...c(), ...fresh }; T.srv = structuredClone(fresh); }
+    if (undo) T.hist.push(cid, undo, body);
     return T.clip;
+  }
+  async function flushPending() { // edits still waiting on a debounce become their own undo step first
+    const jobs = [];
+    if (wordTimer) { clearTimeout(wordTimer); jobs.push(saveWords()); }
+    if (T.ovTimer) { clearTimeout(T.ovTimer); T.ovTimer = null; jobs.push(patch({ edit: { overlays: T.ovs } })); }
+    if (T.frTimer) jobs.push(saveFraming());
+    if (T.rgTimer) jobs.push(flushRegions());
+    if (T.tsTimer) { clearTimeout(T.tsTimer); flushEdit(); }
+    await Promise.all(jobs);
+  }
+  async function undoRedo(redo) {
+    if (locked()) return toast("Posted — make a new version to edit it.", "err");
+    try { await flushPending(); } catch (e) { return fail(e); }
+    const body = redo ? T.hist.redo(cid) : T.hist.undo(cid);
+    if (!body) return toast(redo ? "Nothing to redo." : "Nothing to undo.");
+    try { await patch(body, false); } catch (e) { T.hist.clear(); return fail(e); }
+    T.ovs = structuredClone(c().edit.overlays || []); T.osel = null; T.csel = null;
+    setTrack(c().edit.track || {}); loadWords(); renderPanel(); buildFx();
   }
 
   // ----- layout -----
@@ -1422,16 +2056,18 @@ function Studio(cid) {
       <div class="ed-top">
         <a class="btn ghost sm" href="#/editor/${esc(pid())}">← Back to project</a>
         <div class="title" id="st-name" title="${esc(c().title)}">${esc(c().title)}</div>
-        <span class="muted mono" id="st-span"></span>
+        <span class="muted mono" id="st-span"></span>${keepBtn("clip", cid, c().keep)}${dueChip(c().due)}
         <div class="grow"></div>
         <div class="seg" id="st-mode">${[["source", "Source view"], ["output", "Output view"]].map(([v, l]) => `<button data-act="mode" data-v="${v}" class="${T.mode === v ? "on" : ""}">${l}</button>`).join("")}</div>
+        <button class="btn sm" data-act="safe" id="st-safe-btn" title="Output view: shade where each app's own buttons and captions cover the frame">Safe zones: ${SAFE_NAMES[T.safe] || "off"}</button>
       </div>
       <div class="stage">
         <div class="player" id="st-player"><div class="st-frame" id="st-frame">
-          <video id="svid" src="/files/${esc(pid())}/${esc(T.proj.source)}" preload="auto" playsinline></video><canvas id="sov"></canvas><div class="st-fx" id="st-fx"></div></div></div>
+          <video id="svid" src="/files/${esc(pid())}/${esc(T.proj.proxy || T.proj.source)}" preload="auto" playsinline></video><canvas id="sov"></canvas><div class="st-fx" id="st-fx"></div></div></div>
         <div class="transport">
           <button class="btn sm" data-act="play" title="Space">▶</button>
           <span class="tc" id="stc">0:00.0</span>
+          <button class="btn xs ghost" data-act="undo" title="Undo (Ctrl+Z)">↶</button><button class="btn xs ghost" data-act="redo" title="Redo (Ctrl+Y or Ctrl+Shift+Z)">↷</button>
           <div class="grow"></div>
           <span class="muted" style="font-size:12px" id="st-hint"></span>
         </div>
@@ -1446,13 +2082,23 @@ function Studio(cid) {
     video.addEventListener("play", () => { $("[data-act=play]").textContent = "❚❚"; });
     video.addEventListener("pause", () => { $("[data-act=play]").textContent = "▶"; T.sounds.forEach((au) => au.pause()); });
     bindFrame(); bindTimeline(); bindDrop();
+    bindBoxes(ov, () => (!multiOn() || T.tmode === "target" ? null : T.mode === "source" ? regs() : c().edit.layout === "free" ? freeOuts() : null),
+      (i, b) => (T.mode === "source" ? Object.assign(regs()[i], b) : (regs()[i].out = b)));
     view.onclick = onClick; view.oninput = onInput; view.onchange = onChange;
     keyHandler = (e) => {
       if (e.target.closest?.("input, textarea, select") || $("#modal-root").innerHTML) return;
-      if (e.code === "Space") { e.preventDefault(); video.paused ? video.play() : video.pause(); }
+      const z = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase();
+      if (z === "z" || z === "y") { e.preventDefault(); undoRedo(z === "y" || e.shiftKey); }
+      else if ((e.key === "Delete" || e.key === "Backspace") && T.csel) { e.preventDefault(); cutSel(); }
+      else if (e.code === "Space") { e.preventDefault(); video.paused ? video.play() : video.pause(); }
+      else if (e.key.startsWith("Arrow") && multiOn() && regs()[T.rsel]) { e.preventDefault(); nudgeRegion(e.key, e.shiftKey ? 0.02 : 0.004); }
       else if (e.key === "ArrowLeft") seek(video.currentTime - (e.shiftKey ? 1 : 1 / (T.proj.meta?.fps || 30)));
       else if (e.key === "ArrowRight") seek(video.currentTime + (e.shiftKey ? 1 : 1 / (T.proj.meta?.fps || 30)));
       else if (e.key === "Escape" && (T.pick || T.box)) { T.pick = T.box = null; renderTrack(); }
+      else if (/^[0-6]$/.test(e.key) && readyAngs().length && !e.ctrlKey && !e.altKey && !e.metaKey) { // angle cuts at the playhead
+        const id = e.key === "0" ? "main" : readyAngs()[+e.key - 1]?.id;
+        if (id) cutTo(id);
+      }
     };
     document.addEventListener("keydown", keyHandler);
     renderPanel(); buildFx(); setMode(T.mode); applyLock();
@@ -1468,13 +2114,17 @@ function Studio(cid) {
     if (m === "source") { $("#st-frame").style.cssText = ""; video.style.cssText = ""; }
     hint();
   }
-  const hint = () => { $("#st-hint").textContent = T.mode === "output" ? "Showing the final framing" : T.tmode === "target" ? "Pause and drag a box around what to follow · Esc cancels" : c().edit.follow ? "Pause and drag the frame (or a corner, to zoom) to add a tracking keyframe" : "Drag the frame to set the framing"; };
+  const hint = () => { $("#st-hint").textContent = T.mode === "output" ? (multiOn() && c().edit.layout === "free" ? "Drag a box to place it in the frame" : "Showing the final framing")
+    : multiOn() && T.tmode !== "target" ? "Drag the coloured boxes to mark each region · a corner resizes · arrow keys nudge" : T.tmode === "target" ? "Pause and drag a box around what to follow · Esc cancels" : c().edit.follow ? "Pause and drag the frame (or a corner, to zoom) to add a tracking keyframe" : "Drag the frame to set the framing"; };
 
   // ----- per-frame drawing: overlay or output crop, timecode, timeline, current word -----
   function frame() {
     if (!video || !c()) return;
     const k = c(), t = video.currentTime, rel = t - k.start;
     if (!video.paused && (t >= k.end || t < k.start - 0.25)) video.currentTime = k.start; // loop inside the clip
+    const cut = !video.paused && (k.edit.cuts || []).find(([a, b]) => t >= a && t < b - 0.02);
+    if (cut) video.currentTime = cut[1]; // text cuts: the preview jumps over them like the render
+    if (angs().length) { syncAngles(t); drawCompare(); }
     $("#stc").textContent = `${fmt(Math.max(0, rel))} / ${fmt(k.end - k.start)}`;
     drawTimeline();
     const wi = T.words.findIndex((w) => t >= w.s && t <= w.e);
@@ -1484,12 +2134,24 @@ function Studio(cid) {
     const f = framing(rel), win = winAt(f, sw, sh);
     T.win = win;
     fxTick(rel);
+    const multi = multiOn();
+    $("#st-frame").classList.toggle("multi", multi);
+    if (multi) { // split-screen: region boxes on the source, the composition in the panel (and as the Output view)
+      drawComp($("#st-comp"), rel);
+      if (T.mode === "output") {
+        const pl = $("#st-player"), [OW, OH] = outSize(), s = Math.min(pl.clientWidth / OW, pl.clientHeight / OH) * 0.98;
+        Object.assign($("#st-frame").style, { width: OW * s + "px", height: OH * s + "px" });
+        return drawComp(ov, rel);
+      }
+      if (T.tmode !== "target") return drawRegions();
+    }
     if (T.mode === "output") {
       const pl = $("#st-player"), cw = win.w * sw, ch = win.h * sh, s = Math.min(pl.clientWidth / cw, pl.clientHeight / ch) * 0.98;
       Object.assign($("#st-frame").style, { width: cw * s + "px", height: ch * s + "px" });
       Object.assign(video.style, { width: sw * s + "px", height: sh * s + "px", left: -win.x * sw * s + "px", top: -win.y * sh * s + "px" });
-      return;
+      return drawLiveAngle(rel);
     }
+    $("#st-frame").classList.remove("angle");
     const dpr = window.devicePixelRatio || 1, W = video.clientWidth, H = video.clientHeight;
     if (ov.width !== Math.round(W * dpr) || ov.height !== Math.round(H * dpr)) { ov.width = Math.round(W * dpr); ov.height = Math.round(H * dpr); }
     const g = octx;
@@ -1521,7 +2183,7 @@ function Studio(cid) {
   function bindFrame() {
     const frac = (ev) => { const r = ov.getBoundingClientRect(); return [Math.min(Math.max((ev.clientX - r.left) / r.width, 0), 1), Math.min(Math.max((ev.clientY - r.top) / r.height, 0), 1)]; };
     ov.addEventListener("pointerdown", (ev) => {
-      if (T.mode !== "source" || !video.videoWidth) return;
+      if (T.mode !== "source" || !video.videoWidth || (multiOn() && T.tmode !== "target")) return; // split-screen: bindBoxes drags the regions
       video.pause();
       if (T.tmode === "target") { const [x, y] = frac(ev); T.box = { x0: x, y0: y, x, y, w: 0, h: 0 }; ov.setPointerCapture(ev.pointerId); return; } // picking: draw a new box, don't move the crop
       if (T.win) { // a corner handle: resize the window = zoom at this moment
@@ -1592,14 +2254,15 @@ function Studio(cid) {
 
   // ----- mini timeline of this clip -----
   let TL_H, LANE_Y, LANE_H, KF_Y, FX_Y, FX_H; // scaled by the Timelines interface size
-  const tlScale = () => { [TL_H, LANE_Y, LANE_H, KF_Y, FX_Y, FX_H] = [100, 8, 40, 58, 76, 18].map((v) => v * S.ui.timeline); };
+  let SW_Y, SW_H; // angle-switch lane
+  const tlScale = () => { [TL_H, LANE_Y, LANE_H, KF_Y, FX_Y, FX_H, SW_Y, SW_H] = [T.proj?.angles?.length ? 116 : 100, 8, 40, 58, 76, 18, 99, 14].map((v) => v * S.ui.timeline); };
   tlScale();
   const tx = (t) => ((t - T.range[0]) / (T.range[1] - T.range[0])) * (tl.clientWidth || 1);
   const tAt = (px) => T.range[0] + (px / (tl.clientWidth || 1)) * (T.range[1] - T.range[0]);
   function drawTimeline() {
     tlScale();
     const dpr = window.devicePixelRatio || 1, W = tl.clientWidth;
-    if (tl.width !== Math.round(W * dpr) || tl.height !== Math.round(TL_H * dpr)) { tl.width = Math.round(W * dpr); tl.height = Math.round(TL_H * dpr); }
+    if (tl.width !== Math.round(W * dpr) || tl.height !== Math.round(TL_H * dpr)) { tl.width = Math.round(W * dpr); tl.height = Math.round(TL_H * dpr); tl.style.height = TL_H + "px"; }
     const g = tctx, k = c();
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, W, TL_H);
@@ -1628,12 +2291,18 @@ function Studio(cid) {
       g.fillStyle = "#0006"; g.fillRect(X0 + Wd - 3, FX_Y + 4, 2, FX_H - 8); // resize grip
     }
     if (T.target) { const X = tx(k.start + T.target.t); g.strokeStyle = "#ffc247"; g.lineWidth = 2; g.strokeRect(X - 5, KF_Y - 5, 10, 10); }
+    if (angs().length) drawSwitchLane(g, W);
     const X = tx(T.scrubT ?? video.currentTime);
     g.fillStyle = "#fff"; g.fillRect(X - 1, 0, 2, TL_H);
   }
   function bindTimeline() {
     tl.addEventListener("pointerdown", (ev) => {
       const x = localXY(ev, tl)[0], k = c();
+      if (angs().length && localXY(ev, tl)[1] >= SW_Y - 2) { // switch lane: drag a cut point, or click to seek
+        const i = cuts().findIndex((q) => Math.abs(tx(k.start + q.t) - x) < 7);
+        if (i >= 0) { T.swdrag = { i }; tl.setPointerCapture(ev.pointerId); } else seek(tAt(x));
+        return;
+      }
       if (localXY(ev, tl)[1] >= FX_Y - 2) { // effects lane: select, move (body) or resize (right edge)
         const hit = [...T.ovs].reverse().find((o) => x >= tx(k.start + o.t) - 2 && x <= tx(k.start + o.t + o.d) + 3);
         if (hit) {
@@ -1655,6 +2324,11 @@ function Studio(cid) {
     });
     tl.addEventListener("pointermove", (ev) => {
       const x = localXY(ev, tl)[0], k = c();
+      if (T.swdrag) { // a cut moves between its neighbours
+        const sw = cuts(), i = T.swdrag.i, lo = i ? sw[i - 1].t + 0.1 : 0, hi = i + 1 < sw.length ? sw[i + 1].t - 0.1 : k.end - k.start;
+        sw[i] = { ...sw[i], t: +Math.min(Math.max(tAt(x) - k.start, lo), hi).toFixed(2) };
+        return;
+      }
       if (T.odrag) {
         const D = T.odrag, len = k.end - k.start, dt = ((x - D.x0) / (tl.clientWidth || 1)) * (T.range[1] - T.range[0]);
         if (D.mode === "t") D.o.t = +Math.min(Math.max(D.t0 + dt, 0), Math.max(0, len - 0.2)).toFixed(2);
@@ -1674,6 +2348,7 @@ function Studio(cid) {
       spanLabel();
     });
     const up = async () => {
+      if (T.swdrag) { T.swdrag = null; return saveCuts(); }
       if (T.odrag) { T.odrag = null; renderOvInspector(); return saveOverlays(); }
       const d = T.tdrag; T.tdrag = null;
       if (d === "seek" && T.fine) { seek(T.fine.cur); T.scrubT = null; T.fine = null; }
@@ -1694,6 +2369,259 @@ function Studio(cid) {
   }
   const spanLabel = () => { $("#st-span").textContent = `${fmt(c().start)} → ${fmt(c().end)} · ${(c().end - c().start).toFixed(1)}s`; };
 
+  // ----- split-screen layout: gallery, one box per region on the source, live composition -----
+  const multiOn = () => isMulti(c()?.edit);
+  const regs = () => T.regs || (T.regs = regionsOf(c().edit));
+  const freeOuts = () => { const rs = regs(), m = rs.findIndex((r) => r.role === "main"); return rs.map((r, i) => clampBox(r.out || (i === m ? FULL_BOX : FREE_OUT))); };
+  function saveRegions() { // the first change turns an old split clip's derived boxes into saved regions
+    c().edit = { ...c().edit, regions: regs() };
+    clearTimeout(T.rgTimer);
+    T.rgTimer = setTimeout(() => { T.rgTimer = null; patch({ edit: { regions: regs() } }).catch(fail); }, 400);
+  }
+  async function flushRegions() { if (T.rgTimer) { clearTimeout(T.rgTimer); T.rgTimer = null; await patch({ edit: { regions: regs() } }); } }
+  function selectRegion(i) { T.rsel = i; $$(".lay-reg").forEach((r) => r.classList.toggle("on", +r.dataset.i === i)); }
+  function nudgeRegion(key, step) {
+    const out = T.mode === "output" && c().edit.layout === "free", r = regs()[T.rsel], b = out ? freeOuts()[T.rsel] : r;
+    const [dx, dy] = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[key] || [0, 0];
+    const nb = clampBox({ ...b, x: b.x + dx, y: b.y + dy });
+    if (out) r.out = nb; else Object.assign(r, nb);
+    saveRegions();
+  }
+  // drag boxes (0..1 of el) on a canvas: the body moves one, a corner resizes it; pointer maths via localXY (CSS-zoom safe)
+  function bindBoxes(el, boxes, apply) {
+    let d = null;
+    el.addEventListener("pointerdown", (ev) => {
+      const bs = boxes();
+      if (!bs || !video.videoWidth) return;
+      const [lx, ly] = localXY(ev, el), W = el.offsetWidth || 1, H = el.offsetHeight || 1, px = lx / W, py = ly / H;
+      // a corner handle wins, else the smallest box under the pointer (a full-frame main view must not hide the others)
+      const hits = bs.map((b, i) => {
+        const near = ([, qx, qy]) => Math.abs(qx - px) * W < 10 && Math.abs(qy - py) * H < 10;
+        const corner = [["nw", b.x, b.y], ["ne", b.x + b.w, b.y], ["sw", b.x, b.y + b.h], ["se", b.x + b.w, b.y + b.h]].find(near)?.[0];
+        return (corner || (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h)) && { i, corner, rank: corner ? -1 : b.w * b.h };
+      }).filter(Boolean).sort((a, b) => a.rank - b.rank);
+      if (!hits.length) return selectRegion(null);
+      const { i, corner } = hits[0];
+      video.pause(); el.setPointerCapture(ev.pointerId);
+      d = { i, corner, b0: { ...bs[i] }, px, py, W, H, moved: false };
+      selectRegion(i);
+    });
+    el.addEventListener("pointermove", (ev) => {
+      if (!d) return;
+      const [lx, ly] = localXY(ev, el), dx = lx / d.W - d.px, dy = ly / d.H - d.py, b = { ...d.b0 };
+      if (!d.corner) { b.x += dx; b.y += dy; } else {
+        if (d.corner[1] === "w") { b.x += dx; b.w -= dx; } else b.w += dx;
+        if (d.corner[0] === "n") { b.y += dy; b.h -= dy; } else b.h += dy;
+      }
+      apply(d.i, clampBox(b)); d.moved = true;
+    });
+    const end = () => { if (d?.moved) saveRegions(); d = null; };
+    el.addEventListener("pointerup", end); el.addEventListener("pointercancel", end);
+  }
+  function drawRegions() { // source view: one colour-coded box per region
+    const dpr = window.devicePixelRatio || 1, W = video.clientWidth, H = video.clientHeight, g = octx;
+    if (ov.width !== Math.round(W * dpr) || ov.height !== Math.round(H * dpr)) { ov.width = Math.round(W * dpr); ov.height = Math.round(H * dpr); }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    g.font = "700 11px Inter, sans-serif";
+    regs().forEach((r, i) => {
+      const col = ROLE_COLOR[r.role], x = r.x * W, y = r.y * H, w = r.w * W, h = r.h * H, sel = i === T.rsel, label = r.role.toUpperCase() + (r.follow ? " · follows" : "");
+      g.fillStyle = col + (sel ? "30" : "18"); g.fillRect(x, y, w, h);
+      g.strokeStyle = col; g.lineWidth = sel ? 3 : 2; g.setLineDash(sel ? [] : [6, 4]); g.strokeRect(x + 1, y + 1, w - 2, h - 2); g.setLineDash([]);
+      g.fillStyle = col; g.fillRect(x + 1, y + 1, g.measureText(label).width + 10, 16); g.fillStyle = "#111"; g.fillText(label, x + 6, y + 13);
+      g.fillStyle = col;
+      for (const [qx, qy] of [[x, y], [x + w, y], [x, y + h], [x + w, y + h]]) g.fillRect(qx - (sel ? 6 : 4), qy - (sel ? 6 : 4), sel ? 12 : 8, sel ? 12 : 8);
+    });
+  }
+  function drawComp(cv, rel) { // the output frame as the renderer composes it (following regions ride the tracked path)
+    const cw = cv?.clientWidth, ch = cv?.clientHeight, sw = video.videoWidth, sh = video.videoHeight;
+    if (!cw || !ch || !sw) return;
+    const dpr = window.devicePixelRatio || 1, [OW, OH] = outSize(), g = cv.getContext("2d"), k = cw / OW;
+    if (cv.width !== Math.round(cw * dpr) || cv.height !== Math.round(ch * dpr)) { cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr); }
+    g.setTransform(dpr * k, 0, 0, dpr * k, 0, 0);
+    g.fillStyle = "#000"; g.fillRect(0, 0, OW, OH);
+    const e = { ...LAYOUT_DEFAULTS, ...c().edit, regions: regs() }, sizeOf = (r) => angSize(r.source) || [sw, sh], { base, items } = layoutSlots(e, OW, OH, sw, sh, sizeOf);
+    const draw = (src, sx, sy, sW, sH, x, y, w, h) => { if (src) g.drawImage(src[0], sx, sy, sW, sH, x, y, w, h); else { g.fillStyle = "#000"; g.fillRect(x, y, w, h); } };
+    if (base === "blur") { const [w, h, x, y] = regionCrop(items[0].r, OW / OH, ...sizeOf(items[0].r)); g.filter = `blur(${Math.round(10 * dpr)}px)`; draw(srcOf(angSize(items[0].r.source) ? items[0].r.source : "main"), x, y, w, h, 0, 0, OW, OH); g.filter = "none"; }
+    for (const it of items) {
+      const own = angSize(it.r.source) ? it.r.source : "main", sid = it.r.id === e.switch_region && cuts().length ? liveAt(rel) : own, src = srcOf(sid);
+      let [w0, h0, x0, y0] = sid === own ? it.crop : regionCrop(it.r, it.box[2] / it.box[3], ...(angSize(sid) || [sw, sh]));
+      if (it.r.follow && sid === "main" && T.points.length) { const p = trackAt(T.points, T.manual, rel, base0()); x0 = Math.min(Math.max(p.cx * sw - w0 / 2, 0), sw - w0); y0 = Math.min(Math.max(p.cy * sh - h0 / 2, 0), sh - h0); }
+      const [x, y, w, h] = it.box;
+      g.save();
+      if (it.pip) {
+        const b = Math.min(+e.pip_border || 0, Math.min(w, h) / 4);
+        g.beginPath(); g.roundRect(x, y, w, h, (+e.pip_radius || 0) * Math.min(w, h)); g.clip();
+        g.fillStyle = "#fff"; g.fillRect(x, y, w, h);
+        draw(src, x0, y0, w0, h0, x + b, y + b, w - 2 * b, h - 2 * b);
+      } else draw(src, x0, y0, w0, h0, x, y, w, h);
+      if (sid !== "main") angTag(g, angName(sid), x, y, 1 / k);
+      g.restore();
+      if (e.layout === "free") { g.strokeStyle = ROLE_COLOR[it.r.role]; g.lineWidth = (regs().indexOf(it.r) === T.rsel ? 3 : 1.5) / k; g.strokeRect(x, y, w, h); }
+    }
+  }
+  const base0 = () => ({ cx: +c().edit.crop_x, cy: +c().edit.crop_y });
+  function renderLayout() {
+    const el = $("#st-layout"), e = { ...LAYOUT_DEFAULTS, ...c().edit };
+    if (!el) return;
+    if (!T.rgTimer) T.regs = regionsOf(e);
+    if (e.aspect === "source") { el.innerHTML = `<h3>Layout</h3><div class="muted" style="font-size:12px">Split-screen layouts need a 9:16, 1:1, 4:5 or 16:9 output — pick one in the project's Edit tab.</div>`; return; }
+    const multi = multiOn(), lay = e.layout, [OW, OH] = outSize(), rs = regs();
+    // camera angles (project.angles, once multicam import exists): a source picker per region; hidden without any
+    const angles = (T.proj.angles || []).map((a) => (typeof a === "string" ? [a, a] : [a.id, a.name || a.id])).filter(([v]) => v);
+    const rl = (k, label, min, max, step, unit = "") => `<label class="slider"><span>${label}</span><input type="range" data-k="${k}" min="${min}" max="${max}" step="${step}" value="${e[k]}"><output>${(+e[k]).toFixed(step < 1 ? 2 : 0)}${unit}</output></label>`;
+    el.innerHTML = `<h3>Layout</h3>
+      <div class="lay-gal">${LAYOUTS.map(([v, l]) => `<button class="lay-card${lay === v ? " on" : ""}" data-act="layout" data-v="${v}" title="${l}" aria-pressed="${lay === v}">${layoutThumb(v)}<span>${l}</span></button>`).join("")}</div>
+      ${multi ? `<canvas id="st-comp" class="lay-out" style="aspect-ratio:${OW}/${OH}" title="Output preview${lay === "free" ? " — drag a box to place it" : ""}"></canvas>
+        ${["split", "split_rev", "stack3", "duo"].includes(lay) ? rl("split", lay === "split_rev" ? "Cam share (bottom)" : "Top share", 0.15, 0.7, 0.01) : ""}
+        ${lay === "stack3" ? rl("split2", "Bottom share", 0.1, 0.5, 0.01) : ""}
+        ${lay === "pip" || lay === "blurcam" ? `<div class="row"><span class="muted" style="font-size:12px">Cam corner</span>${segBtns("pip_corner", e.pip_corner, [["tl", "↖"], ["tr", "↗"], ["bl", "↙"], ["br", "↘"]])}</div>
+          ${rl("pip_size", "Cam size", 0.15, 0.6, 0.01)}${rl("pip_radius", "Rounding", 0, 0.5, 0.01)}${rl("pip_border", "Border", 0, 24, 1, "px")}` : ""}
+        <div class="lay-regs">${rs.map((r, i) => `<div class="lay-reg${T.rsel === i ? " on" : ""}" data-act="rg-sel" data-i="${i}"><i style="background:${ROLE_COLOR[r.role]}"></i>
+          <select data-rg="${i}" data-f="role" aria-label="Region ${i + 1} role">${ROLES.map((ro) => `<option value="${ro}"${ro === r.role ? " selected" : ""}>${ro}</option>`).join("")}</select>
+          ${angles.length ? `<select data-rg="${i}" data-f="source" aria-label="Region ${i + 1} camera">${[["main", "Main video"], ...angles].map(([v, l]) =>
+            `<option value="${esc(v)}"${v === (r.source || "main") ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>` : ""}
+          <label class="switch grow" title="This box follows the tracked subject (run tracking below)"><input type="checkbox" data-rg="${i}" data-f="follow"${r.follow ? " checked" : ""}> follow</label>
+          <button class="st-x" data-act="rg-del" data-i="${i}" title="Remove this region"${rs.length < 2 ? " disabled" : ""}>✕</button></div>`).join("")}</div>
+        <div class="row wrap"><button class="btn xs" data-act="rg-add"${rs.length >= 4 ? " disabled" : ""}>＋ Region</button><button class="btn xs" data-act="rg-detect">◎ Detect regions</button></div>
+        <div class="muted" style="font-size:12px">Source view: drag a box to move it, a corner to resize it; arrow keys nudge the selected box (Shift = faster).${lay === "free" ? " Drag the boxes on the preview to place them in the frame." : ""}</div>` : ""}
+      <div class="row wrap"><button class="btn xs" data-act="lay-all">Apply to all clips in this project</button><button class="btn xs" data-act="lay-default">Save as my default layout</button></div>`;
+    const comp = $("#st-comp");
+    if (comp) bindBoxes(comp, () => (c().edit.layout === "free" ? freeOuts() : null), (i, b) => { regs()[i].out = b; });
+  }
+
+
+  // ----- camera angles (project.angles, multicam.py): the Angles panel, hidden players on the main clock, angle cuts -----
+  const ANG_COL = ["#8a8fa3", "#4fc3f7", "#f06292", "#aed581", "#ffb74d", "#ba68c8", "#4db6ac"]; // main, then angles 1-6
+  const angs = () => (T.proj?.angles || []).filter((a) => a && a.id);
+  const readyAngs = () => angs().filter((a) => a.status === "ready" && a.meta);
+  const angName = (id) => (id === "main" ? "Main" : angs().find((a) => a.id === id)?.name || "Removed angle");
+  const angCol = (id) => ANG_COL[id === "main" ? 0 : angs().findIndex((a) => a.id === id) + 1] || ANG_COL[0];
+  const angSize = (id) => { const a = id && readyAngs().find((x) => x.id === id); return a ? [a.meta.width, a.meta.height] : null; };
+  const cuts = () => c().edit.switches || [];
+  const swDefault = () => (c().edit.switch_region && regs().find((r) => r.id === c().edit.switch_region)?.source) || "main";
+  const liveAt = (rel) => { let cur = swDefault(); for (const q of cuts()) if (q.t <= rel) cur = q.angle; return angSize(cur) ? cur : "main"; };
+  function angVid(a) { // one muted hidden player per ready angle
+    T.av = T.av || {};
+    let v = T.av[a.id];
+    if (!v) { v = T.av[a.id] = Object.assign(document.createElement("video"), { muted: true, preload: "auto", playsInline: true, src: `/files/${pid()}/${a.file}` }); }
+    return v;
+  }
+  function syncAngles(t) { // angle time = main time − offset; outside the angle's recording it shows black (like the render)
+    for (const a of readyAngs()) {
+      const v = angVid(a), want = t - (+a.offset_s || 0);
+      v._on = want >= 0 && want <= (+a.meta.duration || v.duration || 0);
+      if (!v._on || v.readyState < 1) { if (!v.paused) v.pause(); continue; }
+      if (Math.abs(v.currentTime - want) > (video.paused ? 0.04 : 0.3)) v.currentTime = want;
+      if (video.paused !== v.paused) video.paused ? v.pause() : v.play().catch(() => {});
+    }
+  }
+  // what a camera shows right now: [element, width, height], or null = black (that angle isn't recording at this moment)
+  const srcOf = (id) => { if (!id || id === "main") return [video, video.videoWidth, video.videoHeight]; const v = T.av?.[id]; return v?._on && v.videoWidth ? [v, v.videoWidth, v.videoHeight] : null; };
+  const angTag = (g, text, x, y, s = 1) => {
+    g.save(); g.font = `700 ${11 * s}px Inter, sans-serif`;
+    g.fillStyle = "#000b"; g.fillRect(x + 4 * s, y + 4 * s, g.measureText(text).width + 10 * s, 17 * s);
+    g.fillStyle = "#fff"; g.fillText(text, x + 9 * s, y + 16.5 * s); g.restore();
+  };
+  function drawLiveAngle(rel) { // single layout, Output view: the live angle (cover-cropped, centred) laid over the main framing
+    const id = cuts().length ? liveAt(rel) : "main", fr = $("#st-frame");
+    fr.classList.toggle("angle", id !== "main");
+    if (id === "main") return;
+    const W = fr.clientWidth, H = fr.clientHeight, dpr = window.devicePixelRatio || 1, g = octx, src = srcOf(id);
+    if (ov.width !== Math.round(W * dpr) || ov.height !== Math.round(H * dpr)) { ov.width = Math.round(W * dpr); ov.height = Math.round(H * dpr); }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+    if (src) { const [w, h, x, y] = cropPx(src[1], src[2], W / H, 0.5, 0.5); g.drawImage(src[0], x, y, w, h, 0, 0, W, H); }
+    angTag(g, angName(id) + (src ? "" : " · not recording here (renders black)"), 0, 0);
+  }
+  function drawCompare() { // "Check sync": the main video and one angle side by side at the playhead
+    const cv = $("#st-cmp");
+    if (!cv || !T.cmp) return;
+    const W = cv.clientWidth, H = cv.clientHeight, dpr = window.devicePixelRatio || 1, g = cv.getContext("2d");
+    if (!W) return;
+    if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+    [["main", 0], [T.cmp, W / 2]].forEach(([id, x0]) => {
+      const s = srcOf(id);
+      if (s && s[1]) { const k = Math.min(W / 2 / s[1], H / s[2]), w = s[1] * k, h = s[2] * k; g.drawImage(s[0], x0 + (W / 2 - w) / 2, (H - h) / 2, w, h); }
+      angTag(g, angName(id) + (s ? "" : " · not recording"), x0, 0);
+    });
+  }
+  function drawSwitchLane(g, W) { // which camera is live along the clip; white ticks = cuts (drag them), yellow = suggestions
+    const k = c(), len = k.end - k.start, segs = [[0, swDefault()], ...cuts().map((q) => [q.t, q.angle])];
+    g.fillStyle = "#ffffff06"; g.fillRect(0, SW_Y, W, SW_H);
+    g.font = `600 ${9 * S.ui.timeline}px Inter, sans-serif`;
+    segs.forEach(([t0, id], i) => {
+      const X0 = tx(k.start + t0), X1 = tx(k.start + (i + 1 < segs.length ? segs[i + 1][0] : len));
+      if (X1 <= X0) return;
+      g.fillStyle = angCol(id) + (id === "main" ? "66" : "cc"); g.beginPath(); g.roundRect(X0, SW_Y, X1 - X0, SW_H, 3); g.fill();
+      g.save(); g.beginPath(); g.rect(X0, SW_Y, X1 - X0 - 2, SW_H); g.clip(); g.fillStyle = "#0b0c10"; g.fillText(angName(id), X0 + 4, SW_Y + SW_H - 4); g.restore();
+    });
+    g.fillStyle = "#fff";
+    for (const q of cuts()) g.fillRect(tx(k.start + q.t) - 1, SW_Y - 2, 2, SW_H + 4);
+    if (T.sugg) { g.fillStyle = "#ffc247"; for (const q of T.sugg.switches) g.fillRect(tx(k.start + q.t) - 1.5, SW_Y - 4, 3, 5); }
+  }
+  function cutTo(id) { // a cut at the playhead (replacing one within 0.1 s of it)
+    const rel = +Math.min(Math.max(video.currentTime - c().start, 0), c().end - c().start).toFixed(2);
+    c().edit.switches = [...cuts().filter((q) => Math.abs(q.t - rel) >= 0.1), { t: rel, angle: id }].sort((a, b) => a.t - b.t);
+    toast(`Cut to ${angName(id)} at ${fmt(rel)}`);
+    saveCuts();
+  }
+  async function saveCuts() { try { await patch({ edit: { switches: cuts() } }); } catch (e) { fail(e); } renderAngles(); }
+  async function saveAngle(ag, body) { Object.assign(ag, await api(`/api/projects/${pid()}/angles/${ag.id}`, { method: "PATCH", body })); renderAngles(); }
+  async function reloadAngles(full) { // full: the clip's regions / cuts were changed on the server (an angle was removed)
+    const p = await api(`/api/projects/${pid()}`).catch(() => null);
+    if (!p || T.dead) return;
+    const was = angs().filter((a) => a.status === "importing" || a.status === "syncing").map((a) => a.id);
+    T.proj.angles = p.angles || [];
+    for (const id of Object.keys(T.av || {})) if (!readyAngs().some((a) => a.id === id)) { T.av[id].pause(); delete T.av[id]; }
+    for (const a of angs().filter((x) => was.includes(x.id))) {
+      if (a.status === "ready") toast(`${a.name}: ${a.sync?.method === "audio" ? "lined up by sound" : a.sync?.note || "ready"}`, a.sync?.method === "audio" ? "ok" : "info", 8000);
+      else if (a.status === "failed") toast(`${a.name}: ${a.error || "import failed"}`, "err", 8000);
+    }
+    const fresh = p.clips.find((x) => x.id === cid);
+    if (full && fresh) { c().edit = fresh.edit; c().rev = fresh.rev; T.regs = null; }
+    renderAngles(); renderLayout();
+  }
+  async function showObsPicker() {
+    const el = $("#st-ang-obs"), list = await api(`/api/projects/${pid()}/angles/obs`);
+    el.innerHTML = list.length ? list.map((s) => `<div class="muted ang-note">${esc(s.name)} · ${esc(s.folder)}</div>
+      <div class="ang-obs">${s.files.map((f) => `<button class="btn xs ghost" data-act="ang-obs-pick" data-obs="${esc(s.obs_id)}" data-file="${esc(f.name)}" title="${(f.size / 1e6).toFixed(0)} MB · ${esc(new Date(f.mtime * 1000).toLocaleString())}">${esc(f.name)}</button>`).join("") || `<span class="muted ang-note">No recordings there.</span>`}</div>`).join("")
+      : `<div class="muted ang-note">No OBS recordings folder known yet: connect OBS in Settings and keep it connected (or let it import one recording first).</div>`;
+  }
+  function renderAngles() {
+    const el = $("#st-angles");
+    if (!el) return;
+    const as = angs(), ready = readyAngs(), e = c().edit, multi = multiOn(), full = as.length >= 6;
+    const nudge = (a, d) => `<button class="btn xs" data-act="ang-nudge" data-id="${esc(a.id)}" data-d="${d}" title="Move this angle ${Math.abs(d)} s ${d < 0 ? "earlier" : "later"} on the main video's clock">${d > 0 ? "+" : "−"}${Math.abs(d)}</button>`;
+    const status = (a) => (a.status === "ready" ? (a.sync?.method === "audio" ? `✓ Lined up by sound (confidence ${(+a.sync.confidence).toFixed(0)})`
+      : a.sync?.method === "manual" ? "✎ Offset set by hand" : `⚠ ${esc(a.sync?.note || "Not synced: set the offset by hand.")}`)
+      : a.status === "failed" ? `✕ ${esc(a.error || "Import failed")}` : `<span class="spin"></span> ${a.status === "syncing" ? "Lining up the sound…" : "Importing…"}`);
+    el.innerHTML = `<h3>Camera angles <span class="muted">${as.length}/6</span></h3>
+      ${as.map((a, i) => `<div class="ang">
+        <div class="ang-top"><i style="background:${angCol(a.id)}"></i>${a.thumb ? `<img src="/files/${esc(pid())}/${esc(a.thumb)}" alt="">` : `<span class="ang-ph"></span>`}
+          <input type="text" data-ang="${esc(a.id)}" data-f="name" value="${esc(a.name)}" maxlength="60" aria-label="Angle name">${a.status === "ready" ? `<span class="kbd" title="Press ${i + 1} to cut to this angle at the playhead">${i + 1}</span>` : ""}</div>
+        <div class="muted ang-note">${status(a)}</div>
+        ${a.status === "ready" ? `<div class="ang-off"><span class="muted">Offset</span>${[-1, -0.1, -0.01].map((d) => nudge(a, d)).join("")}<input type="number" step="0.01" data-ang="${esc(a.id)}" data-f="offset_s" value="${(+a.offset_s).toFixed(2)}" aria-label="Offset in seconds" title="Where this angle starts on the main video's clock (s)">${[0.01, 0.1, 1].map((d) => nudge(a, d)).join("")}</div>` : ""}
+        <div class="row wrap"><button class="btn xs${T.cmp === a.id ? " primary" : ""}" data-act="ang-cmp" data-id="${esc(a.id)}"${a.status === "ready" ? "" : " disabled"} title="Main video and this angle side by side: scrub the timeline to check the sync">⇆ Check sync</button>
+          <button class="btn xs" data-act="ang-resync" data-id="${esc(a.id)}"${["ready", "failed"].includes(a.status) ? "" : " disabled"}>↻ Re-sync</button><button class="btn xs" data-act="ang-del" data-id="${esc(a.id)}">Remove</button></div></div>`).join("")}
+      ${T.cmp && ready.some((a) => a.id === T.cmp) ? `<canvas id="st-cmp" class="ang-cmp"></canvas>` : ""}
+      <div class="row wrap"><button class="btn xs" data-act="ang-add"${full ? " disabled" : ""}>＋ Add camera angle</button><button class="btn xs" data-act="ang-url"${full ? " disabled" : ""}>＋ From link</button><button class="btn xs" data-act="ang-obs"${full ? " disabled" : ""}>＋ From OBS</button></div>
+      <div id="st-ang-obs" class="stack" style="gap:4px"></div>
+      ${!as.length ? `<div class="muted ang-note">Another camera's recording of the same moment (a facecam, a wide shot, a second phone): it's lined up by sound, then a region can show it or you can cut between cameras.</div>` : ""}
+      ${ready.length ? `<h3 style="margin-top:4px">Angle cuts</h3>
+        ${multi ? `<label class="field">Cuts switch this region<select id="st-swreg"><option value="">— pick a region —</option>${regs().map((r) => `<option value="${esc(r.id)}"${r.id === e.switch_region ? " selected" : ""}>${esc(r.role)}${r.source ? ` (${esc(angName(r.source))})` : ""}</option>`).join("")}</select></label>`
+          : `<div class="muted ang-note">Cuts switch the whole frame.</div>`}
+        <div class="row wrap"><select id="st-cutto" aria-label="Camera to cut to">${[["main", "Main"], ...ready.map((a) => [a.id, a.name])].map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("")}</select>
+          <button class="btn xs" data-act="cut-to" title="Keys 1–6 cut to an angle, 0 back to main">✂ Cut to angle at playhead</button><button class="btn xs" data-act="auto-switch" title="Suggest cuts: the loudest camera's mic, else the camera with the most movement">✦ Auto-switch</button></div>
+        ${T.sugg ? `<div class="ang-sugg"><div><b>Suggested cuts</b> <span class="muted">${esc(T.sugg.note)}</span></div>
+          <div class="ang-cuts">${T.sugg.switches.map((q) => `<span class="chip"><i style="background:${angCol(q.angle)}"></i>${fmt(q.t)} → ${esc(angName(q.angle))}</span>`).join("") || `<span class="muted">None.</span>`}</div>
+          <div class="row"><button class="btn xs primary" data-act="sugg-apply"${T.sugg.switches.length ? "" : " disabled"}>Use these cuts</button><button class="btn xs" data-act="sugg-drop">Discard</button><span class="muted ang-note">Replaces your cuts; edit them after.</span></div></div>` : ""}
+        <div class="ang-cuts">${cuts().map((q, i) => `<span class="chip"><i style="background:${angCol(q.angle)}"></i>${fmt(q.t)} → ${esc(angName(q.angle))}<button class="st-x" data-act="cut-del" data-i="${i}" title="Remove this cut" aria-label="Remove cut at ${fmt(q.t)}">✕</button></span>`).join("")
+          || `<span class="muted ang-note">No cuts: press 1–6 to cut to an angle at the playhead, 0 back to main. Drag a cut on the timeline's bottom lane to move it.</span>`}</div>
+        ${multi && cuts().length && !e.switch_region ? `<div class="ang-note warn">Pick the region the cuts switch, or they won't show in this layout.</div>` : ""}
+        <label class="field">Sound from<select id="st-asrc">${[["main", "Main video"], ...ready.filter((a) => a.meta.has_audio).map((a) => [a.id, a.name])].map(([v, l]) => `<option value="${esc(v)}"${v === (e.audio_source || "main") ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>
+        <div class="muted ang-note">The preview follows the angles live; the render is frame-exact. Where an angle wasn't recording, its picture is black.</div>` : ""}`;
+  }
+
   // ----- side panel -----
   const QUICK = ["Make it punchier", "Tighter on the face", "Add zoom on the punchline", "Clean captions"];
   const segBtns = (k, cur, opts) => `<div class="seg">${opts.map(([v, l]) => `<button class="${String(cur) === v ? "on" : ""}" data-act="set" data-k="${k}" data-v="${v}">${l}</button>`).join("")}</div>`;
@@ -1701,7 +2629,9 @@ function Studio(cid) {
     const k = c(), e = k.edit;
     $("#st-panel").innerHTML = `
       <div class="sec"><input type="text" id="st-title" value="${esc(k.title)}" style="font-weight:600">
-        <div class="muted" style="font-size:12px">Output ${esc(e.aspect === "source" ? "original frame" : e.aspect)}${e.layout === "split" ? " · split layout (preview shows the main view)" : ""}${e.fit === "blur" && e.aspect !== "source" ? " · fit + blur (preview shows the crop)" : ""}</div></div>
+        <div class="muted" style="font-size:12px">Output ${esc(e.aspect === "source" ? "original frame" : e.aspect)}${e.fit === "blur" && e.layout === "single" && e.aspect !== "source" ? " · fit + blur (preview shows the crop)" : ""}</div></div>
+      <div class="sec" id="st-layout"></div>
+      <div class="sec" id="st-angles"></div>
       <div class="sec"><h3>Framing</h3>
         <label class="slider"><span>Headroom</span><input type="range" data-fr="offset_y" min="-0.4" max="0.4" step="0.01" value="${+(e.framing?.offset_y || 0)}"><output>${(+(e.framing?.offset_y || 0)).toFixed(2)}</output></label>
         <label class="slider"><span>Zoom</span><input type="range" data-fr="zoom" min="1" max="4" step="0.05" value="${baseZ()}"><output>${baseZ().toFixed(2)}×</output></label>
@@ -1709,15 +2639,23 @@ function Studio(cid) {
       <div class="sec" id="st-track"></div>
       <div class="sec"><h3>Cuts</h3>
         <label class="switch"><input type="checkbox" data-k="remove_silence" ${e.remove_silence ? "checked" : ""}> AI jump cuts — remove silences &amp; dead air</label>
-        <label class="switch"><input type="checkbox" data-k="remove_fillers" ${e.remove_fillers ? "checked" : ""}> Cut filler words (“um”, “uh”)</label></div>
+        <label class="switch"><input type="checkbox" data-k="remove_fillers" ${e.remove_fillers ? "checked" : ""}> Cut filler words (“um”, “uh”)</label>
+        <div class="muted" style="font-size:12px">Cut by text: click a word, Shift-click another, then press Delete or Cut. Click a struck-out word to restore it.</div>
+        <div class="st-words st-cutw" id="st-cutw"></div>
+        <div class="row"><span class="muted grow" style="font-size:12px" id="st-cutn"></span><button class="btn xs" data-act="cut">✂ Cut</button><button class="btn xs ghost" data-act="cut-clear">Restore all</button></div></div>
       <div class="sec"><h3>Captions</h3>
         <label class="switch"><input type="checkbox" data-k="captions" ${e.captions ? "checked" : ""}> Animated captions</label>
         ${segBtns("caption_style", e.caption_style, [["bold", "Bold"], ["clean", "Clean"], ["boxed", "Boxed"], ["neon", "Neon"]])}
         ${segBtns("caption_pos", e.caption_pos, [["low", "Low"], ["middle", "Middle"], ["high", "High"]])}
+        ${segBtns("caption_anim", e.caption_anim || "highlight", CAP_ANIMS)}
+        <label class="switch"><input type="checkbox" data-k="caption_emphasis" ${e.caption_emphasis ? "checked" : ""}> Emphasise keywords</label>
         <div class="row"><span class="muted grow" style="font-size:12px" id="st-wsrc"></span><button class="btn xs" data-act="words-reset">Reset to transcript</button></div>
         <div class="st-words" id="st-words"></div>
         <details><summary class="muted" style="font-size:12px;cursor:pointer">Caption font &amp; style</summary><div id="st-cts" class="stack" style="gap:8px;margin-top:8px"></div></details>
         <div class="muted" style="font-size:12px">Switch to Output view to see captions in the frame.</div></div>
+      <div class="sec"><h3>Headline</h3><div id="st-hl-ed" class="stack" style="gap:8px"></div>
+        <details><summary class="muted" style="font-size:12px;cursor:pointer">Headline font &amp; style (over the theme)</summary><div id="st-hts" class="stack" style="gap:8px;margin-top:8px"></div></details>
+        <div class="muted" style="font-size:12px">Switch to Output view to see the banner in the frame.</div></div>
       <div class="sec"><h3>Effects</h3>
         <div id="st-ovi" class="stack" style="gap:8px"></div>
         <div class="row"><input type="text" id="st-txt" placeholder="Text or emoji sticker 🔥" maxlength="80"><button class="btn sm" data-act="add-text">＋ Add</button></div>
@@ -1748,8 +2686,11 @@ function Studio(cid) {
       catch (e) { fail(e); } finally { btn.disabled = false; }
     };
     textStyleEditor($("#st-cts"), { get: (k) => c().edit[`caption_${k}`], set: (k, v) => queueEdit(`caption_${k}`, v), def: tsDefaults("caption", c().edit, ...outSize()), sample: "Captions look like this" });
-    renderLib(); renderOvInspector(); renderPlan();
-    spanLabel(); renderTrack(); renderWords(); renderActions();
+    const hlStyle = () => textStyleEditor($("#st-hts"), { get: (k) => c().edit[`headline_${k}`], set: (k, v) => queueEdit(`headline_${k}`, v), def: hlTsDefaults(c().edit), sample: c().edit.headline?.text || "Your headline" });
+    headlineEditor($("#st-hl-ed"), { clip: c, set: (ed) => { const th = c().edit.headline?.theme; Object.entries(ed).forEach(([k, v]) => queueEdit(k, v)); if (ed.headline?.theme !== th) hlStyle(); } });
+    hlStyle();
+    renderLib(); renderOvInspector(); renderPlan(); renderLayout(); renderAngles();
+    spanLabel(); renderTrack(); renderWords(); renderCuts(); renderActions();
   }
 
   // ----- effects (edit.overlays) -----
@@ -1799,7 +2740,7 @@ function Studio(cid) {
       const inner = o.kind === "text" ? `<span>${esc(o.text)}</span>` : !a ? `<span class="st-miss">${esc(o.kind)}</span>`
         : o.kind === "video" ? `<video src="${src}" muted loop playsinline preload="metadata"></video>` : `<img src="${src}" alt="">`;
       return o.kind === "sound" ? "" : `<div class="st-ov" data-o="${esc(o.id)}" hidden>${inner}</div>`;
-    }).join("") + `<div class="st-cap" id="st-cap" hidden></div>`;
+    }).join("") + `<div class="st-cap" id="st-cap" hidden></div><div class="hl-prev" id="st-hl" hidden></div><div class="st-safe" id="st-safe" hidden></div>`;
     for (const o of T.ovs) {
       const a = o.kind === "sound" && T.assets?.find((x) => x.id === o.asset_id);
       if (a) { const au = new Audio(`/assets/${encodeURI(a.file)}`); au.volume = Math.min(Math.max(+(o.volume ?? 1), 0), 1); T.sounds.set(o.id, au); }
@@ -1826,6 +2767,8 @@ function Studio(cid) {
       }
     }
     capTick(out, fw);
+    hlTick(out, fw, rel);
+    safeTick(out);
     if (!video.paused && T.prevRel != null && rel > T.prevRel && rel - T.prevRel < 0.5) {
       for (const [id, au] of T.sounds) { const o = T.ovs.find((x) => x.id === id); if (o && T.prevRel < o.t && rel >= o.t) { au.currentTime = 0; au.play().catch(() => {}); } }
     }
@@ -1841,11 +2784,42 @@ function Studio(cid) {
     el.hidden = !chunk;
     if (!chunk) return;
     const upper = S.settings?.caption_uppercase !== false, hl = hexOr(S.settings?.caption_color, "#FFD400");
-    const html = chunk.map((w, i) => { const txt = esc(upper ? String(w.w).trim().toUpperCase() : String(w.w).trim()); return t >= w.s && (i === chunk.length - 1 || t < chunk[i + 1].s) ? `<em style="color:${hl}">${txt}</em>` : txt; }).join(" ");
+    const anim = CAP_ANIMS.some(([k]) => k === e.caption_anim) ? e.caption_anim : "highlight", cur = chunk.findIndex((w, i) => t >= w.s && (i === chunk.length - 1 || t < chunk[i + 1].s));
+    const html = chunk.map((w, i) => { const raw = String(w.w).trim(), txt = esc(upper ? raw.toUpperCase() : raw);
+      if (i === cur) return anim === "box" ? `<em class="ca-box" style="background:${hl}">${txt}</em>` : `<em class="ca-${anim}" style="color:${hl}">${txt}</em>`;
+      if (anim === "reveal" && cur >= 0 && i > cur) return `<span style="visibility:hidden">${txt}</span>`;
+      return e.caption_emphasis && capKeyword(raw) ? `<b class="ca-emph" style="color:${hl}">${txt}</b>` : txt; }).join(" ");
     if (el._h !== html) { el._h = html; el.innerHTML = html; }
     styleText(el, tsOf((k) => e[`caption_${k}`], tsDefaults("caption", e, OW, OH)), fw / OW);
-    el.style.bottom = CAPTION_POS[e.caption_pos || "low"][OH > OW ? 0 : 1] * 100 + "%";
+    let mv = CAPTION_POS[e.caption_pos || "low"][OH > OW ? 0 : 1] * OH;
+    const hs = hlSpec(e);
+    if (hs) { // keep clear of the banner, like media.build_ass
+      const L = hlLayout(hs, OW, OH, seamOf(e)), y0 = L.kbox && !L.left ? L.kbox[1] : L.bar[1], y1 = L.bar[1] + L.bar[3], gap = OH * 0.015;
+      const capH = 2.4 * tsOf((k) => e[`caption_${k}`], tsDefaults("caption", e, OW, OH)).size;
+      if (OH - mv > y0 - gap && OH - mv - capH < y1 + gap) mv = y0 + y1 < OH ? OH - (y1 + gap + capH) : OH - (y0 - gap);
+    }
+    el.style.bottom = (mv / OH) * 100 + "%";
     el.style.background = e.caption_style === "boxed" ? "#0009" : "";
+  }
+  // platform safe zones over the output view (vertical only): the app UI that would cover text, from qa.SAFE_ZONES
+  function safeTick(out) {
+    const el = $("#st-safe"), z = SAFE_ZONES[T.safe], [OW, OH] = outSize(), on = !!(out && z && OH > OW);
+    if (!el) return;
+    if (el.hidden === on) el.hidden = !on;
+    if (!on || el._k === T.safe) return;
+    el._k = T.safe;
+    el.innerHTML = `<i style="top:0;left:0;right:0;height:${z.top * 100}%"></i><i style="bottom:0;left:0;right:0;height:${z.bottom * 100}%"></i>`
+      + `<i style="top:40%;bottom:${z.bottom * 100}%;right:0;width:${z.right * 100}%"></i><span>${esc(SAFE_NAMES[T.safe])} UI</span>`;
+  }
+  // the headline banner in the output view (only while it shows: whole clip or its first seconds)
+  function hlTick(out, fw, rel) {
+    const el = $("#st-hl"), e = c().edit, sp = out ? hlSpec(e) : null;
+    const on = !!sp && (sp.show === "whole" || rel / (+e.speed || 1) <= +sp.seconds);
+    if (!el) return;
+    if (el.hidden === on) el.hidden = !on;
+    if (!on) return;
+    const [OW, OH] = outSize(), key = JSON.stringify(sp) + fw + OH;
+    if (el._k !== key) { el._k = key; hlRender(el, sp, hlLayout(sp, OW, OH, seamOf(e)), fw / OW); }
   }
   function renderOvInspector() {
     const el = $("#st-ovi");
@@ -1904,6 +2878,7 @@ function Studio(cid) {
   }
   function reloadFromClip(fresh) {
     clearTimeout(T.ovTimer); T.ovTimer = null;
+    clearTimeout(T.rgTimer); T.rgTimer = null; T.regs = null; // regions come from the fresh clip
     T.clip = { ...c(), ...fresh };
     setTrack(c().edit.track || {});
     T.ovs = structuredClone(c().edit.overlays || []);
@@ -1938,6 +2913,26 @@ function Studio(cid) {
       ? T.words.map((w, i) => `<input type="text" class="wd" data-i="${i}" value="${esc(w.w)}" title="${fmt(w.s, 2)}" style="width:calc(${Math.max(1, w.w.length)}ch + 16px)" spellcheck="false">`).join("")
       : `<span class="muted" style="font-size:12px">No words in this clip's range.</span>`;
   }
+  // ----- text cuts (edit.cuts: [[s, e], …] source seconds; the server merges and clamps them) -----
+  const cutWords = () => T.tx.filter((w) => w.s >= c().start - 0.05 && w.e <= c().end + 0.05);
+  const cutOf = (w) => (c().edit.cuts || []).findIndex(([a, b]) => (w.s + w.e) / 2 >= a && (w.s + w.e) / 2 < b);
+  function renderCuts() {
+    const el = $("#st-cutw"); if (!el) return;
+    const ws = cutWords(), [i, j] = T.csel ? [Math.min(...T.csel), Math.max(...T.csel)] : [-1, -2], cuts = c().edit.cuts || [];
+    el.innerHTML = ws.length ? ws.map((w, k) => `<span class="cw${cutOf(w) >= 0 ? " cut" : ""}${k >= i && k <= j ? " sel" : ""}" data-ci="${k}" title="${fmt(w.s, 2)}">${esc(String(w.w).trim())}</span>`).join("")
+      : `<span class="muted" style="font-size:12px">No transcript words in this clip.</span>`;
+    $("#st-cutn").textContent = cuts.length ? `${cuts.length} cut${cuts.length > 1 ? "s" : ""} · ${fmt(cuts.reduce((n, [a, b]) => n + b - a, 0), 1)} removed` : "";
+  }
+  async function setCuts(cuts) {
+    if (locked()) return toast("Posted — make a new version to edit it.", "err");
+    try { await patch({ edit: { cuts: cuts.length ? cuts : null } }); } catch (e) { fail(e); }
+    renderCuts();
+  }
+  function cutSel() {
+    const ws = cutWords(); if (!T.csel) return;
+    const a = ws[Math.min(...T.csel)], b = ws[Math.max(...T.csel)]; T.csel = null;
+    if (a && b) setCuts([...(c().edit.cuts || []), [a.s, b.e]]);
+  }
   async function saveWords() {
     wordTimer = null;
     try { await patch({ edit: { words: T.words.filter((w) => w.w.trim()) } }); } catch (e) { fail(e); }
@@ -1952,20 +2947,92 @@ function Studio(cid) {
          ${current ? `<a class="btn" href="/files/${esc(pid())}/${esc(ex.file)}" download="${esc(k.title.replace(/[\\/:*?"<>|]/g, "_"))}.mp4">Download</a>` : ""}
          ${current && ex.cover ? `<a href="/files/${esc(pid())}/${esc(ex.cover)}?r=${+k.rev}" target="_blank" title="Auto-picked cover (YouTube thumbnail / TikTok cover) at ${(+ex.cover_t || 0).toFixed(1)}s"><img src="/files/${esc(pid())}/${esc(ex.cover)}?r=${+k.rev}" alt="Cover" style="height:36px;border-radius:5px;border:1px solid var(--line-2);vertical-align:middle"></a>` : ""}
          ${ex.status === "failed" ? `<span style="color:var(--err);font-size:12px" title="${esc(ex.error)}">Render failed</span>` : ""}
-         <div class="grow"></div><button class="btn primary" data-act="publish">⇪ Publish</button>`;
+         ${nleLinks(`/api/clips/${esc(cid)}`)}<div class="grow"></div><button class="btn primary" data-act="publish">⇪ Publish</button>${current && ex.qa ? qaList(ex.qa) : ""}`;
   }
 
   // ----- events -----
   async function onClick(ev) {
+    const kb = ev.target.closest("[data-keep]"); // space saver pin for this clip
+    if (kb) { const on = !kb.classList.contains("on"); await toggleKeep(kb); if (!kb.isConnected) c().keep = on; return; }
     const w = ev.target.closest(".wd");
     if (w) { video.pause(); seek(T.words[+w.dataset.i].s); return; }
+    const cw = ev.target.closest(".cw");
+    if (cw) {
+      const k = +cw.dataset.ci, word = cutWords()[k], ci = word ? cutOf(word) : -1;
+      if (ci >= 0) return setCuts((c().edit.cuts || []).filter((_, x) => x !== ci)); // a struck-out word: restore its cut
+      T.csel = ev.shiftKey && T.csel ? [T.csel[0], k] : [k, k];
+      video.pause(); if (word) seek(word.s);
+      return renderCuts();
+    }
     const a = ev.target.closest("[data-act]");
     if (!a) return;
     const k = c();
     try {
       switch (a.dataset.act) {
         case "play": video.paused ? video.play() : video.pause(); break;
+        case "undo": case "redo": await undoRedo(a.dataset.act === "redo"); break;
+        case "cut": if (T.csel) cutSel(); else toast("Click a word (Shift-click to extend), then Cut."); break;
+        case "cut-clear": T.csel = null; await setCuts([]); break;
         case "mode": setMode(a.dataset.v); break;
+        case "safe": { const all = ["", ...Object.keys(SAFE_ZONES)]; T.safe = all[(all.indexOf(T.safe || "") + 1) % all.length]; a.textContent = `Safe zones: ${SAFE_NAMES[T.safe] || "off"}`; if (T.safe && T.mode !== "output") setMode("output"); break; }
+        case "layout": {
+          await flushRegions();
+          k.edit = { ...k.edit, layout: a.dataset.v }; T.rsel = null;
+          renderLayout(); hint();
+          await patch({ edit: { layout: a.dataset.v } });
+          break;
+        }
+        case "rg-sel": selectRegion(+a.dataset.i); break;
+        case "ang-add": pickAngleFile(pid(), () => reloadAngles()); break;
+        case "ang-url": {
+          const u = prompt("Link to the other camera's video (YouTube, Twitch VOD, any link yt-dlp can download)");
+          if (u?.trim()) { await api(`/api/projects/${pid()}/angles/url`, { body: { url: u.trim() } }); await reloadAngles(); }
+          break;
+        }
+        case "ang-obs": await showObsPicker(); break;
+        case "ang-obs-pick": await api(`/api/projects/${pid()}/angles/obs`, { body: { obs_id: a.dataset.obs, file: a.dataset.file } }); T.obs = null; await reloadAngles(); break;
+        case "ang-nudge": { const ag = angs().find((x) => x.id === a.dataset.id); if (ag) await saveAngle(ag, { offset_s: +(+ag.offset_s + +a.dataset.d).toFixed(3) }); break; }
+        case "ang-cmp": T.cmp = T.cmp === a.dataset.id ? null : a.dataset.id; renderAngles(); break;
+        case "ang-resync": await api(`/api/projects/${pid()}/angles/${a.dataset.id}/resync`, { method: "POST" }); await reloadAngles(); break;
+        case "ang-del":
+          if (await confirmBox("Remove this camera angle?", "Its file is deleted from this project. Regions that show it go back to the main video and cuts to it become cuts to main.", "Remove")) {
+            await api(`/api/projects/${pid()}/angles/${a.dataset.id}`, { method: "DELETE" }); if (T.cmp === a.dataset.id) T.cmp = null; await reloadAngles(true);
+          }
+          break;
+        case "cut-to": cutTo($("#st-cutto").value); break;
+        case "cut-del": c().edit.switches = cuts().filter((_, i) => i !== +a.dataset.i); await saveCuts(); break;
+        case "auto-switch": {
+          a.disabled = true; a.innerHTML = `<span class="spin"></span> Listening…`;
+          try { T.sugg = await api(`/api/clips/${cid}/switches/suggest`, { method: "POST" }); if (!T.sugg.switches.length) toast("No cuts suggested: one camera stays the best all through."); }
+          finally { renderAngles(); }
+          break;
+        }
+        case "sugg-apply": c().edit.switches = T.sugg?.switches || []; T.sugg = null; await saveCuts(); break;
+        case "sugg-drop": T.sugg = null; renderAngles(); break;
+        case "rg-add": {
+          if (regs().length >= 4) break;
+          const taken = new Set(regs().map((r) => r.role)), role = ["cam", "chat", "guest", "extra"].find((ro) => !taken.has(ro)) || "extra";
+          regs().push({ id: "r" + Date.now().toString(36), role, x: 0.35, y: 0.35, w: 0.3, h: 0.3, follow: false });
+          T.rsel = regs().length - 1; saveRegions(); renderLayout(); break;
+        }
+        case "rg-del": regs().splice(+a.dataset.i, 1); T.rsel = null; saveRegions(); renderLayout(); break;
+        case "rg-detect": {
+          a.disabled = true; a.innerHTML = `<span class="spin"></span> Detecting…`;
+          try {
+            await flushRegions();
+            const fresh = await api(`/api/clips/${cid}/regions/detect`, { method: "POST" });
+            T.clip = { ...c(), ...fresh }; T.regs = null; T.rsel = null;
+            toast(`Found: ${regs().map((r) => r.role).join(", ")} — drag the boxes to fine-tune.`, "ok");
+          } finally { renderLayout(); hint(); }
+          break;
+        }
+        case "lay-all": {
+          if (!(await confirmBox("Use this layout on every clip?", "Every other clip in this project that isn't posted gets this layout and these regions.", "Apply"))) break;
+          await flushRegions();
+          const r = await api(`/api/clips/${cid}/layout/apply-all`, { method: "POST" });
+          toast(`Layout applied to ${r.updated} more clip${r.updated === 1 ? "" : "s"}.`, "ok"); break;
+        }
+        case "lay-default": await flushRegions(); await api(`/api/clips/${cid}/layout/default`, { method: "POST" }); toast("New clips will start with this layout.", "ok"); break;
         case "set": k.edit = { ...k.edit, [a.dataset.k]: a.dataset.v }; $$(`[data-k="${a.dataset.k}"]`, a.parentElement).forEach((b) => b.classList.toggle("on", b === a)); await patch({ edit: { [a.dataset.k]: a.dataset.v } }); break;
         case "tmode":
           T.tmode = a.dataset.v;
@@ -2045,6 +3112,11 @@ function Studio(cid) {
   }
   function onInput(ev) {
     const t = ev.target;
+    if (t.dataset.k && t.type === "range" && t.closest("#st-layout")) { // layout ratios / corner-cam look: live preview, batched save
+      queueEdit(t.dataset.k, +t.value);
+      t.nextElementSibling.textContent = (+t.value).toFixed(+t.step < 1 ? 2 : 0) + (t.dataset.k === "pip_border" ? "px" : "");
+      return;
+    }
     if (t.dataset.fr) {
       c().edit = { ...c().edit, framing: { ...fr(), [t.dataset.fr]: +t.value } };
       t.nextElementSibling.textContent = (+t.value).toFixed(2) + (t.dataset.fr === "zoom" ? "×" : "");
@@ -2070,6 +3142,21 @@ function Studio(cid) {
   async function onChange(ev) {
     const t = ev.target, k = c();
     if (t.dataset.plan) { t.checked ? T.picked.add(t.dataset.plan) : T.picked.delete(t.dataset.plan); return renderPlan(); }
+    if (t.dataset.ang) { const ag = angs().find((x) => x.id === t.dataset.ang); if (ag) await saveAngle(ag, t.dataset.f === "name" ? { name: t.value } : { offset_s: +t.value }).catch(fail); return; }
+    if (t.id === "st-swreg" || t.id === "st-asrc") {
+      const key = t.id === "st-swreg" ? "switch_region" : "audio_source";
+      k.edit = { ...k.edit, [key]: t.value };
+      try { await patch({ edit: { [key]: t.value } }); } catch (e) { fail(e); }
+      return renderAngles();
+    }
+    if (t.dataset.rg != null) { // a region's role or follow switch
+      const r = regs()[+t.dataset.rg];
+      if (!r) return;
+      if (t.dataset.f === "role") r.role = t.value;
+      else if (t.dataset.f === "source") { if (t.value === "main") delete r.source; else r.source = t.value; }
+      else r.follow = t.checked;
+      saveRegions(); return renderLayout();
+    }
     if (t.dataset.ov === "cutaway") { const o = T.ovs.find((x) => x.id === T.osel); if (o) { o.cutaway = t.checked; saveOverlays(); } return; }
     try {
       if (t.id === "st-title") { k.title = t.value; $("#st-name").textContent = t.value; await patch({ title: t.value }); }
@@ -2081,6 +3168,7 @@ function Studio(cid) {
   // ----- light polling: only while a tracking job or a render is in flight -----
   this.refresh = async () => {
     if (!c() || T.dead) return;
+    if (angs().some((a) => a.status === "importing" || a.status === "syncing")) await reloadAngles();
     if (T.job && !DONE.includes(T.job.status)) {
       const r = await api(`/api/clips/${cid}/track`);
       T.job = r.job || { status: "done" };
@@ -2105,26 +3193,53 @@ function Studio(cid) {
 // Pipeline — every video from harvest to posted
 // ======================================================================
 function Pipeline() {
-  let data = null, q = "", sig = "";
+  let data = null, q = "", sig = "", showExp = false;
+  const sel = new Set(), this_ = this; // sel: "type:id" of the ticked cards
   this.every = 5000;
   const href = (u) => (/^#\/[\w\/-]*$/.test(u || "") ? u : null); // edit links stay inside the app
   const img = (u) => (/^(\/(?!\/)|https?:\/\/)/.test(u || "") ? u : null);
+  const key = (it) => `${it.type}:${it.id}`;
+  const all = () => (data?.stages || []).flatMap((st) => st.items || []);
   this.mount = async () => {
     view.innerHTML = `<div class="page"><div class="row wrap" style="align-items:flex-end"><div class="grow"><h1>Pipeline</h1>
         <p class="sub" style="margin:0">Every video from harvest to posted. Posted videos are locked — make a new version to change one.</p></div>
-        <input type="text" id="pl-q" placeholder="Filter by title" style="max-width:260px"></div><div id="pl-body" style="margin-top:18px"></div></div>`;
+        <label class="row" style="gap:6px;font-size:12.5px" title="Clips and long forms the space saver removed (their posts and history are kept)"><input type="checkbox" id="pl-exp"> Show expired</label>
+        <input type="text" id="pl-q" placeholder="Filter by title" style="max-width:260px"></div>
+        <div id="pl-bulk" class="pl-bulk" hidden></div><div id="pl-body" style="margin-top:18px"></div></div>`;
     $("#pl-q").oninput = (e) => { q = e.target.value.trim().toLowerCase(); render(); };
+    $("#pl-exp").onchange = (e) => { showExp = e.target.checked; this.refresh(); };
+    view.onchange = (e) => {
+      const cb = e.target.closest("[data-sel]");
+      if (!cb) return;
+      cb.checked ? sel.add(cb.dataset.sel) : sel.delete(cb.dataset.sel);
+      cb.closest(".pl-card")?.classList.toggle("sel", cb.checked);
+      renderBulk();
+    };
+    view.onkeydown = (e) => { // Delete on a focused card (not while typing in the filter)
+      const c = e.target.closest?.(".pl-card[data-key]");
+      if (e.key !== "Delete" || !c || e.target.matches("input[type=text], textarea")) return;
+      e.preventDefault();
+      const it = all().find((x) => key(x) === c.dataset.key);
+      if (it) del([it]);
+    };
     view.onclick = async (e) => {
+      const kb = e.target.closest("[data-keep]");
+      if (kb) { await toggleKeep(kb); sig = ""; return this_.refresh(); }
+      if (e.target.closest("[data-bulk-del]")) return del(all().filter((it) => sel.has(key(it))));
+      if (e.target.closest("[data-bulk-clear]")) { sel.clear(); return render(); }
+      const d = e.target.closest("[data-del]");
+      if (d) { const it = all().find((x) => key(x) === d.dataset.del); return it && del([it]); }
       const b = e.target.closest("[data-ver]");
       if (!b) return;
       b.disabled = true;
-      try { const nc = await api(`/api/clips/${b.dataset.ver}/version`, { method: "POST" }); location.hash = `#/studio/${nc.id || nc.clip?.id}`; }
+      const lf = b.dataset.vtype === "longform";
+      try { const nc = await api(`/api/${lf ? "longform" : "clips"}/${encodeURIComponent(b.dataset.ver)}/version`, { method: "POST" }); location.hash = `#/${lf ? "long" : "studio"}/${nc.id || nc.clip?.id}`; }
       catch (err) { fail(err); b.disabled = false; }
     };
     await this.refresh();
   };
   this.refresh = async () => {
-    try { data = await api("/api/pipeline"); } catch (e) { data = { error: e.status === 404 ? "" : e.message }; }
+    try { data = await api(`/api/pipeline${showExp ? "?expired=1" : ""}`); } catch (e) { data = { error: e.status === 404 ? "" : e.message }; }
     const next = JSON.stringify(data);
     if (next !== sig) { sig = next; render(); }
   };
@@ -2133,12 +3248,18 @@ function Pipeline() {
     const posts = (it.posts || []).map((p) => /^https?:\/\//.test(p.url || "")
       ? `<a class="pl-link" href="${esc(p.url)}" target="_blank" rel="noopener">${esc(PLATFORM[p.platform] || p.platform)} ↗</a>`
       : `<span class="dim">${esc(PLATFORM[p.platform] || p.platform)}${p.publish_at ? ` · public ${esc(when(p.publish_at))}` : ""}</span>`).join("");
-    return `<div class="pl-card">${th ? `<img src="${esc(th)}" alt="" loading="lazy">` : `<div class="pl-ph">▶</div>`}
+    const k = key(it), on = sel.has(k);
+    return `<div class="pl-card${on ? " sel" : ""}" tabindex="0" data-key="${esc(k)}" aria-label="${esc(it.title || "Untitled")} (press Delete to delete)">
+      <div class="pl-top"><label class="pl-check" title="Select"><input type="checkbox" data-sel="${esc(k)}" ${on ? "checked" : ""} aria-label="Select ${esc(it.title || "Untitled")}"></label>
+        <button class="btn xs ghost danger" data-del="${esc(k)}" title="Delete" aria-label="Delete ${esc(it.title || "Untitled")}">🗑</button></div>
+      ${th ? `<img src="${esc(th)}" alt="" loading="lazy">` : `<div class="pl-ph">▶</div>`}
       <div class="pl-t" title="${esc(it.title)}">${esc(it.title || "Untitled")}</div>
-      <div class="pl-meta">${it.duration ? `<span>${fmt(+it.duration, 0)}</span>` : ""}${it.aspect ? `<span class="chip">${esc(it.aspect)}</span>` : ""}${it.type ? `<span>${esc(it.type)}</span>` : ""}</div>
+      <div class="pl-meta">${it.duration ? `<span>${fmt(+it.duration, 0)}</span>` : ""}${it.aspect ? `<span class="chip">${esc(it.aspect)}</span>` : ""}${it.type === "longform" ? `<span class="chip lf-badge" title="A long-form edit: captured → edited → rendered → uploaded">Long form · ${esc(it.lf_stage || "")}</span>` : it.type ? `<span>${esc(it.type)}</span>` : ""}</div>
+      <div class="pl-meta">${it.expired ? `<span class="chip" title="${esc(it.expired.archive ? `Archived to ${it.expired.archive}` : "Removed by the space saver")}">Expired</span>${keepBtn(it.type, it.id, false, "↺ Restore")}`
+        : `${keepBtn(it.type || "clip", it.id, it.keep)}${dueChip(it.due, it.type === "project")}`}</div>
       ${(it.pending || []).length ? `<div class="chips">${it.pending.map((p) => `<span class="chip">${esc(PLATFORM[p.platform] || p.platform)} · ${esc(p.status)}${p.when ? ` · ${esc(when(p.when))}` : ""}</span>`).join("")}</div>` : ""}
       ${uploaded ? `<div class="stack" style="gap:4px">${posts}<span class="dim" style="font-size:11.5px">🔒 Posted — locked</span>
-          ${!it.type || it.type === "clip" ? `<button class="btn xs" data-ver="${esc(it.id)}">Make a new version</button>` : ""}</div>`
+          ${!it.type || it.type === "clip" || it.type === "longform" ? `<button class="btn xs" data-ver="${esc(it.id)}" data-vtype="${esc(it.type || "clip")}">Make a new version</button>` : ""}</div>`
         : edit ? `<a class="btn xs" href="${esc(edit)}">Edit</a>` : ""}</div>`;
   }
   function render() {
@@ -2146,11 +3267,64 @@ function Pipeline() {
     if (!el) return;
     if (!data || data.error !== undefined) { el.innerHTML = `<div class="card empty"><b>The pipeline view isn't available yet</b>${esc(data?.error || "It appears once the server supports it.")}</div>`; return; }
     const match = (it) => !q || String(it.title || "").toLowerCase().includes(q);
+    const focused = document.activeElement?.closest?.(".pl-card")?.dataset.key;
     el.innerHTML = `<div class="pl-board">${(data.stages || []).map((st) => {
       const items = (st.items || []).filter(match), up = st.key === "uploaded";
       return `<div class="pl-col"><h3><span>${esc(st.label || st.key)}</span><span class="chip">${items.length}${q ? ` / ${(st.items || []).length}` : ""}</span></h3>
         ${items.map((it) => card(it, up)).join("") || `<div class="dim" style="font-size:12px;padding:8px 2px">Nothing here${q ? " matches" : ""}.</div>`}</div>`;
     }).join("")}</div>`;
+    const keys = new Set(all().map(key));
+    [...sel].forEach((k) => keys.has(k) || sel.delete(k)); // gone from the board: no longer selected
+    if (focused) $(`.pl-card[data-key="${CSS.escape(focused)}"]`, el)?.focus(); // a refresh keeps keyboard focus
+    renderBulk();
+  }
+  function renderBulk() {
+    const bar = $("#pl-bulk");
+    if (!bar) return;
+    bar.hidden = !sel.size;
+    bar.innerHTML = `<b>${sel.size} selected</b> · <button class="btn sm danger" data-bulk-del>Delete</button><button class="btn sm ghost" data-bulk-clear>Clear</button>`;
+  }
+  function describe(it) {
+    const t = `<b>${esc(it.title || "Untitled")}</b>`, name = (p) => esc(PLATFORM[p] || p);
+    if (it.type === "project") return { ok: true, html: `${t}: the project, its files and all its clips.` };
+    const busy = (it.pending || []).filter((p) => p.status === "uploading");
+    if (busy.length) return { ok: false, html: `${t}: can't be deleted now, it is uploading to ${busy.map((p) => name(p.platform)).join(", ")}. Wait for it to finish or let it fail.` };
+    const n = (it.pending || []).length, posts = it.posts || [];
+    const lines = posts.map((p) => p.platform === "youtube"
+      ? `<label class="switch"><input type="checkbox" data-remote="${esc(p.upload_id)}"> Also delete the video from YouTube${p.account ? ` (${esc(p.account)})` : ""}</label>`
+      : `<div class="dim">${name(p.platform)} doesn't let apps delete posts: ${/^https?:\/\//.test(p.url || "") ? `<a class="pl-link" href="${esc(p.url)}" target="_blank" rel="noopener">open the post ↗</a> and ` : ""}remove it in the app.</div>`);
+    return { ok: true, html: `${t}: the ${it.type === "longform" ? "long-form edit" : "clip"} and its rendered files.${n ? ` Its ${n} pending post${n > 1 ? "s" : ""} will be canceled first.` : ""}${posts.length
+      ? ` It is removed from Reelwright only; the post${posts.length > 1 ? "s stay" : " stays"} online unless you tick below.<div class="stack" style="gap:4px;margin-top:6px">${lines.join("")}</div>` : ""}` };
+  }
+  function del(items) {
+    if (!items.length) return;
+    const rows = items.map((it) => ({ it, ...describe(it) })), go = rows.filter((r) => r.ok);
+    modal(`<h2>Delete ${items.length === 1 ? "this" : `${items.length} items`}?</h2><p class="muted">This can't be undone. What happens:</p>
+      <div class="stack pl-del-list">${rows.map((r) => `<div class="pl-del${r.ok ? "" : " no"}">${r.html}</div>`).join("")}</div>
+      <div class="foot"><button class="btn" data-close>Cancel</button>${go.length ? `<button class="btn primary danger" id="pl-del-ok">Delete${go.length < items.length ? ` ${go.length}` : ""}</button>` : ""}</div>`,
+    (m, close) => { const ok = $("#pl-del-ok", m); if (ok) ok.onclick = () => {
+      const remote = Object.fromEntries($$("[data-remote]", m).filter((c) => c.checked).map((c) => [c.dataset.remote, true]));
+      close(); send(go.map((r) => r.it), remote);
+    }; }, true);
+  }
+  async function send(items, remote) {
+    const gone = new Set(items.map(key));
+    data.stages.forEach((st) => (st.items = (st.items || []).filter((it) => !gone.has(key(it))))); // optimistic
+    gone.forEach((k) => sel.delete(k));
+    render();
+    let res;
+    try { res = (await api("/api/pipeline/delete", { body: { items: items.map((it) => ({ type: it.type, id: it.id })), options: { remote } } })).results; }
+    catch (e) { fail(e); sig = ""; return this_.refresh(); }
+    const bad = res.filter((r) => !r.ok), remoteBad = res.flatMap((r) => r.remote || []).filter((x) => !x.ok);
+    const yt = res.flatMap((r) => r.remote || []).filter((x) => x.ok).length, canceled = res.reduce((s, r) => s + (r.canceled || 0), 0);
+    const title = (r) => esc(items.find((it) => it.type === r.type && it.id === r.id)?.title || r.id);
+    if (!bad.length && !remoteBad.length) toast(`Deleted ${res.length}${canceled ? ` · ${canceled} pending post${canceled > 1 ? "s" : ""} canceled` : ""}${yt ? ` · ${yt} removed from YouTube` : ""}`, "ok");
+    else modal(`<h2>Deleted ${res.length - bad.length} of ${res.length}</h2><div class="stack pl-del-list">
+        ${bad.map((r) => `<div class="pl-del no"><b>${title(r)}</b> wasn't deleted: ${esc(r.error)}</div>`).join("")}
+        ${remoteBad.map((x) => `<div class="pl-del${x.manual ? "" : " no"}">${esc(PLATFORM[x.platform] || x.platform)}: ${esc(x.error)}${/^https?:\/\//.test(x.url || "") ? ` <a class="pl-link" href="${esc(x.url)}" target="_blank" rel="noopener">Open the post ↗</a>` : ""}</div>`).join("")}
+        ${yt ? `<div class="pl-del">${yt} video${yt > 1 ? "s" : ""} deleted from YouTube.</div>` : ""}</div><div class="foot"><button class="btn primary" data-close>OK</button></div>`);
+    sig = "";
+    this_.refresh();
   }
 }
 
@@ -2305,8 +3479,9 @@ function Obs() {
         <button class="btn sm primary" data-oact="save_replay" data-id="${c.id}" title="Save the last seconds of OBS's replay buffer as a clip">✂ Clip that</button>
         <button class="btn sm" data-oact="start_replay" data-id="${c.id}">Start replay buffer</button><button class="btn sm" data-oact="stop_replay" data-id="${c.id}">Stop replay buffer</button>
         <button class="btn sm" data-oact="start_record" data-id="${c.id}">● Record</button><button class="btn sm" data-oact="stop_record" data-id="${c.id}">■ Stop</button>
+        <button class="btn sm" data-oact="mark" data-id="${c.id}" title="Mark this moment in the running recording: the analysis looks there first (needs “Import finished recordings”)">⚑ Mark</button>
         <button class="btn sm" data-otest="${c.id}">Test</button></div>
-      <div class="dim" style="font-size:12px;margin-top:8px">${c.imported || 0} clips imported${c.last_at ? ` · last ${when(c.last_at)}: ${esc((c.last_file || "").split(/[\\/]/).pop())}` : ""} · ${c.import_replays !== false ? "replays" : ""}${c.import_recordings ? " + recordings" : ""}${c.autopilot?.enabled ? " · Autopilot" : ""}</div>
+      <div class="dim" style="font-size:12px;margin-top:8px">${c.imported || 0} clips imported${c.last_at ? ` · last ${when(c.last_at)}: ${esc((c.last_file || "").split(/[\\/]/).pop())}` : ""} · ${c.import_replays !== false ? "replays" : ""}${c.import_recordings ? " + recordings" : ""}${c.autopilot?.enabled ? " · Autopilot" : ""}${c.recording ? ` · <b style="color:var(--err)">● recording</b>, ${+c.recording.marks} mark(s)` : ""}</div>
       <div id="otest-${c.id}" style="font-size:12.5px;margin-top:6px"></div></div>`).join("")
       : `<div class="empty card"><b>No OBS connected yet</b>Add OBS on the left, or turn on “Receive clips from other PCs” and run the relay there.</div>`;
   };
@@ -2322,6 +3497,12 @@ function Obs() {
         const id = t.dataset.id || t.dataset.otest, out = $(`#otest-${id}`);
         t.disabled = true;
         try {
+          if (t.dataset.oact === "mark") {
+            const r = await api(`/api/obs/${id}/action`, { body: { action: "mark" } });
+            const m = r.marks[0];
+            toast(m ? `Marked at ${fmt(m.t)}${m.imports ? "" : " — turn on “Import finished recordings” for this OBS to use it"}.` : "That moment is before the recording started.", m?.imports ? "ok" : "info");
+            sig = ""; return this.refresh();
+          }
           const r = t.dataset.oact ? await api(`/api/obs/${id}/action`, { body: { action: t.dataset.oact } }) : await api(`/api/obs/${id}/test`, { method: "POST" });
           out.innerHTML = `<span class="pill ok">OBS ${esc(r.obs_version)}</span> replay buffer ${r.replay_buffer == null ? "not enabled in OBS" : r.replay_buffer ? "running" : "stopped"} · recording ${r.recording ? "on" : "off"}${r.record_dir ? ` · saves to <span class="mono">${esc(r.record_dir)}</span>` : ""}`;
           if (t.dataset.oact === "save_replay") toast("Clip saved in OBS — it'll appear in your Library shortly.", "ok");
@@ -2352,8 +3533,8 @@ function Lab() {
             <label class="field">Notes about your audience &amp; style<textarea id="pnotes" rows="2" placeholder="Fast-paced, hype moments, clean captions…"></textarea></label>
             <button class="btn">Create profile</button></form></div>
       </div>
-      <div class="stack"><div class="card" id="learned"></div><div id="profiles" class="stack"></div><div class="card" style="overflow-x:auto"><h2>Reports</h2><div id="reports"></div></div></div></div></div>`;
-    loadLearned();
+      <div class="stack"><div class="card" id="learned"></div><div class="card" id="works"></div><div class="card" id="evals" style="overflow-x:auto"></div><div id="profiles" class="stack"></div><div class="card" style="overflow-x:auto"><h2>Reports</h2><div id="reports"></div></div></div></div></div>`;
+    loadLearned(); loadWorks(); loadEvals();
     const projects = await api("/api/projects");
     $("#lp").innerHTML = projects.filter((p) => p.status === "ready").map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join("") || "<option value='' disabled selected>No analyzed projects yet</option>";
     $("#lgo").onclick = async () => {
@@ -2362,6 +3543,7 @@ function Lab() {
       catch (e) { fail(e); }
     };
     view.onchange = async (e) => {
+      if (e.target.closest("[data-wset]")) return saveWorks();
       const f = e.target.closest("[data-limport]");
       if (!f?.files?.[0]) return;
       const fd = new FormData();
@@ -2451,6 +3633,67 @@ function Lab() {
       sig = ""; this.refresh();
     } catch (err) { fail(err); }
   };
+  // "What works for you": taste per platform/account, experiments, retention; "Evals": the saved eval baselines
+  const WDIM = { hook: "Hook", length: "Length", slot: "Posting time" };
+  const WOPT = { question: "question", statement: "statement", short: "up to target length", long: "over target length", morning: "morning", afternoon: "afternoon", evening: "evening", night: "night" };
+  const saveWorks = async () => {
+    const on = (k) => !!$(`[data-wset="${k}"]`)?.checked;
+    const experiments = { enabled: on("exp") };
+    for (const dim of Object.keys(WDIM)) experiments[dim] = $$(`[data-wexp="${dim}"]`).filter((x) => x.checked).map((x) => x.value);
+    try {
+      S.settings = await api("/api/settings", { method: "PUT", body: { context_guard: on("guard"), context_cards: on("cards") ? "auto" : "off", tiktok_metrics: on("ttm"), experiments } });
+      toast("Saved.", "ok");
+    } catch (err) { fail(err); }
+  };
+  const curveSvg = (r) => {
+    const pts = r.curve || [], W = 220, H = 56, maxS = Math.max(1, ...pts.map((q) => +q[0]));
+    const xy = (sec, v) => `${((+sec / maxS) * W).toFixed(1)},${(H - 2 - (Math.min(+v, 1.2) / 1.2) * (H - 4)).toFixed(1)}`;
+    const dx = r.drop_s != null ? ((+r.drop_s / maxS) * W).toFixed(1) : null;
+    const drop = dx != null ? `<line x1="${dx}" x2="${dx}" y1="0" y2="${H}" stroke="var(--err)" stroke-dasharray="3 3"/>` : "";
+    return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Share of viewers still watching over the clip" style="flex:none;background:var(--panel-2);border-radius:4px">${drop}<polyline fill="none" stroke="var(--ok)" stroke-width="2" points="${pts.map((q) => xy(q[0], q[1])).join(" ")}"/></svg>`;
+  };
+  const loadWorks = async () => {
+    const box = $("#works");
+    if (!box) return;
+    let W;
+    try { W = await api("/api/learn/insights"); } catch (e) { box.innerHTML = `<div class="dim">${esc(e.message)}</div>`; return; }
+    const top = (m) => Object.entries(m.weights || {}).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1])).slice(0, 3).map(([k, v]) => `<span class="chip" style="font-size:11.5px">${v >= 0 ? "↑" : "↓"} ${esc(FEAT[k] || k)}</span>`).join("");
+    const row = (label, m, n) => `<tr><td>${label}</td><td class="dim">${+n || 0}</td><td>${m ? (m.useful ? '<span class="pill ok">Active</span>' : '<span class="pill warn">Learning</span>') + (m.shrunk ? ' <span class="dim" style="font-size:11px" title="Few lessons of its own yet: pulled toward your overall taste">≈ overall</span>' : "") : '<span class="dim">needs ~12 lessons</span>'}</td><td>${m ? top(m) : ""}</td></tr>`;
+    const ex = W.experiments.settings || {}, st = W.settings || {};
+    const sw = (k, on, label, tip) => `<label class="switch" title="${esc(tip)}"><input type="checkbox" data-wset="${k}" ${on ? "checked" : ""}> ${label}</label>`;
+    const scopes = [row("Overall", W.global, W.global?.n), ...Object.entries(W.platforms).map(([pl, m]) => row(platTag(pl), m, m?.n)),
+      ...W.accounts.map((a) => row(`${platTag(a.platform)} ${esc(a.name || "")}`, a.model, a.lessons))];
+    const dims = Object.entries(W.experiments.dims).map(([dim, vals]) => `<div class="row wrap" style="font-size:12.5px;gap:10px"><span class="muted" style="width:96px">${WDIM[dim] || esc(dim)}</span>${vals.map((v) => `<label class="switch"><input type="checkbox" data-wset="x" data-wexp="${dim}" value="${esc(v)}" ${(ex[dim] || []).includes(v) ? "checked" : ""}> ${WOPT[v] || esc(v)}</label>`).join("")}</div>`).join("");
+    const results = W.experiments.accounts.map((a) => `<div style="font-size:12.5px">${platTag(a.platform)} <b>${esc(a.name || "")}</b> ${Object.entries(a.stats).map(([dim, o]) => `<span class="muted">${WDIM[dim] || esc(dim)}:</span> ${Object.entries(o).map(([v, [w, l]]) => `${WOPT[v] || esc(v)} <b>${+w}</b> won · ${+l} lost`).join(", ")}`).join(" · ")}</div>`).join("");
+    const retInfo = (r) => (r.available ? `${Math.round(+r.hold_3s * 100)}% still watching at 3 s${r.drop_s != null ? ` · biggest drop at ${+r.drop_s}s` : ""}${(r.trim || [])[0] || (r.trim || [])[1] ? ` · suggests start ${+r.trim[0] >= 0 ? "+" : ""}${+r.trim[0]}s, end ${+r.trim[1]}s` : ""}` : esc(r.reason || ""));
+    const retention = (W.retention || []).map((r) => `<div class="row" style="gap:10px;font-size:12px;margin-top:6px">${r.available ? curveSvg(r) : ""}<div class="grow"><b>${esc(r.title)}</b> ${platTag(r.platform)}<div class="dim">${retInfo(r)}</div></div></div>`).join("");
+    box.innerHTML = `<h2 style="margin:0">What works for you</h2>
+      <p class="muted" style="font-size:12.5px;margin:6px 0 10px">Learned from real results: each post's views against <i>that account's</i> usual for posts of the same age (${+W.with_lift} lessons so far), plus where viewers stop watching.</p>
+      ${Object.entries(W.notes || {}).map(([aid, msg]) => `<div style="color:var(--warn);font-size:12.5px;margin-bottom:6px">⚠ ${esc(W.account_names[aid] || aid)}: ${esc(msg)}</div>`).join("")}
+      <div class="row wrap" style="gap:14px;font-size:12.5px">${sw("guard", st.context_guard !== false, "Start picks at their setup", "A pick that opens mid-story (he…, and then…) is extended back to the sentence that sets it up, when it fits the max length")}
+        ${sw("cards", st.context_cards !== "off", "“Earlier: …” card when it doesn't fit", "One small AI call writes a 2-second line shown as the clip's headline (never replaces your own headline)")}
+        ${sw("ttm", !!st.tiktok_metrics, "Ask TikTok for view counts", "Requests TikTok's video.list permission when you (re)connect: add the Display API to your TikTok app first, then Reconnect")}</div>
+      <h3 style="margin-top:12px">Taste by platform and account</h3>
+      <table><thead><tr><th></th><th>Lessons</th><th>Model</th><th>Favours</th></tr></thead><tbody>${scopes.join("")}</tbody></table>
+      <h3 style="margin-top:12px">Autopilot experiments</h3>
+      <div class="stack" style="gap:6px">${sw("exp", ex.enabled, "Let Autopilot test what works on each account", "Thompson sampling: tries the options you tick below, then favours what wins (beats that account's usual). At most a quarter of posts explore.")}
+        ${dims}<div class="dim" style="font-size:11.5px">Tick 2+ options to test a dimension. Posting time is only tested when Autopilot picks the best times.</div>
+        ${results || `<div class="dim" style="font-size:12.5px">No experiment results yet.</div>`}</div>
+      <h3 style="margin-top:12px">Where viewers stop watching</h3>
+      ${retention || `<div class="dim" style="font-size:12.5px">YouTube posts get a retention curve once they are a week old (needs the yt-analytics.readonly permission: Reconnect on the Publish page).</div>`}`;
+  };
+  const loadEvals = async () => {
+    const box = $("#evals");
+    if (!box) return;
+    let E;
+    try { E = await api("/api/learn/evals"); } catch (e) { box.innerHTML = `<div class="dim">${esc(e.message)}</div>`; return; }
+    const M = { precision_at_k: "Precision@k", iou: "Overlap (IoU)", complete: "Setup + payoff", bad_rate: "Bad picks ↓" };
+    const pct = (v) => (v == null ? "—" : `${Math.round(+v * 100)}%`);
+    const table = (b, label) => (b ? `<h3>${label} <span class="dim" style="font-weight:400;font-size:12px">· ${when(b.at)} · ${(b.cases || []).length} cases${b.guard === false ? " · setup guard off" : ""}</span></h3>
+      <table><thead><tr><th>Finder</th>${Object.values(M).map((m) => `<th>${m}</th>`).join("")}</tr></thead><tbody>${Object.entries(b.finders || {}).map(([f, r]) => `<tr><td>${esc(f)}</td>${Object.keys(M).map((k) => `<td>${pct(r.summary?.[k])}</td>`).join("")}</tr>`).join("")}</tbody></table>` : "");
+    box.innerHTML = `<h2 style="margin:0">Evals</h2><p class="muted" style="font-size:12.5px;margin:6px 0 10px">Golden-set checks of clip finding: hand-made transcripts with the moments a creator would post and ones they wouldn't. After changing prompts, models or the finder run <code>python scripts/eval.py</code> (offline, free); <code>--save</code> updates the baseline, <code>--live</code> tests your AI settings and asks before spending.</p>
+      ${table(E.baseline, "Offline baseline")}${table(E.baseline_live, "Live baseline")}${!E.baseline && !E.baseline_live ? `<div class="dim" style="font-size:12.5px">No baseline saved yet.</div>` : ""}`;
+  };
   const FEAT = { length: "length", ai: "AI score", wps: "speech pace", loud: "loudness", spikes: "energy spikes", cuts: "scene cuts", chat: "chat activity", pos: "later in video", question: "question hook", lead: "slow start" };
   const loadLearned = async () => {
     const box = $("#learned");
@@ -2528,10 +3771,10 @@ function Publish() {
     upcoming.forEach((u) => { const d = new Date(at(u)).toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" }); (days[d] ||= []).push(u); });
     $("#upcoming").innerHTML = upcoming.length ? Object.entries(days).map(([d, us]) => `<div class="day"><h3>${d}</h3>${us.map((u) => `
       <div class="slot"><span class="when">${new Date(at(u)).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</span>${platTag(u.platform)}
-      <span class="grow" style="font-size:13px">${esc(u.title)}</span><span class="dim" style="font-size:11px">${u.publish_at ? "goes live" : "posts"}</span></div>`).join("")}</div>`).join("")
+      <span class="grow" style="font-size:13px">${esc(u.title)}${u.account ? ` <span class="dim">· ${esc(u.account)}</span>` : ""}</span><span class="dim" style="font-size:11px">${u.publish_at ? "goes live" : "posts"}</span></div>`).join("")}</div>`).join("")
       : `<div class="empty" style="padding:24px"><b>Nothing scheduled</b>Schedule from a clip's Publish button, or turn on Autopilot.</div>`;
     $("#queue").innerHTML = ups.length ? `<table><thead><tr><th>Post</th><th>Status</th><th>Schedule</th><th></th></tr></thead><tbody>${ups.map((u) => `
-      <tr><td>${platTag(u.platform)} <b>${esc(u.title)}</b><div class="dim mono">${u.clip ? `${fmt(u.clip.start)} → ${fmt(u.clip.end)}` : "clip deleted"} · ${esc(u.privacy)}</div></td>
+      <tr><td>${platTag(u.platform)} <b>${esc(u.title)}</b>${u.account ? ` <span class="dim" style="font-size:12px">→ ${esc(u.account)}</span>` : ""}<div class="dim mono">${u.clip ? `${fmt(u.clip.start)} → ${fmt(u.clip.end)}` : "clip deleted"} · ${esc(u.privacy)}</div></td>
       <td style="min-width:150px">${pill(UPLOAD_STATUS, u.status)}${u.status === "uploading" ? `<div style="margin-top:6px">${bar(u.progress)}</div>` : ""}${u.error ? `<div style="color:var(--err);font-size:11.5px;margin-top:4px">${esc(u.error).slice(0, 180)}</div>` : ""}</td>
       <td style="font-size:12.5px">${u.publish_at ? `Live ${when(u.publish_at)}` : u.upload_at ? `Posts ${when(u.upload_at)}` : "Immediately"}</td>
       <td style="text-align:right;white-space:nowrap">${/^https:\/\//.test(u.url || "") ? `<a class="btn xs" href="${esc(u.url)}" target="_blank">Open ↗</a> ` : ""}
@@ -2539,48 +3782,128 @@ function Publish() {
         ${u.status !== "uploading" ? `<button class="btn xs ghost" data-cancel="${u.id}" title="${u.status === "done" ? "Remove from list" : "Cancel"}">✕</button>` : ""}</td></tr>`).join("")}</tbody></table>`
       : `<div class="empty"><b>Nothing posted yet</b>Open a clip in the editor and press Publish.</div>`;
   };
+  // Each platform card lists its linked accounts (each with its own sign-in and its own "okay"), plus "+ Add another account".
+  let adding = "", igTarget = ""; // Instagram's token form: open to add an account / the account being reconnected
+  const HINT = {
+    youtube: "Google asks which account to use: to add another channel, pick a different Google account (or Brand Account) in its chooser. If it signs straight in, sign out of Google in your browser first.",
+    tiktok: "TikTok signs in whoever is logged in on tiktok.com in your browser: to add a different account, log out (or switch accounts) on tiktok.com first, then click Add.",
+    instagram: "Each Instagram account needs its own access token: generate one for the other account. With a Facebook Login token, Reelwright picks the next linked Instagram account not added yet (type its account ID to choose one).",
+  };
   function renderConns(c) {
     const yt = c.youtube, tt = c.tiktok, ig = c.instagram;
     const safeImg = (u) => (/^https:\/\//.test(u || "") ? `<img src="${esc(u)}" alt="">` : "");
-    const head = (p, ok, name, avatar, extra = "") => `<div class="row" style="margin-bottom:10px">${platTag(p)}<span class="grow"></span>${ok ? `<span class="pill ok">Connected</span>` : `<span class="pill warn">Not connected</span>`}</div>
-      ${ok ? `<div class="chan">${safeImg(avatar)}<div class="grow"><b>${esc(name || "Connected")}</b><div class="muted" style="font-size:12px">${esc(extra)}</div></div><button class="btn sm ghost" data-disc="${p}">Disconnect</button></div>` : ""}`;
-    const ytBody = yt.connected ? (yt.needs_reconnect ? `<p style="color:var(--warn);font-size:12.5px;margin:0 0 8px">Reelwright needs one more YouTube permission (to move videos that are already scheduled). Disconnect, then <b>Sign in with Google</b> again and approve it. Uploads keep working meanwhile.${yt.missing_scopes?.length ? `<br><span class="dim mono" style="font-size:11px">Missing: ${yt.missing_scopes.map(esc).join(", ")}</span>` : ""}</p>` : "") : !yt.has_secret ? `<ol class="steps"><li>In <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank">Google Cloud</a>, enable <b>YouTube Data API v3</b>.</li>
+    const accs = (p) => c[p].accounts || [];
+    const row = (p, a) => `<div class="chan" style="margin-bottom:12px;align-items:flex-start">${safeImg(a.avatar)}<div class="grow"><b>${esc(a.name || a.handle || "Account")}</b>
+        <div class="muted" style="font-size:12px">${esc([a.handle && a.handle !== a.name ? a.handle : "", a.subscribers != null ? `${num(a.subscribers)} subscribers` : "", a.followers != null ? `${num(a.followers)} followers` : ""].filter(Boolean).join(" · "))}</div>
+        ${a.connected ? "" : `<div style="color:var(--warn);font-size:12px">${a.locked ? "This sign-in was saved on another PC or Windows user, so it can't be read here: Reconnect to keep posting here." : "Signed out: Reconnect to keep posting here."}</div>`}
+        <details style="margin-top:6px"><summary class="dim" style="font-size:12px">Description template ${a.description_template != null ? "(own)" : "(default)"}</summary>
+          <textarea rows="2" data-tplacc="${esc(a.id)}" placeholder="Empty = use the default template below">${esc(a.description_template ?? "")}</textarea>
+          <button class="btn xs" data-tplsave="${esc(a.id)}">Save</button></details>
+        ${a.needs_reconnect ? `<div style="color:var(--warn);font-size:12px">Needs one more YouTube permission (to move videos that are already scheduled): Reconnect and approve it. Uploads keep working meanwhile.${a.missing_scopes?.length ? `<br><span class="dim mono" style="font-size:11px">Missing: ${a.missing_scopes.map(esc).join(", ")}</span>` : ""}</div>` : ""}
+        ${a.error ? `<div style="color:var(--err);font-size:12px">${esc(a.error)}</div>` : ""}
+        <div class="row wrap" style="gap:14px;margin-top:6px">
+          <label class="switch" title="Nothing is posted to an account until you okay it here"><input type="checkbox" data-appr="${esc(a.id)}" ${a.approved ? "checked" : ""}> Approved for uploads</label>
+          <label class="switch" ${a.approved ? 'title="Autopilot only posts to accounts with both switches on"' : 'style="opacity:.45" title="Approve the account for uploads first"'}><input type="checkbox" data-apauto="${esc(a.id)}" ${a.autopilot && a.approved ? "checked" : ""} ${a.approved ? "" : "disabled"}> Allow Autopilot to post here</label></div></div>
+        <div class="stack" style="gap:6px"><button class="btn sm ghost" data-recon="${esc(a.id)}" data-plat="${p}">Reconnect</button><button class="btn sm ghost" data-rm="${esc(a.id)}">Remove</button></div></div>`;
+    const head = (p) => {
+      const n = accs(p).length, waiting = accs(p).filter((a) => !a.approved).length;
+      return `<div class="row" style="margin-bottom:10px">${platTag(p)}<span class="grow"></span>${waiting ? `<span class="pill warn">${waiting} awaiting approval</span>` : ""}${n ? `<span class="pill ok">${n} linked</span>` : `<span class="pill warn">Not connected</span>`}</div>${accs(p).map((a) => row(p, a)).join("")}`;
+    };
+    const addBtn = (p, first, dis = "") => `<button class="btn ${accs(p).length ? "" : "primary"} sm" data-add="${p}" ${dis}>${accs(p).length ? "+ Add another account" : first}</button>`;
+    const hint = (p) => (accs(p).length ? `<p class="dim" style="font-size:11.5px;margin:8px 0 0">${HINT[p]} A new account isn't used until you turn on <b>Approved for uploads</b>.</p>` : "");
+    const ytBody = !yt.has_secret ? `<ol class="steps"><li>In <a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank">Google Cloud</a>, enable <b>YouTube Data API v3</b>.</li>
         <li>Configure the OAuth consent screen and add yourself as a test user.</li><li>Create an OAuth client of type <b>Desktop app</b>, download the JSON, and upload it:</li></ol>
         <div style="margin-top:10px"><input type="file" id="secret" accept=".json" hidden><button class="btn primary sm" data-yt="pick">Upload client JSON</button></div>`
-      : `<div class="row wrap"><button class="btn primary sm" data-yt="connect" ${yt.connecting ? "disabled" : ""}>${yt.connecting ? '<span class="spin"></span> Waiting for Google…' : "Sign in with Google"}</button>
-        <button class="btn ghost sm" data-yt="pick">Replace client JSON</button><input type="file" id="secret" accept=".json" hidden></div>`;
-    const ttBody = tt.connected ? "" : `<p class="muted" style="font-size:12.5px;margin:0 0 8px">Create an app at <a href="https://developers.tiktok.com/apps" target="_blank">TikTok for Developers</a> with Login Kit + Content Posting API (scopes <code>user.info.basic</code>, <code>video.publish</code>). Add this redirect URI:</p>
+      : `<div class="row wrap">${yt.connecting ? `<button class="btn sm" disabled><span class="spin"></span> Waiting for Google…</button>` : addBtn("youtube", "Sign in with Google")}
+        <button class="btn ghost sm" data-yt="pick">Replace client JSON</button><input type="file" id="secret" accept=".json" hidden></div>${hint("youtube")}`;
+    const ttBody = accs("tiktok").length && tt.has_app ? `<div class="row wrap">${addBtn("tiktok")}</div>${hint("tiktok")}`
+      : `<p class="muted" style="font-size:12.5px;margin:0 0 8px">Create an app at <a href="https://developers.tiktok.com/apps" target="_blank">TikTok for Developers</a> with Login Kit + Content Posting API (scopes <code>user.info.basic</code>, <code>video.publish</code>). Add this redirect URI:</p>
         <div class="mono" style="background:#0d0e14;padding:6px 8px;border-radius:6px;margin-bottom:8px;word-break:break-all">${esc(tt.redirect_uri)}</div>
         <div class="two"><input type="text" id="ttk" placeholder="Client key"><input type="password" id="tts" placeholder="Client secret"></div>
-        <div class="row" style="margin-top:8px"><button class="btn sm" data-tt="save">Save app</button><button class="btn primary sm" data-tt="connect" ${tt.has_app ? "" : "disabled"}>Sign in with TikTok</button></div>
+        <div class="row" style="margin-top:8px"><button class="btn sm" data-tt="save">Save app</button>${addBtn("tiktok", "Sign in with TikTok", tt.has_app ? "" : "disabled")}</div>
         <p class="dim" style="font-size:11.5px;margin:8px 0 0">Until TikTok audits your app, posts are private (only you can see them).</p>`;
-    const igBody = ig.connected ? "" : `<p class="muted" style="font-size:12.5px;margin:0 0 6px">Needs an Instagram <b>Business or Creator</b> account. Either way works:</p>
+    const reconIg = accs("instagram").find((a) => a.id === igTarget);
+    const igBody = accs("instagram").length && !adding && !reconIg ? `<div class="row wrap">${addBtn("instagram")}</div>${hint("instagram")}`
+      : `${reconIg ? `<p style="font-size:12.5px;margin:0 0 6px"><b>Reconnect ${esc(reconIg.name || "this account")}</b>: paste a new token for it.</p>` : ""}
+        <p class="muted" style="font-size:12.5px;margin:0 0 6px">Needs an Instagram <b>Business or Creator</b> account. Either way works:</p>
         <ul class="list" style="font-size:12.5px;margin:0 0 8px"><li><b>Instagram Login</b> (simplest, no Facebook Page): in your <a href="https://developers.facebook.com/apps" target="_blank">Meta app</a> → Instagram → <i>API setup with Instagram login</i>, add your account under <i>Generate access tokens</i>. Use the <b>Instagram App ID</b> shown there (not the Meta/Facebook App ID) and scopes <code>instagram_business_basic</code>, <code>instagram_business_content_publish</code>. Paste the token; the account ID is optional.</li>
           <li><b>Facebook Login</b>: Instagram account linked to a Facebook Page; token with <code>instagram_basic</code>, <code>instagram_content_publish</code>, <code>pages_show_list</code>, <code>pages_read_engagement</code>. Reelwright finds the Instagram account through your Page.</li></ul>
         <p class="dim" style="font-size:11.5px;margin:0 0 8px">“Invalid platform app” from Meta means the Facebook App ID was used where the Instagram App ID belongs, or old scopes were requested.</p>
         <input type="password" id="igt" placeholder="Access token" style="margin-bottom:8px"><input type="text" id="igu" placeholder="Instagram account ID (optional — found automatically)">
-        <div style="margin-top:8px"><button class="btn primary sm" data-ig="save">Connect Instagram</button></div>`;
-    $("#conns").innerHTML = `<p class="muted" style="font-size:12.5px;margin:0 0 4px">Every permission each platform needs, and step-by-step portal setup: <a href="/guide/connect.html" target="_blank">Connection guide</a>.</p>
-      <div class="card">${head("youtube", yt.connected, yt.channel?.title, yt.channel?.thumb, yt.channel ? `${num(yt.channel.subscribers)} subscribers` : "")}${ytBody}${yt.error ? `<p style="color:var(--err);font-size:12px">${esc(yt.error)}</p>` : ""}</div>
-      <div class="card">${head("tiktok", tt.connected, tt.name, tt.avatar)}${ttBody}</div>
-      <div class="card">${head("instagram", ig.connected, ig.name ? "@" + ig.name : "", ig.avatar, ig.followers != null ? `${num(ig.followers)} followers` : "")}${igBody}</div>`;
+        <div class="row" style="margin-top:8px"><button class="btn primary sm" data-ig="save">${reconIg ? "Reconnect" : accs("instagram").length ? "Add account" : "Connect Instagram"}</button>${accs("instagram").length ? `<button class="btn ghost sm" data-ig="cancel">Cancel</button>` : ""}</div>${hint("instagram")}`;
+    $("#conns").innerHTML = `<p class="muted" style="font-size:12.5px;margin:0 0 4px">Link as many accounts per platform as you like; each one is only posted to after you turn on <b>Approved for uploads</b>. Every permission each platform needs, and step-by-step portal setup: <a href="/guide/connect.html" target="_blank">Connection guide</a>.</p>
+      <div class="card">${head("youtube")}${ytBody}${yt.error ? `<p style="color:var(--err);font-size:12px">${esc(yt.error)}</p>` : ""}</div>
+      <div class="card">${head("tiktok")}${ttBody}</div>
+      <div class="card">${head("instagram")}${igBody}</div>
+      <div class="card" id="secvault"></div>`;
+    securityCard();
     const f = $("#secret");
     if (f) f.onchange = async () => { const fd = new FormData(); fd.append("file", f.files[0]); try { await api("/api/youtube/secret", { body: fd }); toast("Client saved — now sign in.", "ok"); connSig = ""; self.refresh(); } catch (e) { fail(e); } };
   }
+  // Security & templates (WP3): whether sign-ins/keys are encrypted (DPAPI), the ones sealed on another PC, the default template
+  async function securityCard() {
+    const box = $("#secvault");
+    if (!box) return;
+    $$("[data-tplsave]", $("#conns")).forEach((b) => (b.onclick = async () => {
+      const v = $(`[data-tplacc="${CSS.escape(b.dataset.tplsave)}"]`).value;
+      try { await api("/api/publish/template", { method: "PUT", body: { account_id: b.dataset.tplsave, template: v.trim() ? v : null } }); toast("Template saved.", "ok"); redraw(); } catch (err) { fail(err); }
+    }));
+    let v, t;
+    try { [v, t] = await Promise.all([api("/api/vault"), api("/api/publish/template")]); } catch (err) { box.textContent = err.message; return; }
+    box.innerHTML = `<h3 style="margin:0 0 6px">Security &amp; post text</h3>
+      <p style="font-size:12.5px;margin:0 0 6px">${v.encrypted ? "🔒 Sign-ins, keys and phone pairings are encrypted for your Windows account (they can't be read on another PC or user)." : `⚠ Sign-ins and keys are stored as plain text: ${esc(v.scheme)}.`}
+        ${v.available ? `<button class="btn xs ghost" data-vault="${v.encrypted ? "rollback" : "enable"}">${v.encrypted ? "Store as plain files" : "Encrypt"}</button>` : ""}</p>
+      ${v.locked.length ? `<div style="color:var(--warn);font-size:12.5px">Saved on another PC or Windows user, so unreadable here — enter or reconnect these:<ul class="list">${v.locked.map((x) => `<li>${esc(x.what)}</li>`).join("")}</ul><button class="btn xs" data-vault="forget">Forget the unreadable copies</button></div>` : ""}
+      ${v.backups.length ? `<p class="dim" style="font-size:11.5px;margin:4px 0">Plain-text backups from before encryption (${v.backups.map(esc).join(", ")}) are deleted after 5 clean starts.</p>` : ""}
+      <label class="field">Default description template <span class="dim">({title} {hook} {description} {source_url} {vod_time} {channel} {hashtags}; a line whose variables are empty is left out)</span>
+        <textarea rows="2" id="tpl-def">${esc(t.default || "")}</textarea></label><button class="btn xs" data-vault="tpl">Save template</button>`;
+    box.onclick = async (e) => {
+      const a = e.target.dataset.vault;
+      if (!a) return;
+      try {
+        if (a === "tpl") { await api("/api/publish/template", { method: "PUT", body: { template: $("#tpl-def").value } }); toast("Template saved.", "ok"); return; }
+        if (a === "rollback" && !confirm("Store sign-ins and keys as plain files again (for an older Reelwright, or moving to another PC)? Encryption stays off until you turn it back on.")) return;
+        await api(`/api/vault/${a}`, { method: "POST", body: { confirm: a } });
+        securityCard();
+      } catch (err) { fail(err); }
+    };
+  }
+  const redraw = () => { connSig = ""; renderConns(S.conn); };
   const onClick = async (e) => {
-    const t = e.target.closest("[data-yt],[data-tt],[data-ig],[data-disc],[data-retry],[data-cancel]");
+    const t = e.target.closest("[data-yt],[data-tt],[data-ig],[data-add],[data-recon],[data-rm],[data-appr],[data-apauto],[data-retry],[data-cancel]");
     if (!t) return;
     try {
+      const id = t.dataset.recon || t.dataset.rm, plat = t.dataset.add || t.dataset.plat;
       if (t.dataset.yt === "pick") return $("#secret").click();
-      if (t.dataset.yt === "connect") { await api("/api/youtube/connect", { method: "POST" }); toast("Finish signing in in the browser window that opened."); }
+      if (t.dataset.appr) await api(`/api/accounts/${encodeURIComponent(t.dataset.appr)}`, { method: "PATCH", body: { approved: t.checked } });
+      if (t.dataset.apauto) await api(`/api/accounts/${encodeURIComponent(t.dataset.apauto)}`, { method: "PATCH", body: { autopilot: t.checked } });
+      if (plat === "instagram" && (t.dataset.add || t.dataset.recon)) { adding = t.dataset.add ? "instagram" : ""; igTarget = t.dataset.recon || ""; return redraw(); }
+      if (plat === "youtube" && (t.dataset.add || t.dataset.recon)) {
+        await api("/api/youtube/connect", { body: { account_id: t.dataset.recon || null } });
+        toast(t.dataset.recon ? "Sign in to that channel's Google account in the browser window that opened." : "Choose the Google account / channel to add in the browser window that opened.", "info", 7000);
+      }
+      if (plat === "tiktok" && (t.dataset.add || t.dataset.recon)) {
+        const { url } = await api("/api/connections/tiktok/connect", { body: { account_id: t.dataset.recon || null } });
+        window.open(url, "_blank");
+        toast(t.dataset.recon ? "Approve Reelwright in the TikTok tab, signed in as that account." : "Approve Reelwright in the TikTok tab (to add a different account, log out on tiktok.com first), then come back here.", "info", 7000);
+      }
       if (t.dataset.tt === "save") { await api("/api/connections/tiktok/app", { method: "PUT", body: { client_key: $("#ttk").value, client_secret: $("#tts").value } }); toast("TikTok app saved.", "ok"); }
-      if (t.dataset.tt === "connect") { const { url } = await api("/api/connections/tiktok/connect", { method: "POST" }); window.open(url, "_blank"); toast("Approve Reelwright in the TikTok tab, then come back here."); }
-      if (t.dataset.ig === "save") { await api("/api/connections/instagram", { method: "PUT", body: { access_token: $("#igt").value, ig_user_id: $("#igu").value } }); toast("Instagram connected.", "ok"); }
-      if (t.dataset.disc && (await confirmBox(`Disconnect ${PLATFORM[t.dataset.disc]}?`, "Scheduled posts to it will wait until you reconnect.", "Disconnect"))) await api(`/api/connections/${t.dataset.disc}/disconnect`, { method: "POST" });
+      if (t.dataset.ig === "cancel") { adding = igTarget = ""; return redraw(); }
+      if (t.dataset.ig === "save") {
+        await api("/api/connections/instagram", { method: "PUT", body: { access_token: $("#igt").value, ig_user_id: $("#igu").value, account_id: igTarget || null } });
+        toast(igTarget ? "Instagram account reconnected." : "Instagram account linked: turn on “Approved for uploads” to post to it.", "ok", 6000);
+        adding = igTarget = "";
+      }
+      if (t.dataset.rm) {
+        const a = Object.values(S.conn || {}).flatMap((x) => x.accounts || []).find((x) => x.id === id);
+        if (!(await confirmBox(`Remove ${a?.name || "this account"}?`, "Its posts that haven't gone out yet are stopped, never moved to another account (you can move them on the Schedule page). Its sign-in is deleted from this PC.", "Remove"))) return;
+        const r = await api(`/api/accounts/${encodeURIComponent(id)}`, { method: "DELETE" });
+        toast(r.held ? `Removed. ${r.held} post${r.held === 1 ? " that was waiting was" : "s that were waiting were"} stopped: move ${r.held === 1 ? "it" : "them"} to another account on the Schedule page.` : "Account removed.", r.held ? "info" : "ok", 8000);
+      }
       if (t.dataset.retry) await api(`/api/uploads/${t.dataset.retry}/retry`, { method: "POST" });
       if (t.dataset.cancel) await api(`/api/uploads/${t.dataset.cancel}`, { method: "DELETE" });
       connSig = ""; self.refresh(); sideStatus();
-    } catch (err) { fail(err); }
+    } catch (err) { fail(err); connSig = ""; self.refresh(); }
   };
 }
 
@@ -2607,12 +3930,13 @@ function Jobs() {
     const u = await api("/api/usage?days=30").catch(() => null);
     if (!u) return;
     const money = (v) => (v < 0.01 && v > 0 ? "<$0.01" : `$${v.toFixed(2)}`);
-    $("#usage").innerHTML = `<div class="row wrap"><h2 class="grow" style="margin:0">Claude usage · last 30 days</h2><span class="dim" style="font-size:12px">estimated from per-token prices; web searches during live research are billed separately and not included</span></div>
+    $("#usage").innerHTML = `<div class="row wrap"><h2 class="grow" style="margin:0">AI usage · last 30 days</h2><span class="dim" style="font-size:12px">estimated from per-token prices; local models (Ollama) cost nothing and other providers are unpriced; web searches during live research are billed separately and not included</span></div>
       ${u.calls ? `<div class="row wrap" style="gap:22px;margin:8px 0;font-size:13px"><span><b>${+u.calls}</b> calls</span><span><b>${money(u.cost_usd)}</b> est.${u.unpriced_calls ? ` <span class="dim">(+${+u.unpriced_calls} unpriced)</span>` : ""}</span>
           <span title="Share of input tokens served from the prompt cache (transcripts re-read at ~5% of the price)"><b>${u.cache_hit_ratio == null ? "—" : Math.round(u.cache_hit_ratio * 100) + "%"}</b> cache hits</span>
           <span class="dim">${num(u.input_tokens)} in · ${num(u.output_tokens)} out</span></div>
         <table><thead><tr><th>Feature</th><th>Calls</th><th>Input</th><th>Cached</th><th>Output</th><th>Est. cost</th></tr></thead><tbody>${Object.entries(u.by_kind).map(([k, v]) =>
-          `<tr><td>${esc(k)}</td><td>${+v.calls}</td><td>${num(v.input)}</td><td>${num(v.cache_read)}</td><td>${num(v.output)}</td><td>${money(v.cost)}${v.unpriced ? " +?" : ""}</td></tr>`).join("")}</tbody></table>`
+          `<tr><td>${esc(k)}</td><td>${+v.calls}</td><td>${num(v.input)}</td><td>${num(v.cache_read)}</td><td>${num(v.output)}</td><td>${money(v.cost)}${v.unpriced ? " +?" : ""}</td></tr>`).join("")}</tbody></table>
+        ${u.by_model ? `<div class="dim" style="font-size:12px;margin-top:6px">By model: ${Object.entries(u.by_model).map(([m, v]) => `${esc(m)} · ${+v.calls} calls · ${m.startsWith("ollama:") ? "free (local)" : v.unpriced === v.calls ? "unpriced" : money(v.cost)}`).join(" &nbsp;|&nbsp; ")}</div>` : ""}`
         : `<div class="dim" style="font-size:12.5px;margin-top:6px">No Claude calls yet.</div>`}`;
   };
   this.refresh = async () => {
@@ -2637,7 +3961,7 @@ function Schedule() {
   const SRC = { yours: "from your own results", research: "from live research", default: "default — no data yet" };
   const dayStart = (offset) => { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + offset); return d; };
   this.mount = async () => {
-    view.innerHTML = `<div class="page"><h1>Schedule</h1><p class="sub">Every post waiting to go out. Drag a post to another hour to move it, or click it to change its time, platform or remove it. Shading shows the best hours for the selected platform.</p>
+    view.innerHTML = `<div class="page"><h1>Schedule</h1><p class="sub">Every post waiting to go out. Drag a post to another hour to move it, or click it to change its time, move it to another approved account, or remove it. Shading shows the best hours for the selected platform.</p>
       <div id="sch-banner"></div>
       <div class="row wrap" style="margin-bottom:12px"><button class="btn sm" data-wk="-1">‹ Prev</button><button class="btn sm" data-wk="0">This week</button><button class="btn sm" data-wk="1">Next ›</button>
         <b id="sch-range" style="margin:0 8px"></b><span class="grow"></span>
@@ -2658,8 +3982,8 @@ function Schedule() {
     const plats = filter === "all" ? Object.keys(PLATFORM) : [filter];
     return Math.max(...plats.map((p) => data.heat[p].scores[d * 24 + h][2]));
   };
-  const chip = (it) => `<div class="sch-post plat-${it.platform}" draggable="true" data-post="${esc(it.id)}" title="${esc(it.title)} — ${esc(PLATFORM[it.platform])}, ${esc(UPLOAD_STATUS[it.status]?.[1] || it.status)}${it.error ? " — " + esc(it.error) : ""}">
-      ${it.cover ? `<img src="${esc(it.cover)}" alt="">` : ""}<span>${esc(PLATFORM[it.platform].slice(0, 2))}</span> ${esc((it.title || "").slice(0, 26))}${it.auto ? " ⚡" : ""}${it.status === "held" ? " ⏸" : ""}${it.error ? " ⚠" : ""}</div>`;
+  const chip = (it) => `<div class="sch-post plat-${it.platform}" draggable="true" data-post="${esc(it.id)}" title="${esc(it.title)} — ${esc(PLATFORM[it.platform])}${it.account ? " · " + esc(it.account) : ""}, ${esc(UPLOAD_STATUS[it.status]?.[1] || it.status)}${it.error ? " — " + esc(it.error) : ""}">
+      ${it.cover ? `<img src="${esc(it.cover)}" alt="">` : ""}<span>${esc(PLATFORM[it.platform].slice(0, 2))}</span> ${esc((it.title || "").slice(0, 26))}${it.account ? `<i class="dim"> · ${esc(it.account.slice(0, 18))}</i>` : ""}${it.auto ? " ⚡" : ""}${it.status === "held" ? " ⏸" : ""}${it.error ? " ⚠" : ""}</div>`;
   const render = () => {
     $("#sch-banner").innerHTML = data.paused ? `<div class="card row" style="border-color:var(--warn);margin-bottom:12px"><span class="grow">⏸ <b>Autopilot is paused.</b> Its posts are held (⏸) and won't go out until you resume.</span><button class="btn sm primary" id="sch-resume">Resume Autopilot</button></div>`
       : `<div class="row" style="margin-bottom:12px"><span class="grow dim" style="font-size:12.5px">⚡ Autopilot is running — posts marked ⚡ go out on their own.</span><button class="btn sm" id="sch-pause" title="Stops new scheduling and holds Autopilot's queued posts (nothing is deleted)">⏸ Pause Autopilot</button></div>`;
@@ -2709,16 +4033,20 @@ function Schedule() {
   const edit = (it) => {
     modal(`<h2>${esc(it.title || "Post")}</h2><p class="muted" style="margin-top:-4px">${pill(UPLOAD_STATUS, it.status)} ${it.auto ? '<span class="chip">⚡ Autopilot</span>' : ""}</p>
       <div class="stack">
-        <label class="field">Platform<select id="se-plat">${Object.entries(PLATFORM).map(([k, v]) => `<option value="${k}" ${k === it.platform ? "selected" : ""}>${v}${data.connected[k] ? "" : " (not connected)"}</option>`).join("")}</select></label>
+        <label class="field">Account<select id="se-acc">${data.accounts.some((a) => a.id === it.account_id) ? "" : `<option value="" selected>${esc(PLATFORM[it.platform])} · ${esc(it.account || "no account")} (${it.account ? "not approved" : "removed or not chosen"}: pick another)</option>`}
+          ${data.accounts.map((a) => `<option value="${esc(a.id)}" data-plat="${a.platform}" ${a.id === it.account_id ? "selected" : ""}>${esc(PLATFORM[a.platform])} · ${esc(a.name || a.handle || "account")}</option>`).join("")}</select></label>
         <div class="row"><label class="field grow">Date &amp; time<input type="datetime-local" id="se-time" value="${it.when ? toLocalInput(new Date(it.when)) : ""}"></label>
           <button class="btn" id="se-best" style="align-self:flex-end">★ Best time</button></div>
         <p class="dim" style="font-size:12px;margin:0">YouTube posts upload ahead and go public at this time; TikTok and Instagram post at this time (Reelwright must be running).</p>
         ${it.error ? `<div style="color:var(--err);font-size:12.5px">${esc(it.error)}</div>` : ""}
       </div>
       <div class="foot"><button class="btn danger" id="se-del">Remove</button><button class="btn" id="se-now">Post as soon as ready</button><span class="grow"></span><button class="btn" data-close>Cancel</button><button class="btn primary" id="se-save">Save</button></div>`, (m, close) => {
+      const sel = () => $("#se-acc", m).selectedOptions[0];
+      const plat = () => sel()?.dataset.plat || it.platform;
+      const target = () => (sel()?.value && sel().value !== it.account_id ? { account_id: sel().value } : {}); // another approved account (its platform follows)
       $("#se-best", m).onclick = async () => {
         try {
-          const r = await api("/api/schedule/suggest", { body: { platform: $("#se-plat", m).value, category_id: it.category_id, current: it.when } });
+          const r = await api("/api/schedule/suggest", { body: { platform: plat(), category_id: it.category_id, current: it.when } });
           if (r.times[0]) $("#se-time", m).value = toLocalInput(new Date(r.times[0]));
           toast(`Best time ${SRC[r.source]}.`);
         } catch (err) { fail(err); }
@@ -2726,9 +4054,9 @@ function Schedule() {
       $("#se-save", m).onclick = async () => {
         const v = $("#se-time", m).value;
         if (v && new Date(v) < new Date()) return toast("Pick a time in the future.", "err");
-        close(); await move(it.id, { when: v ? fromLocalInput(v) : null, platform: $("#se-plat", m).value });
+        close(); await move(it.id, { when: v ? fromLocalInput(v) : null, ...target() });
       };
-      $("#se-now", m).onclick = async () => { close(); await move(it.id, { when: null, platform: $("#se-plat", m).value }); };
+      $("#se-now", m).onclick = async () => { close(); await move(it.id, { when: null, ...target() }); };
       $("#se-del", m).onclick = async () => {
         close();
         if (!(await confirmBox("Remove this post?", "It won't be posted. The clip itself stays in your project.", "Remove"))) return;
@@ -2749,6 +4077,75 @@ function Schedule() {
 // ======================================================================
 // Settings
 // ======================================================================
+// clip card: which two AIs agreed on a consensus-mode pick, both reasons in the tooltip
+function consensusChip(k) {
+  const who = (x) => `${({ anthropic: "Claude", ollama: "Ollama", openai: "OpenAI-compatible" })[x?.provider] || x?.provider}${x?.model ? ` (${x.model})` : ""}`;
+  const tip = `${who(k.scout)} found it${k.scout?.score != null ? ` (${k.scout.score})` : ""}: ${k.scout?.reason || ""}\n${who(k.reviewer)} ${k.verdict === "adjust" ? "adjusted the cut" : "agreed"} (${k.reviewer?.score}): ${k.reviewer?.reason || ""}`;
+  return `<span class="chip" style="font-size:11px;color:var(--ok)" title="${esc(tip)}">✓ 2 AIs ${k.verdict === "adjust" ? "agreed · re-cut" : "agreed"}</span>`;
+}
+
+// Settings → "Other AIs & consensus": per-task provider routing, Ollama / OpenAI-compatible setup, the two-AI consensus mode
+const AI_TASKS = [["find", "Finding clips"], ["judge", "Ranking clips (long videos)"], ["classify", "Video type"], ["meta", "Titles & captions"], ["plan", "Edit plans"], ["assist", "Edit assistant"], ["other", "Everything else"]];
+const AI_NAMES = [["anthropic", "Claude"], ["ollama", "Ollama (this PC)"], ["openai", "OpenAI-compatible"]];
+const OAI_PRESETS = [["https://api.openai.com/v1", "OpenAI"], ["https://openrouter.ai/api/v1", "OpenRouter"], ["https://api.groq.com/openai/v1", "Groq"], ["https://generativelanguage.googleapis.com/v1beta/openai", "Google Gemini"], ["http://127.0.0.1:1234/v1", "LM Studio (this PC)"]];
+function aiCard(s, opt) {
+  const r = s.ai_routes || {}, ol = s.ai_providers?.ollama || {}, oa = s.ai_providers?.openai || {};
+  const test = (p) => `<div class="row"><button type="button" class="btn sm" data-aitest="${p}">Test</button><span class="dim" style="font-size:12px" data-aiout="${p}"></span></div>`;
+  return `<div class="card stack"><h2>Other AIs &amp; consensus</h2>
+    <p class="muted" style="margin:0;font-size:13px">Run any task on a local model with <a href="https://ollama.com" target="_blank">Ollama</a> (free, nothing leaves this PC) or an OpenAI-compatible service. <b>Local first, Claude agrees</b>: the local model scans the whole video and proposes extra candidates, then Claude agrees, adjusts or rejects each one — fewer Claude tokens on long videos. Your clip length settings still apply after.</p>
+    <label class="field">Consensus mode<select id="aicons">${opt([["off", "Off — one AI finds clips"], ["local_then_claude", "Local first, Claude agrees (Ollama → Claude)"], ["ollama:openai", "Ollama → OpenAI-compatible agrees"], ["openai:anthropic", "OpenAI-compatible → Claude agrees"], ["anthropic:openai", "Claude → OpenAI-compatible agrees"]], s.ai_consensus || "off")}</select></label>
+    <div class="row wrap">${AI_TASKS.map(([k, l]) => `<label class="field grow" style="min-width:170px">${l}<select data-airoute="${k}">${opt(AI_NAMES, r[k] || "anthropic")}</select></label>`).join("")}</div>
+    <h3 style="margin:6px 0 0">Ollama</h3>
+    <div class="row wrap"><label class="field grow">Base URL<input id="ol-url" value="${esc(ol.base_url || "")}"></label>
+      <label class="field grow">Model<select id="ol-model"><option value="${esc(ol.model || "")}">${esc(ol.model || "— pick a model —")}</option></select></label>
+      <button type="button" class="btn sm" id="ol-refresh" style="align-self:flex-end" title="Reload the models installed in Ollama">↻</button>
+      <label class="field" title="Tokens of transcript the model reads at once. Long videos need more; more uses more GPU memory.">Context<input type="number" id="ol-ctx" min="2048" max="262144" step="1024" value="${+ol.num_ctx || 16384}"></label></div>
+    <span class="dim" style="font-size:12px" id="ol-note"></span>
+    ${test("ollama")}
+    <h3 style="margin:6px 0 0">OpenAI-compatible</h3>
+    <div class="row wrap"><label class="field grow">Service<select id="oa-preset"><option value="">Custom URL</option>${opt(OAI_PRESETS, oa.base_url)}</select></label>
+      <label class="field grow">Base URL<input id="oa-url" value="${esc(oa.base_url || "")}"></label>
+      <label class="field grow">Model<input id="oa-model" value="${esc(oa.model || "")}" placeholder="e.g. gpt-4.1-mini, meta-llama/llama-3.3-70b-instruct"></label></div>
+    <div class="row wrap"><label class="field grow">API key ${oa.api_key_set ? `<span class="pill ok">saved ${esc(oa.api_key_hint)}</span>` : ""}<input type="password" id="oa-key" placeholder="${oa.api_key_set ? "Leave blank to keep the current key" : "Not needed for local servers"}" autocomplete="off"></label>
+      <label class="switch" style="align-self:flex-end"><input type="checkbox" id="oa-vision" ${oa.vision !== false ? "checked" : ""}> Send still frames (vision model)</label>
+      ${oa.api_key_set ? `<button type="button" class="btn sm danger" id="oa-rmkey" style="align-self:flex-end">Remove key</button>` : ""}</div>
+    <p class="muted" style="margin:0;font-size:12px">A custom base URL receives transcripts and frames for the tasks you route to it — only use one you trust. See the Privacy Policy.</p>
+    ${test("openai")}
+  </div>`;
+}
+function aiBody() {
+  const routes = Object.fromEntries($$("[data-airoute]").map((x) => [x.dataset.airoute, x.value]));
+  const openai = { base_url: $("#oa-url").value.trim(), model: $("#oa-model").value.trim(), vision: $("#oa-vision").checked };
+  if ($("#oa-key").value.trim()) openai.api_key = $("#oa-key").value.trim();
+  return { ai_consensus: $("#aicons").value, ai_routes: routes,
+    ai_providers: { ollama: { base_url: $("#ol-url").value.trim(), model: $("#ol-model").value, num_ctx: +$("#ol-ctx").value || 16384 }, openai } };
+}
+function aiCardWire(s) {
+  const loadModels = async () => {
+    $("#ol-note").textContent = "Looking for Ollama models…";
+    const res = await api("/api/ai/ollama/models").catch((e) => ({ models: [], error: e.message }));
+    const cur = $("#ol-model").value;
+    $("#ol-model").innerHTML = `<option value="">— pick a model —</option>` + res.models.map((m) => `<option value="${esc(m.name)}" ${m.name === cur ? "selected" : ""}>${esc(m.name)}${m.size ? ` · ${esc(m.size)}` : ""}${m.vision ? " · vision" : ""}</option>`).join("")
+      + (cur && !res.models.some((m) => m.name === cur) ? `<option value="${esc(cur)}" selected>${esc(cur)} (not installed)</option>` : "");
+    $("#ol-note").textContent = res.error ? `${res.error} — install it from ollama.com and run “ollama pull qwen3:8b”.` : `${res.models.length} model${res.models.length === 1 ? "" : "s"} installed.`;
+  };
+  $("#ol-refresh").onclick = loadModels;
+  loadModels();
+  $("#oa-preset").onchange = (e) => { if (e.target.value) $("#oa-url").value = e.target.value; };
+  $("#oa-rmkey")?.addEventListener("click", async () => { await api("/api/settings", { method: "PUT", body: { ai_providers: { openai: { api_key: "" } } } }).catch(fail); toast("Key removed."); route(); });
+  $$("[data-aitest]").forEach((b) => b.onclick = async () => {
+    const p = b.dataset.aitest, out = $(`[data-aiout="${p}"]`);
+    out.innerHTML = `<span class="spin"></span> Saving and testing…`;
+    try {
+      const body = aiBody();
+      if (p === "anthropic" && $("#key").value.trim()) body.anthropic_api_key = $("#key").value.trim();
+      S.settings = await api("/api/settings", { method: "PUT", body });
+      const r = await api("/api/ai/test", { method: "POST", body: { provider: p } });
+      out.innerHTML = r.ok ? `<span class="pill ok">works</span> ${esc(r.model)} replied “${esc(r.result)}”` : `<span class="pill err">failed</span> ${esc(r.error)}`;
+    } catch (e) { out.innerHTML = `<span class="pill err">failed</span> ${esc(e.message)}`; }
+  });
+}
+
 function Settings() {
   this.mount = async () => {
     const s = (S.settings = await api("/api/settings"));
@@ -2761,7 +4158,9 @@ function Settings() {
           <label class="field">Model<select id="model">${opt([["claude-opus-5-5", "Claude Opus 5.5 — best judgement (default)"], ["claude-sonnet-5-5", "Claude Sonnet 5.5 — faster, cheaper"], ["claude-haiku-5-5", "Claude Haiku 5.5 — fastest, cheapest"], ["claude-fable-5-2", "Claude Fable 5.2 — most capable, premium"]], s.model)}</select></label>
           <label class="switch"><input type="checkbox" id="vj" ${s.visual_judge !== false ? "checked" : ""}> Let Claude see a few small frames when ranking clips from long videos <span class="muted" style="font-size:12px">(better picks on gaming/VTuber streams; uses more tokens — about 4 images for each of up to 12 candidates)</span></label>
           ${s.anthropic_key_set ? `<div><button type="button" class="btn sm danger" id="rmkey">Remove key</button></div>` : ""}
+          <div class="row"><button type="button" class="btn sm" data-aitest="anthropic">Test Claude</button><span class="dim" style="font-size:12px" data-aiout="anthropic"></span></div>
         </div>
+        ${aiCard(s, opt)}
         <div class="card stack"><h2>Transcription</h2>
           <div class="row wrap"><label class="field grow">Whisper model<select id="wm">${opt([["large-v3-turbo", "large-v3-turbo — best speed/accuracy (default)"], ["large-v3", "large-v3 — most accurate"], ["medium", "medium"], ["small", "small — fast, lighter"], ["base", "base — fastest"]], s.whisper_model)}</select></label>
           <label class="field grow">Run on<select id="wd">${opt([["auto", "Auto (GPU if available)"], ["cuda", "NVIDIA GPU"], ["cpu", "CPU"]], s.whisper_device)}</select></label></div>
@@ -2781,6 +4180,13 @@ function Settings() {
         </div>
         <div><button class="btn primary">Save settings</button></div>
       </form>
+      ${signalsCard()}
+      ${renderCard()}
+      <div class="card stack" style="margin-top:20px" id="appwin"><div class="row wrap"><h2 class="grow" style="margin:0">App window &amp; startup</h2>
+          <button class="btn sm danger" id="appquit" hidden title="Close Reelwright completely (stops renders, uploads and Autopilot until you open it again)">⏻ Quit Reelwright</button></div>
+        <label class="row" style="gap:8px"><input type="checkbox" id="c2t"> <span>Clicking ✕ minimizes to the taskbar instead of closing <span class="dim">— renders, uploads and Autopilot keep running</span></span></label>
+        <label class="row" style="gap:8px"><input type="checkbox" id="sob"> <span>Start Reelwright when I sign in to Windows <span class="dim">— opens minimized in the taskbar</span></span></label>
+        <div class="dim" id="appnote" style="font-size:12px"></div></div>
       <div class="card stack" style="margin-top:20px" id="uiscale"><div class="row wrap"><h2 class="grow" style="margin:0">Interface size</h2><button class="btn sm" data-uireset="all" title="Every part back to 100% of the automatic size for this window">⤢ Fit to screen / Reset</button></div>
         <p class="muted" style="margin:0;font-size:12.5px">The base size follows your window automatically (now ${Math.round(uiAuto() * 100)}% for ${innerWidth} px); these multiply on top. Changes apply as you drag and are kept across restarts and updates. <span class="kbd">Ctrl</span>+<span class="kbd">=</span> / <span class="kbd">Ctrl</span>+<span class="kbd">-</span> / <span class="kbd">Ctrl</span>+<span class="kbd">0</span> change the whole app.</p>
         ${Object.entries(UI_KEYS).map(([k, l]) => `<div class="row"><label class="slider grow ui-row"><span>${l}</span><input type="range" data-ui="${k}" min="60" max="200" step="5" value="${Math.round(S.ui[k] * 100)}"><output>${Math.round(S.ui[k] * 100)}%</output></label><button class="btn xs ghost" data-uireset="${k}" title="Back to 100%">Reset</button></div>`).join("")}</div>
@@ -2807,7 +4213,27 @@ function Settings() {
     };
     $("#doc").onclick = () => runDoctor(false);
     $("#docd").onclick = () => runDoctor(true);
+    const appShow = (a) => {
+      $("#c2t").checked = a.close_to_taskbar; $("#sob").checked = a.start_on_boot; $("#appquit").hidden = !a.desktop;
+      $("#appnote").textContent = a.desktop ? "" : "These apply to the Reelwright desktop app (Reelwright.exe); this page is open in a browser.";
+    };
+    api("/api/app").then(appShow).catch(() => {});
+    $("#appwin").onchange = async (e) => {
+      const key = { c2t: "close_to_taskbar", sob: "start_on_boot" }[e.target.id];
+      if (!key) return;
+      try { appShow(await api("/api/app", { method: "PUT", body: { [key]: e.target.checked } })); toast("Saved.", "ok", 1200); }
+      catch (err) { e.target.checked = !e.target.checked; fail(err); }
+    };
+    $("#appquit").onclick = async () => {
+      if (await confirmBox("Quit Reelwright?", "Renders, uploads and Autopilot stop until you open it again. Scheduled posts wait and go out when it's running.", "Quit")) {
+        await api("/api/app/quit", { method: "POST" }).catch(fail);
+      }
+    };
     $("#rmkey")?.addEventListener("click", async () => { await api("/api/settings", { method: "PUT", body: { anthropic_api_key: "" } }).catch(fail); toast("Key removed."); sideStatus(); route(); });
+    aiCardWire(s);
+    storageCards(); // Settings › Storage + Space saver (storage.py), above App window
+    phoneRemoteCard(); // its own card, appended below (section at the end of this file)
+    liveCards(); // Live integrations + Claude Desktop (MCP): their own cards (section at the end of this file)
     $("#sf").onsubmit = async (e) => {
       e.preventDefault();
       const body = {
@@ -2818,6 +4244,7 @@ function Settings() {
       if (body.clip_target && (body.clip_target < body.clip_min || body.clip_target > body.clip_max)) return toast("Target length must be between min and max (or 0 for automatic).", "err");
       if ($("#key").value.trim()) body.anthropic_api_key = $("#key").value.trim();
       body.visual_judge = $("#vj").checked;
+      Object.assign(body, aiBody());
       try { S.settings = await api("/api/settings", { method: "PUT", body }); toast("Settings saved.", "ok"); sideStatus(); route(); } catch (err) { fail(err); }
     };
   };
@@ -2838,3 +4265,1257 @@ sideStatus().then(route);
 setInterval(sideStatus, 5000);
 if (localStorage.lastProject) $("#nav-editor").hidden = false;
 if (localStorage.lastClip) $("#nav-studio").hidden = false;
+
+// ======================================================================
+// Long form — a separate edit of a project: ordered source segments played back to back as one landscape video
+// (longform.py). Captured from the existing analysis (condensed / highlights / from clips), edited here, rendered,
+// published as a regular YouTube video (TikTok / Instagram only within their length limits).
+// ======================================================================
+// ----- Review: one AI pick at a time, across projects, judged with the keyboard (GET /api/triage) -----
+// Y keep / N skip go through PATCH /api/clips/{id} {rating}, the same path as 👍/👎, so the learning memory records them.
+routes.review = Review;
+function Review() {
+  const R = { list: [], total: 0, i: 0, done: [], projects: [],
+    f: { project: lsGet("rvProject") || "", new_only: lsGet("rvNew") !== "0", min_score: lsGet("rvMin") || "" } };
+  let video, keyH;
+  const cur = () => R.list[R.i];
+
+  this.mount = async () => {
+    R.projects = await api("/api/projects").catch(() => []);
+    await load();
+    keyH = onKey;
+    document.addEventListener("keydown", keyH);
+  };
+  this.destroy = () => { document.removeEventListener("keydown", keyH); video?.pause(); };
+
+  async function load() {
+    const q = new URLSearchParams({ project: R.f.project, new_only: R.f.new_only ? "1" : "0", limit: "200" });
+    if (R.f.min_score !== "") q.set("min_score", R.f.min_score);
+    const r = await api(`/api/triage?${q}`);
+    R.list = r.clips; R.total = r.total; R.i = 0;
+    render();
+  }
+
+  function render() {
+    const c = cur();
+    view.innerHTML = `<div class="page review">
+      <div class="row" style="gap:8px;flex-wrap:wrap">
+        <h1 style="margin:0" class="grow">Review</h1>
+        <select id="rv-proj" title="Project"><option value="">All projects</option>${R.projects.map((p) => `<option value="${esc(p.id)}" ${p.id === R.f.project ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select>
+        <label class="switch" title="Only picks you haven't rated yet"><input type="checkbox" id="rv-new" ${R.f.new_only ? "checked" : ""}> New only</label>
+        <label class="row" style="gap:6px;font-size:12.5px">Min score <input type="number" id="rv-min" min="0" max="100" step="5" value="${esc(R.f.min_score)}" style="width:70px"></label>
+      </div>
+      ${c ? `<div class="rv-stage"><video id="rv-vid" src="${esc(c.src || "")}" ${c.rendered ? "loop" : ""} autoplay playsinline preload="auto"></video></div>
+        <div class="row" style="gap:10px;margin-top:10px;align-items:flex-start">
+          <div class="grow"><b style="font-size:16px">${esc(c.title)}</b>
+            <div class="dim" style="font-size:12.5px">${esc(c.project || "")} · ${fmt(c.end - c.start, 1)} · ${c.rendered ? "rendered" : "source range"}${c.rating ? ` · rated ${c.rating > 0 ? "👍" : "👎"}` : ""}</div>
+            ${c.hook ? `<div style="margin-top:4px">${esc(c.hook)}</div>` : ""}
+            <div class="muted" style="font-size:12.5px;margin-top:4px">${esc(c.text || "")}</div></div>
+          <div class="stack" style="gap:6px;align-items:flex-end">
+            ${c.score != null ? `<span class="vbadge">✦ ${Math.round(+c.score)}</span>` : ""}<span class="dim mono">${R.i + 1} / ${R.list.length}${R.total > R.list.length ? ` of ${R.total}` : ""}</span></div></div>
+        <div class="row" style="gap:6px;margin-top:10px;flex-wrap:wrap">
+          <button class="btn primary" data-act="keep"><span class="kbd">Y</span> Keep</button><button class="btn" data-act="skip"><span class="kbd">N</span> Skip</button>
+          <button class="btn ghost" data-act="undo"><span class="kbd">U</span> Undo</button><button class="btn ghost" data-act="studio"><span class="kbd">E</span> Open in Studio</button>
+          <span class="grow"></span><span class="hint"><span class="kbd">J</span> <span class="kbd">K</span> <span class="kbd">L</span> back · play/pause · forward &nbsp; <span class="kbd">←</span> <span class="kbd">→</span> previous / next</span></div>`
+        : `<div class="card empty" style="margin-top:14px"><b>Nothing left to review</b>${R.done.length ? `${R.done.length} judged this session. ` : ""}New AI picks land here after a scan; change the filters to see more.
+          ${R.done.length ? `<div style="margin-top:8px"><button class="btn sm" data-act="undo"><span class="kbd">U</span> Undo the last one</button></div>` : ""}</div>`}</div>`;
+    view.onclick = onClick;
+    view.onchange = onChange;
+    video = $("#rv-vid");
+    if (video && c && !c.rendered) { // the pick inside its source video: play just that range, looped
+      video.addEventListener("loadedmetadata", () => { video.currentTime = c.start; });
+      video.ontimeupdate = () => { if (video.currentTime >= c.end || video.currentTime < c.start - 0.5) video.currentTime = c.start; };
+    }
+  }
+
+  function onChange(ev) {
+    const t = ev.target;
+    if (t.id === "rv-proj") { R.f.project = t.value; lsSet("rvProject", t.value); }
+    else if (t.id === "rv-new") { R.f.new_only = t.checked; lsSet("rvNew", t.checked ? "1" : "0"); }
+    else if (t.id === "rv-min") { R.f.min_score = t.value; lsSet("rvMin", t.value); }
+    else return;
+    load().catch(fail);
+  }
+  function onClick(ev) {
+    const a = ev.target.closest("[data-act]");
+    if (!a) return;
+    ({ keep: () => decide(1), skip: () => decide(-1), undo, studio })[a.dataset.act]?.();
+  }
+  function onKey(e) {
+    if (e.target.closest?.("input, textarea, select") || $("#modal-root").innerHTML || e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.key.toLowerCase();
+    if (e.repeat && "ynu".includes(k)) return e.preventDefault(); // a held key judges one clip, not the whole queue
+    const act = { y: () => decide(1), n: () => decide(-1), u: undo, e: studio, arrowright: () => move(1), arrowleft: () => move(-1),
+      j: () => scrub(e.shiftKey ? -5 : -1), l: () => scrub(e.shiftKey ? 5 : 1), k: playPause, " ": playPause }[k];
+    if (act) { e.preventDefault(); act(); }
+  }
+  function move(d) { if (!R.list.length) return; R.i = Math.min(Math.max(R.i + d, 0), R.list.length - 1); render(); }
+  function playPause() { if (video) video.paused ? video.play() : video.pause(); }
+  function scrub(d) {
+    const c = cur(); if (!video || !c) return;
+    const [a, b] = c.rendered ? [0, video.duration || 0] : [c.start, c.end];
+    video.currentTime = Math.min(Math.max(video.currentTime + d, a), Math.max(a, b - 0.05));
+  }
+  function studio() { const c = cur(); if (c) location.hash = `#/studio/${c.id}`; }
+  async function decide(rating) {
+    const c = cur(); if (!c || R.busy) return;
+    R.busy = true;
+    try { await api(`/api/clips/${c.id}`, { method: "PATCH", body: { rating } }); } catch (e) { return fail(e); } finally { R.busy = false; }
+    R.done.push({ card: c, i: R.i, prev: c.rating || 0 });
+    c.rating = rating;
+    if (R.f.new_only) R.list.splice(R.i, 1); // judged: out of the "new" queue
+    else R.i++;
+    R.i = Math.min(R.i, Math.max(0, R.list.length - 1));
+    render();
+  }
+  async function undo() {
+    if (R.busy) return;
+    const h = R.done.pop();
+    if (!h) return toast("Nothing to undo.");
+    R.busy = true;
+    try { await api(`/api/clips/${h.card.id}`, { method: "PATCH", body: { rating: h.prev } }); } catch (e) { R.done.push(h); return fail(e); } finally { R.busy = false; }
+    h.card.rating = h.prev;
+    if (R.f.new_only) R.list.splice(Math.min(h.i, R.list.length), 0, h.card);
+    R.i = Math.min(h.i, R.list.length - 1);
+    render();
+  }
+}
+
+routes.long = LongForm;
+Object.assign(JOB_LABEL, { longform_capture: "Capture long form", longform_export: "Render long form" });
+const LF_MODES = [["condensed", "Condensed", "The whole video minus dead air: silences, idle menu/AFK screens with no speech, and “um”s."],
+  ["highlights", "Highlights", "The AI picks the best moments (with the video-type playbook) up to a target length, in order, one chapter each."],
+  ["clips", "From clips", "The clips you ticked in AI Clips, in the order you ticked them."]];
+const LF_STAGE = { captured: ["info", "Captured"], edited: ["warn", "Edited"], rendered: ["ok", "Rendered"], uploaded: ["ok", "Uploaded"] };
+const lfOffsets = (segs) => { let acc = 0; return segs.map(([a, b]) => { const o = acc; acc += b - a; return o; }); };
+const lfLen = (segs) => segs.reduce((s, [a, b]) => s + b - a, 0);
+const lowerBound = (xs, v) => { let lo = 0, hi = xs.length; while (lo < hi) { const m = (lo + hi) >> 1; if (xs[m] < v) lo = m + 1; else hi = m; } return lo; };
+function lfSeqWords(words, starts, segs) { // mirrors longform.seq_words (words sorted by start)
+  const offs = lfOffsets(segs), out = [];
+  segs.forEach(([a, b], i) => {
+    for (let j = lowerBound(starts, a - 30), n = lowerBound(starts, b); j < n; j++) {
+      const w = words[j], m = (w.s + w.e) / 2;
+      if (m >= a && m < b) out.push({ ...w, s: offs[i] + w.s - a, e: offs[i] + Math.min(w.e, b) - a });
+    }
+  });
+  return out;
+}
+
+// Editor → "Long form": existing long forms of this project and the three capture modes.
+async function openLongCapture(pid, pickedIds = []) {
+  const list = await api(`/api/projects/${pid}/longform`).catch(() => []);
+  modal(`<h2>Long form</h2><p class="muted" style="margin-top:-6px">A separate landscape edit of this video, with chapters, its own render and its own posts. Clips are not changed.</p>
+    ${list.length ? `<div class="stack" style="gap:6px;margin-bottom:14px">${list.map((d) => `<a class="row lf-row" href="#/long/${esc(d.id)}"><b class="grow">${esc(d.title)}</b>
+        <span class="dim">${fmt(d.length, 0)} · ${d.segments.length} segments</span>${pill(LF_STAGE, d.lf_stage)}</a>`).join("")}</div>` : ""}
+    <h3 style="margin-bottom:8px">New long-form edit</h3>
+    <div class="seg" id="lfm">${LF_MODES.map(([k, l]) => `<button data-v="${k}">${l}</button>`).join("")}</div>
+    <p class="muted" id="lfm-help" style="font-size:12.5px"></p><div id="lfm-opts" class="stack"></div>
+    <label class="field">Title<input type="text" id="lf-title" maxlength="100" placeholder="Automatic"></label>
+    <label class="slider"><span>Transitions</span><input type="range" id="lf-tr" min="0" max="1" step="0.05" value="0"><output>off</output></label>
+    <p class="dim" style="font-size:11.5px;margin:0">A short fade between separate moments (none inside a condensed run).</p>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="lf-go">Capture</button></div>`, (m, close) => {
+    let mode = pickedIds.length ? "clips" : "condensed";
+    const opts = () => ({
+      condensed: `<label class="slider"><span>Keep padding</span><input type="range" id="lf-pad" min="0" max="1" step="0.05" value="0.25"><output>0.25 s</output></label>
+        <p class="dim" style="font-size:11.5px;margin:0">Air kept around speech at each cut. Uses the silences, on-screen motion and word timings already analysed (no re-scan).</p>`,
+      highlights: `<label class="field">Target length (minutes)<input type="number" id="lf-target" min="1" max="240" step="1" value="10"></label>
+        ${S.settings?.anthropic_key_set ? "" : `<p class="dim" style="font-size:11.5px;margin:0">No Claude key: the offline picker chooses the moments.</p>`}`,
+      clips: pickedIds.length ? `<p style="margin:0">${pickedIds.length} clip${pickedIds.length > 1 ? "s" : ""} in the order you ticked them (reorder later on the timeline).</p>`
+        : `<p class="dim" style="margin:0">Tick clips in the AI Clips list first (their order is kept), then open this again.</p>` })[mode];
+    const set = (v) => { mode = v; $$("#lfm button", m).forEach((b) => b.classList.toggle("on", b.dataset.v === v));
+      $("#lfm-help", m).textContent = LF_MODES.find(([k]) => k === v)[2]; $("#lfm-opts", m).innerHTML = opts(); $("#lf-go", m).disabled = v === "clips" && !pickedIds.length; };
+    set(mode);
+    $("#lfm", m).onclick = (e) => e.target.dataset.v && set(e.target.dataset.v);
+    m.oninput = (e) => { if (e.target.type === "range") e.target.nextElementSibling.textContent = e.target.id === "lf-tr" ? (+e.target.value ? `${e.target.value} s` : "off") : `${e.target.value} s`; };
+    $("#lf-go", m).onclick = async () => {
+      const body = { mode, title: $("#lf-title", m).value.trim(), transition: +$("#lf-tr", m).value };
+      if (mode === "condensed") body.pad = +$("#lf-pad", m).value;
+      if (mode === "highlights") body.target = Math.max(1, +$("#lf-target", m).value || 10) * 60;
+      if (mode === "clips") body.clip_ids = pickedIds;
+      try { const d = await api(`/api/projects/${pid}/longform`, { body }); close(); location.hash = `#/long/${d.id}`; } catch (err) { fail(err); }
+    };
+  });
+}
+
+function LongForm(lid) {
+  const L = { d: null, proj: null, words: [], starts: [], seq: [], offs: [], sel: 0, cur: 0, t: 0, tab: "segments", zoom: 1, plan: null, picked: new Set(), assets: null, akind: "", tsk: "caption",
+    hist: RWUndo.History(100, 1000), srv: null }; // srv = the doc as the server has it (trim drags change segments in place)
+  let video, raf, keyH, saveT, drag = null, sig = "";
+  const segs = () => L.d.segments, total = () => lfLen(segs()), locked = () => !!L.d.locked;
+  const pid = () => L.d.project_id, dur = () => L.proj?.meta?.duration || 0;
+  const reindex = () => { L.offs = lfOffsets(segs()); L.seq = lfSeqWords(L.words, L.starts, segs()); L.sel = Math.max(0, Math.min(L.sel, segs().length - 1)); L._ck = null; };
+  const segAt = (t) => Math.max(0, lowerBound(L.offs, t + 1e-6) - 1);
+
+  this.mount = async () => {
+    if (!lid) return listPage();
+    L.d = await api(`/api/longform/${lid}`);
+    L.srv = structuredClone(L.d);
+    L.proj = await api(`/api/projects/${L.d.project_id}`);
+    const tr = await fetch(`/files/${L.d.project_id}/transcript.json`).then((r) => (r.ok ? r.json() : { segments: [] })).catch(() => ({ segments: [] }));
+    L.words = (tr.segments || []).flatMap((s) => s.words || []).sort((a, b) => a.s - b.s);
+    L.starts = L.words.map((w) => w.s);
+    reindex();
+    layout();
+    keyH = (e) => {
+      if (e.target.closest("input, textarea, select, [contenteditable]") || $("#modal-root").innerHTML) return;
+      const z = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase();
+      if (z === "z" || z === "y") { e.preventDefault(); undoRedo(z === "y" || e.shiftKey); }
+      else if (e.code === "Space") { e.preventDefault(); toggle(); }
+    };
+    document.addEventListener("keydown", keyH);
+  };
+  this.destroy = () => { cancelAnimationFrame(raf); video?.pause(); if (keyH) document.removeEventListener("keydown", keyH); };
+  this.refresh = async () => {
+    if (!L.d) return;
+    const d = await api(`/api/longform/${lid}`);
+    const was = L.d.status;
+    L.d = { ...d, segments: drag ? L.d.segments : d.segments };
+    if (was !== d.status) { reindex(); return layout(); }
+    const pb = $("#ovl .bar div"); if (pb) pb.style.width = Math.round((d.job?.progress || 0) * 100) + "%";
+    const s = JSON.stringify([d.export, d.job, d.uploads, d.locked, d.lf_stage]);
+    if (s !== sig) { sig = s; renderTop(); if (L.tab === "publish") renderTab(); }
+  };
+
+  async function listPage() {
+    const all = await api("/api/longform");
+    view.innerHTML = `<div class="page"><h1>Long form</h1><p class="sub">Separate landscape edits of whole videos: condensed cuts, highlight reels and clip compilations. Start one from a project's Editor (“▬ Long form”).</p>
+      ${all.length ? `<div class="stack">${all.map((d) => `<a class="card row lf-row" href="#/long/${esc(d.id)}">${d.export?.cover ? `<img src="/files/${esc(d.project_id)}/${esc(d.export.cover)}" alt="" style="height:54px;border-radius:6px">` : ""}
+          <div class="grow"><b>${esc(d.title)}</b><div class="dim" style="font-size:12px">${esc(d.project_name || "")} · ${esc(LF_MODES.find(([k]) => k === d.mode)?.[1] || d.mode)} · ${fmt(d.length, 0)}</div></div>
+          ${pill(LF_STAGE, d.lf_stage)}</a>`).join("")}</div>` : `<div class="card empty"><b>No long-form edits yet</b>Open a project in the Editor and choose “▬ Long form”.</div>`}</div>`;
+  }
+
+  // ----- save -----
+  function save(body, delay = 0, record = true) {
+    if (locked() && Object.keys(body).some((k) => k !== "title")) return toast("Already posted — make a new version to edit it.", "err");
+    clearTimeout(saveT);
+    L.pendingBody = { ...(L.pendingBody || {}), ...body, ...(body.edit ? { edit: { ...(L.pendingBody?.edit || {}), ...body.edit } } : {}) };
+    L.pendingRec = (L.pendingRec ?? true) && record;
+    saveT = setTimeout(async () => {
+      const b = L.pendingBody, undo = L.pendingRec && L.srv ? RWUndo.inverse(b, L.srv) : null; L.pendingBody = L.pendingRec = null;
+      try {
+        const d = await api(`/api/longform/${lid}`, { method: "PATCH", body: b }); L.srv = structuredClone(d);
+        if (undo) L.hist.push(lid, undo, b);
+        L.d = { ...d, segments: drag ? L.d.segments : d.segments }; reindex(); renderTop(); paintTimeline(); if (!b.edit || b.edit.overlays) renderTab();
+      }
+      catch (err) { fail(err); L.d = await api(`/api/longform/${lid}`); L.srv = structuredClone(L.d); reindex(); renderTab(); paintTimeline(); }
+    }, delay);
+  }
+  async function undoRedo(redo) {
+    if (locked()) return toast("Already posted — make a new version to edit it.", "err");
+    if (L.pendingBody) { // an edit still on its debounce: save (and record) it first, so it stays undoable
+      clearTimeout(saveT);
+      const p = L.pendingBody, undo = L.pendingRec !== false && L.srv ? RWUndo.inverse(p, L.srv) : null; L.pendingBody = L.pendingRec = null;
+      try { L.srv = structuredClone(await api(`/api/longform/${lid}`, { method: "PATCH", body: p })); if (undo) L.hist.push(lid, undo, p); } catch (e) { return fail(e); }
+    }
+    const b = redo ? L.hist.redo(lid) : L.hist.undo(lid);
+    if (!b) return toast(redo ? "Nothing to redo." : "Nothing to undo.");
+    L.d = { ...L.d, ...b, edit: { ...L.d.edit, ...(b.edit || {}) } }; reindex(); applyPreview(); paintTimeline(); renderTab();
+    save(b, 0, false);
+  }
+  const setSegs = (next, delay = 0) => { L.d.segments = next; reindex(); paintTimeline(); renderTab(); save({ segments: next }, delay); };
+  const setEdit = (patch, delay = 250) => { L.d.edit = { ...L.d.edit, ...patch }; applyPreview(); save({ edit: patch }, delay); };
+
+  // ----- layout -----
+  function layout() {
+    const d = L.d, p = L.proj, capturing = d.status === "capturing";
+    view.innerHTML = `<div class="editor lf">
+      <div class="ed-top">
+        <a class="btn ghost sm" href="#/editor/${esc(pid())}">← Editor</a>
+        <div class="title" title="${esc(d.title)} — click to rename" data-act="rename" style="cursor:text">${esc(d.title)}</div>
+        <span class="chip">Long form · ${esc(LF_MODES.find(([k]) => k === d.mode)?.[1] || d.mode)}</span>
+        <span id="lf-st"></span><div class="grow"></div><div id="lf-top" class="row"></div>
+      </div>
+      <div class="stage">
+        <div class="player">${p.source ? `<div class="vwrap lf-frame" id="lf-frame"><video id="vid" src="/files/${esc(pid())}/${esc(p.proxy || p.source)}" preload="auto" playsinline></video>
+            <div class="title-preview" id="tprev" hidden></div><div class="sticker-preview" id="sprev" hidden></div><div class="cap-preview" id="cprev"></div></div>` : ""}
+          <div class="overlay-msg" id="ovl" ${capturing || d.status === "failed" ? "" : "hidden"}>${d.status === "failed"
+            ? `<b style="color:var(--err)">Capture failed</b><div class="muted" style="max-width:520px">${esc(d.error)}</div>`
+            : `<div class="spin" style="width:28px;height:28px;color:var(--accent)"></div><b>Capturing from the analysis…</b><div style="width:min(320px,70vw)">${bar(d.job?.progress)}</div>`}</div></div>
+        <div class="transport">
+          <button class="btn sm" data-act="play" title="Space">▶</button>
+          <span class="tc" id="tc">0:00.0 / ${fmt(total())}</span>
+          <span class="dim" style="font-size:12px" id="lf-segno"></span><div class="grow"></div>
+          <button class="btn xs" data-act="split" title="Split the segment under the playhead">✂ Split</button>
+          <button class="btn xs" data-act="chapter-here" title="Add a chapter at the playhead">＋ Chapter</button>
+        </div>
+        <div class="timeline"><div class="tl-scroll" id="lf-scroll"><div class="lf-track" id="lf-track"></div></div>
+          <div class="tl-foot"><span>Zoom</span><input type="range" id="lf-zoom" min="1" max="60" step="0.5" value="${L.zoom}" style="width:min(160px,30vw)">
+            <span class="grow"></span><span>Drag a segment to reorder · drag its edges to trim · click to seek · <span class="kbd">Space</span> play</span></div></div>
+      </div>
+      <div class="panel"><div class="tabs">${[["segments", "Segments"], ["chapters", "Chapters"], ["style", "Style"], ["overlays", "Overlays"], ["ai", "AI"], ["publish", "Render & post"]]
+        .map(([k, l]) => `<button data-tab="${k}" class="${L.tab === k ? "on" : ""}">${l}</button>`).join("")}</div><div class="tab-body" id="tab"></div></div></div>`;
+    video = $("#vid");
+    if (video) {
+      video.addEventListener("loadedmetadata", () => { applyPreview(); seekSeq(L.t); });
+      video.addEventListener("play", () => { $("[data-act=play]").textContent = "❚❚"; L.cur = segAt(L.t); if (!inSeg()) seekSeq(L.t); tick(); });
+      video.addEventListener("pause", () => { $("[data-act=play]").textContent = "▶"; });
+      video.addEventListener("seeked", () => { L.seeking = false; paint(); });
+      new ResizeObserver(() => { applyPreview(); paintTimeline(); }).observe($(".player"));
+    }
+    $("#lf-zoom").oninput = (e) => { L.zoom = +e.target.value; paintTimeline(); };
+    $(".tabs").onclick = (e) => { const t = e.target.closest("[data-tab]"); if (t) { L.tab = t.dataset.tab; $$(".tabs button").forEach((b) => b.classList.toggle("on", b === t)); renderTab(); } };
+    view.onclick = onClick;
+    bindTimeline();
+    renderTop(); renderTab(); paintTimeline();
+  }
+
+  function renderTop() {
+    const d = L.d, ex = d.export || {}, el = $("#lf-top");
+    if (!el) return;
+    $("#lf-st").innerHTML = pill(LF_STAGE, d.lf_stage);
+    const rendering = ex.status === "rendering" || d.job?.kind === "longform_export";
+    el.innerHTML = d.locked ? `<span class="dim" style="font-size:12px">🔒 Posted — locked</span><button class="btn sm" data-act="version">Make a new version</button>`
+      : `${rendering ? `<span class="row" style="gap:6px;font-size:12px"><span class="spin"></span> Rendering ${Math.round((ex.progress || 0) * 100)}%</span>`
+        : d.current ? `<a class="btn sm" href="/files/${esc(pid())}/${esc(ex.file)}?r=${+d.rev}" target="_blank">▶ Watch render</a>`
+          : `<button class="btn sm" data-act="render" ${d.status === "ready" ? "" : "disabled"}>⬇ Render</button>`}
+        ${ex.status === "failed" ? `<span style="color:var(--err);font-size:12px" title="${esc(ex.error)}">Render failed</span>` : ""}
+        <button class="btn xs ghost" data-act="undo" title="Undo (Ctrl+Z)">↶</button><button class="btn xs ghost" data-act="redo" title="Redo (Ctrl+Y or Ctrl+Shift+Z)">↷</button>
+        <button class="btn sm primary" data-act="publish" ${d.status === "ready" ? "" : "disabled"}>⇪ Publish</button>`;
+    el.insertAdjacentHTML("afterbegin", nleLinks(`/api/longform/${esc(lid)}`));
+  }
+
+  // ----- preview: output frame shape, captions/title/sticker -----
+  function applyPreview() {
+    const fr = $("#lf-frame"), e = L.d.edit;
+    if (!fr || !video?.videoWidth) return;
+    const [OW, OH] = SIZES[e.aspect] || [video.videoWidth, video.videoHeight];
+    const box = $(".player"), k = Math.min(box.clientWidth / OW, box.clientHeight / OH) * Math.min(1, S.ui.preview || 1);
+    Object.assign(fr.style, { width: OW * k + "px", height: OH * k + "px", overflow: "hidden" });
+    Object.assign(video.style, { width: "100%", height: "100%", maxWidth: "none", maxHeight: "none", objectFit: e.aspect === "source" || e.fit === "blur" ? "contain" : "cover",
+      objectPosition: `${e.crop_x * 100}% ${e.crop_y * 100}%`, filter: `brightness(${1 + e.brightness}) contrast(${e.contrast}) saturate(${e.saturation})`, background: "#000" });
+    const scale = (OH * k) / OH, ts = (kind) => tsOf((x) => e[`${kind}_${x}`], tsDefaults(kind, e, OW, OH));
+    const cp = $("#cprev"); styleText(cp, ts("caption"), scale);
+    cp.style.bottom = CAPTION_POS[e.caption_pos || "low"][OH > OW ? 0 : 1] * OH * scale + "px";
+    cp.style.background = e.caption_style === "boxed" ? "#0009" : "";
+    const tp = $("#tprev"); styleText(tp, ts("title"), scale); tp.textContent = e.title_text || "";
+    const sp = $("#sprev"); styleText(sp, ts("sticker"), scale); sp.textContent = e.sticker_text || ""; sp.hidden = !e.sticker_text;
+    if (e.sticker_text) Object.assign(sp.style, { background: S.settings?.caption_color || "#FFD400", top: e.sticker_pos.startsWith("top") ? "5%" : "", bottom: e.sticker_pos.startsWith("bottom") ? "5%" : "",
+      left: e.sticker_pos.endsWith("left") ? "4%" : e.sticker_pos.endsWith("center") ? "50%" : "", right: e.sticker_pos.endsWith("right") ? "4%" : "", transform: e.sticker_pos.endsWith("center") ? "translateX(-50%)" : "" });
+    paint();
+  }
+  function paintCaption() {
+    const el = $("#cprev"), e = L.d.edit;
+    if (!el) return;
+    const tp = $("#tprev"); if (tp) tp.hidden = !(e.title_text && L.t < (L.offs[1] ?? total())); // the title card rides on the first part
+    if (!e.captions) return (el.innerHTML = "");
+    const OW = (SIZES[e.aspect] || [16, 9])[0], OH = (SIZES[e.aspect] || [16, 9])[1];
+    const key = L.d.rev + ":" + e.aspect;
+    if (L._ck !== key) { L._ck = key; L._chunks = chunkWords(L.seq, OH > OW); }
+    const t = L.t, ch = L._chunks.find((c) => t >= c[0].s && t <= c.at(-1).e + 0.15);
+    const upper = S.settings?.caption_uppercase !== false, color = S.settings?.caption_color || "#FFD400";
+    el.innerHTML = ch ? ch.map((w, i) => { const x = esc(upper ? w.w.trim().toUpperCase() : w.w.trim()); return t >= w.s && (i === ch.length - 1 || t < ch[i + 1].s) ? `<em style="color:${esc(color)}">${x}</em>` : x; }).join(" ") : "";
+  }
+
+  // ----- sequence playback: one <video> of the source, jumping from segment to segment -----
+  const inSeg = () => { const s = segs()[L.cur]; return s && video.currentTime >= s[0] - 0.05 && video.currentTime < s[1]; };
+  function seekSeq(t) {
+    if (!segs().length || !video) return;
+    L.t = Math.min(Math.max(t, 0), Math.max(total() - 0.01, 0));
+    L.cur = segAt(L.t);
+    L.seeking = true;
+    video.currentTime = segs()[L.cur][0] + L.t - L.offs[L.cur];
+    paint();
+  }
+  function tick() {
+    cancelAnimationFrame(raf);
+    if (!video || video.paused) return;
+    const s = segs()[L.cur];
+    if (s && !L.seeking) {
+      if (video.currentTime >= s[1] - 0.03) {
+        if (L.cur + 1 < segs().length) { const n = segs()[++L.cur]; if (Math.abs(n[0] - video.currentTime) > 0.08) { L.seeking = true; video.currentTime = n[0]; } }
+        else { video.pause(); L.t = total(); }
+      }
+      if (!L.seeking) L.t = L.offs[L.cur] + Math.max(0, video.currentTime - segs()[L.cur][0]);
+    }
+    paint();
+    raf = requestAnimationFrame(tick);
+  }
+  const toggle = () => { if (!video) return; if (video.paused) { if (L.t >= total() - 0.05) seekSeq(0); video.play(); } else video.pause(); };
+  function paint() {
+    const tc = $("#tc"); if (tc) tc.textContent = `${fmt(L.t)} / ${fmt(total())}`;
+    const no = $("#lf-segno"); if (no && segs().length) no.textContent = `segment ${L.cur + 1} of ${segs().length} · source ${fmt(segs()[L.cur][0] + L.t - L.offs[L.cur])}`;
+    const ph = $("#lf-ph"); if (ph) ph.style.left = L.t * L.pps + "px";
+    paintCaption();
+  }
+
+  // ----- timeline: blocks sized by length; drag to reorder, edges to trim, click to seek -----
+  function paintTimeline() {
+    const tr = $("#lf-track"), sc = $("#lf-scroll");
+    if (!tr || !sc) return;
+    const width = Math.max(sc.clientWidth - 2, 200) * L.zoom;
+    if (!drag) L.pps = width / Math.max(total(), 0.1);
+    const pps = L.pps, sel = L.sel;
+    tr.style.width = Math.max(width, total() * pps) + "px";
+    tr.innerHTML = segs().map(([a, b], i) => `<div class="lf-seg${i === sel ? " sel" : ""}${i % 2 ? " alt" : ""}" data-i="${i}" style="left:${L.offs[i] * pps}px;width:${Math.max((b - a) * pps, 2)}px"
+        title="${i + 1}: ${fmt(a)} → ${fmt(b)} (${(b - a).toFixed(1)} s)">${(b - a) * pps > 46 ? `<span>${i + 1}</span>` : ""}${locked() ? "" : `<i class="lf-h" data-side="l"></i><i class="lf-h" data-side="r"></i>`}</div>`).join("")
+      + (L.d.chapters || []).map((c, i) => `<div class="lf-chm" data-ch="${i}" style="left:${c.t * pps}px" title="${esc(fmt(c.t, 0))} ${esc(c.title)}"><span>${esc(c.title)}</span></div>`).join("")
+      + `<div class="lf-ph" id="lf-ph" style="left:${L.t * pps}px"></div><div class="lf-ins" id="lf-ins" hidden></div>`;
+  }
+  function bindTimeline() {
+    const tr = $("#lf-track");
+    if (!tr) return;
+    const x = (ev) => localXY(ev, tr)[0];
+    tr.onpointerdown = (ev) => {
+      if (ev.button !== 0) return;
+      const blk = ev.target.closest(".lf-seg"), h = ev.target.closest(".lf-h"), chm = ev.target.closest(".lf-chm");
+      if (chm) return seekSeq(L.d.chapters[+chm.dataset.ch].t);
+      const i = blk ? +blk.dataset.i : -1;
+      if (h && !locked()) drag = { kind: "trim", i, side: h.dataset.side, x0: x(ev), orig: [...segs()[i]] };
+      else if (blk && !locked()) drag = { kind: "move", i, x0: x(ev), moved: false };
+      else { drag = { kind: "scrub" }; seekSeq(x(ev) / L.pps); }
+      tr.setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+    };
+    tr.onpointermove = (ev) => {
+      if (!drag) return;
+      const px = x(ev);
+      if (drag.kind === "scrub") return seekSeq(px / L.pps);
+      if (drag.kind === "trim") {
+        const s = segs()[drag.i], dt = (px - drag.x0) / L.pps;
+        if (drag.side === "l") s[0] = +Math.min(Math.max(drag.orig[0] + dt, 0), s[1] - 0.1).toFixed(3);
+        else s[1] = +Math.min(Math.max(drag.orig[1] + dt, s[0] + 0.1), dur()).toFixed(3);
+        reindex(); paintTimeline();
+        if (video) { video.pause(); video.currentTime = drag.side === "l" ? s[0] : Math.max(s[1] - 0.05, s[0]); }
+        return;
+      }
+      if (Math.abs(px - drag.x0) > 5) drag.moved = true;
+      if (!drag.moved) return;
+      drag.to = lowerBound(L.offs.map((o, j) => o + (segs()[j][1] - segs()[j][0]) / 2), px / L.pps); // insert before the first block whose middle is right of the pointer
+      const ins = $("#lf-ins"); ins.hidden = false; ins.style.left = (drag.to < segs().length ? L.offs[drag.to] : total()) * L.pps + "px";
+    };
+    tr.onpointerup = () => {
+      const g = drag; drag = null;
+      if (!g || g.kind === "scrub") return;
+      if (g.kind === "trim") { L.sel = g.i; return setSegs(segs().map((s) => [...s])); }
+      if (!g.moved) { L.sel = g.i; paintTimeline(); renderTab(); return seekSeq(L.offs[g.i]); }
+      const next = segs().map((s) => [...s]), [m] = next.splice(g.i, 1), to = g.to > g.i ? g.to - 1 : g.to;
+      next.splice(to, 0, m);
+      L.sel = to;
+      if (to !== g.i) setSegs(next); else paintTimeline();
+    };
+    tr.onpointercancel = () => { drag = null; paintTimeline(); };
+  }
+
+  // ----- actions -----
+  async function onClick(ev) {
+    const a = ev.target.closest("[data-act]");
+    if (!a) return;
+    const act = a.dataset.act, i = +a.dataset.i;
+    try {
+      switch (act) {
+        case "play": toggle(); break;
+        case "rename": { const t = prompt("Long-form title", L.d.title); if (t && t.trim()) { save({ title: t.trim() }); $(".ed-top .title").textContent = t.trim(); } break; }
+        case "split": {
+          const s = segs()[L.cur], at = s[0] + L.t - L.offs[L.cur];
+          if (at - s[0] < 0.2 || s[1] - at < 0.2) return toast("Move the playhead inside a segment, away from its edges.");
+          const next = segs().map((x) => [...x]); next.splice(L.cur, 1, [s[0], +at.toFixed(3)], [+at.toFixed(3), s[1]]); L.sel = L.cur + 1; setSegs(next); break;
+        }
+        case "seg-go": L.sel = i; seekSeq(L.offs[i]); paintTimeline(); renderTab(); break;
+        case "seg-up": case "seg-down": { const j = act === "seg-up" ? i - 1 : i + 1; if (j < 0 || j >= segs().length) break; const next = segs().map((x) => [...x]); [next[i], next[j]] = [next[j], next[i]]; L.sel = j; setSegs(next); break; }
+        case "seg-del": if (segs().length < 2) return toast("A long form needs at least one segment."); L.sel = Math.max(0, i - 1); setSegs(segs().filter((_, j) => j !== i)); break;
+        case "chapter-here": { const ch = [...(L.d.chapters || []), { t: +L.t.toFixed(2), title: `Chapter ${(L.d.chapters || []).length + 1}` }].sort((x, y) => x.t - y.t); L.d.chapters = ch; save({ chapters: ch }); L.tab = "chapters"; $$(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === "chapters")); renderTab(); paintTimeline(); break; }
+        case "ch-go": seekSeq(L.d.chapters[i].t); break;
+        case "ch-del": L.d.chapters = L.d.chapters.filter((_, j) => j !== i); save({ chapters: L.d.chapters }); renderTab(); paintTimeline(); break;
+        case "ch-auto": a.disabled = true; a.innerHTML = `<span class="spin"></span> Writing…`; L.d = await api(`/api/longform/${lid}/chapters/auto`, { method: "POST" }); renderTab(); paintTimeline(); break;
+        case "set": { const v = a.dataset.v; setEdit({ [a.dataset.k]: v === "" || isNaN(+v) ? v : +v }, 0); renderTab(); break; }
+        case "layout": setEdit({ layout: a.dataset.v }, 0); renderTab(); break;
+        case "tsk": L.tsk = a.dataset.v; renderTab(); break;
+        case "music": $("#lf-musicf").click(); break;
+        case "nomusic": setEdit({ music: "" }, 0); renderTab(); break;
+        case "ov-text": case "ov-emoji": {
+          const text = $(act === "ov-text" ? "#lf-ovt" : "#lf-ove").value.trim();
+          if (!text) return toast("Type the text first.");
+          addOverlay({ kind: act === "ov-text" ? "text" : "emoji", text, d: 2.5, x: 0.5, y: act === "ov-text" ? 0.2 : 0.3, w: act === "ov-text" ? 0.5 : 0.12, anim: "pop" }); break;
+        }
+        case "ov-asset": { const as = L.assets.find((x) => x.id === a.dataset.id); addOverlay({ kind: as.kind, asset_id: as.id, x: 0.8, y: 0.25, w: 0.25, anim: as.kind === "sound" ? "none" : "pop" }); break; }
+        case "ov-go": seekSeq(+L.d.edit.overlays[i].t); break;
+        case "ov-del": setEdit({ overlays: (L.d.edit.overlays || []).filter((_, j) => j !== i) }, 0); renderTab(); break;
+        case "akind": L.akind = a.dataset.v; renderTab(); break;
+        case "plan": {
+          a.disabled = true; a.innerHTML = `<span class="spin"></span> Planning…`;
+          L.plan = await api(`/api/longform/${lid}/plan`, { body: { prompt: $("#lf-ask").value } });
+          L.picked = new Set(L.plan.items.map((x) => x.id)); renderTab(); break;
+        }
+        case "plan-apply": L.d = await api(`/api/longform/${lid}/apply`, { body: { plan_id: L.plan.plan_id, item_ids: [...L.picked] } }); L.plan = null; reindex(); applyPreview(); renderTab(); toast("Applied.", "ok"); break;
+        case "render": await api(`/api/longform/${lid}/export`, { method: "POST" }); L.d.export = { status: "rendering", progress: 0, rev: L.d.rev }; renderTop(); toast("Rendering the long form — it keeps going if you leave this page.", "ok"); break;
+        case "publish": openPublish({ id: lid, title: L.d.title, edit: L.d.edit, hook: L.d.chapters_text || "", hashtags: [] }, () => this_refresh(), L.d); break;
+        case "version": { const v = await api(`/api/longform/${lid}/version`, { method: "POST" }); location.hash = `#/long/${v.id}`; break; }
+        case "undo": case "redo": undoRedo(act === "redo"); break;
+      }
+    } catch (err) { fail(err); renderTab(); }
+  }
+  const this_refresh = () => api(`/api/longform/${lid}`).then((d) => { L.d = d; renderTop(); renderTab(); }).catch(() => {});
+  function addOverlay(o) {
+    if (L.t >= total() - 0.1) return toast("Move the playhead inside the video first.");
+    setEdit({ overlays: [...(L.d.edit.overlays || []), { ...o, t: +L.t.toFixed(2) }] }, 0);
+    toast(`Added at ${fmt(L.t)}.`, "ok", 1500);
+  }
+
+  // ----- side panel -----
+  function renderTab() {
+    const el = $("#tab");
+    if (!el || !L.d) return;
+    el.oninput = el.onchange = null;
+    const e = L.d.edit, ro = locked() ? "disabled" : "";
+    const seg = (k, cur, opts) => `<div class="seg">${opts.map(([v, l]) => `<button class="${String(cur) === String(v) ? "on" : ""}" data-act="set" data-k="${k}" data-v="${v}" ${ro}>${l}</button>`).join("")}</div>`;
+    const sw = (k, l) => `<label class="switch"><input type="checkbox" data-k="${k}" ${e[k] ? "checked" : ""} ${ro}> ${l}</label>`;
+    const rng = (k, l, min, max, step) => `<label class="slider"><span>${l}</span><input type="range" data-k="${k}" min="${min}" max="${max}" step="${step}" value="${+e[k]}" ${ro}><output>${(+e[k]).toFixed(2)}</output></label>`;
+    if (L.tab === "segments") {
+      const shown = segs().length > 400 ? segs().slice(Math.max(0, L.sel - 150), L.sel + 250) : segs(), first = segs().indexOf(shown[0]);
+      el.innerHTML = `<div class="row" style="margin-bottom:8px;font-size:12.5px"><b class="grow">${segs().length} segments · ${fmt(total(), 0)}</b><span class="dim">from ${fmt(dur(), 0)} of source</span></div>
+        ${segs().length > shown.length ? `<p class="dim" style="font-size:11.5px">Showing ${shown.length} around the selected one (click the timeline to move).</p>` : ""}
+        <div class="stack lf-list" style="gap:4px">${shown.map(([a, b], k) => { const j = first + k; return `<div class="lf-item${j === L.sel ? " sel" : ""}">
+          <button class="btn xs ghost" data-act="seg-go" data-i="${j}" title="Play from here">${j + 1}</button>
+          <input type="text" class="mono" data-seg="${j}" data-end="0" value="${fmt(a, 2)}" ${ro} aria-label="Start of segment ${j + 1}"><span class="dim">→</span>
+          <input type="text" class="mono" data-seg="${j}" data-end="1" value="${fmt(b, 2)}" ${ro} aria-label="End of segment ${j + 1}"><span class="dim grow">${(b - a).toFixed(1)}s</span>
+          <button class="btn xs ghost" data-act="seg-up" data-i="${j}" ${ro || (j ? "" : "disabled")} title="Earlier">▲</button><button class="btn xs ghost" data-act="seg-down" data-i="${j}" ${ro || (j < segs().length - 1 ? "" : "disabled")} title="Later">▼</button>
+          <button class="btn xs ghost danger" data-act="seg-del" data-i="${j}" ${ro} title="Remove">✕</button></div>`; }).join("")}</div>`;
+      el.onchange = (ev) => { const t = ev.target; if (t.dataset.seg == null) return; const j = +t.dataset.seg, v = parseTime(t.value);
+        if (!isFinite(v)) return renderTab(); const next = segs().map((s) => [...s]); next[j][+t.dataset.end] = +Math.min(Math.max(v, 0), dur()).toFixed(3);
+        if (next[j][1] - next[j][0] < 0.1) { toast("A segment must be at least 0.1 s long."); return renderTab(); } L.sel = j; setSegs(next); };
+    } else if (L.tab === "chapters") {
+      const ch = L.d.chapters || [];
+      el.innerHTML = `<p class="muted" style="font-size:12.5px;margin-top:0">Chapters go into the YouTube description. YouTube needs the first at 0:00, at least 3, each at least 10 s.</p>
+        <div class="stack" style="gap:4px">${ch.map((c, j) => `<div class="lf-item"><button class="btn xs ghost" data-act="ch-go" data-i="${j}">▶</button>
+          <input type="text" class="mono" style="width:76px" data-ch="${j}" data-f="t" value="${fmt(c.t, 0)}" ${ro}><input type="text" class="grow" data-ch="${j}" data-f="title" value="${esc(c.title)}" maxlength="100" ${ro}>
+          <button class="btn xs ghost danger" data-act="ch-del" data-i="${j}" ${ro}>✕</button></div>`).join("") || `<div class="dim">No chapters yet.</div>`}</div>
+        <div class="row wrap" style="margin-top:10px"><button class="btn sm" data-act="chapter-here" ${ro}>＋ At playhead</button><button class="btn sm" data-act="ch-auto" ${ro}>✨ Auto chapters</button></div>
+        <div class="sec"><h3>YouTube chapters</h3>${L.d.chapters_text ? `<pre class="mono lf-pre">${esc(L.d.chapters_text)}</pre>` : `<p class="dim" style="margin:0">Not valid for YouTube yet (needs 3+ chapters, 10 s+ each).</p>`}</div>`;
+      el.onchange = (ev) => { const t = ev.target; if (t.dataset.ch == null) return; const next = ch.map((c) => ({ ...c }));
+        next[+t.dataset.ch][t.dataset.f] = t.dataset.f === "t" ? Math.min(Math.max(parseTime(t.value) || 0, 0), total()) : t.value;
+        L.d.chapters = next.sort((x, y) => x.t - y.t); save({ chapters: L.d.chapters }); paintTimeline(); };
+    } else if (L.tab === "style") {
+      el.innerHTML = `<div class="stack">
+        <div><h3>Frame</h3>${seg("aspect", e.aspect, [["16:9", "16:9"], ["source", "Source"], ["9:16", "9:16"], ["1:1", "1:1"], ["4:5", "4:5"]])}</div>
+        ${seg("fit", e.fit, [["crop", "Crop"], ["blur", "Blurred fit"]])}
+        <details ${isMulti(e) ? "open" : ""}><summary>Layout</summary><div class="lay-gal" style="margin-top:8px">${LAYOUTS.map(([v, l]) => `<button class="lay-card${(e.layout || "single") === v ? " on" : ""}" data-act="layout" data-v="${v}" title="${l}" ${ro}>${layoutThumb(v)}<span>${l}</span></button>`).join("")}</div>
+          <p class="dim" style="font-size:11.5px">Regions come from your saved default layout; fine-tune regions in a clip's Studio and “Save as default”.</p></details>
+        <div class="sec"><h3>Captions</h3>${sw("captions", "Animated captions")}${seg("caption_style", e.caption_style, [["bold", "Bold"], ["clean", "Clean"], ["boxed", "Boxed"], ["neon", "Neon"]])}
+          ${seg("caption_pos", e.caption_pos, [["low", "Low"], ["middle", "Middle"], ["high", "High"]])}
+          <label class="field">Title card (first part)<input type="text" data-k="title_text" maxlength="120" value="${esc(e.title_text)}" ${ro}></label>
+          <label class="field">Sticker (whole video)<input type="text" data-k="sticker_text" maxlength="120" value="${esc(e.sticker_text)}" ${ro}></label>
+          <div class="seg">${[["caption", "Captions"], ["title", "Title card"], ["sticker", "Sticker"]].map(([v, l]) => `<button class="${L.tsk === v ? "on" : ""}" data-act="tsk" data-v="${v}">${l}</button>`).join("")}</div>
+          <div id="lf-ts"></div></div>
+        <div class="sec"><h3>Cuts &amp; sound</h3>${sw("remove_fillers", "Also cut “um” / “uh”")}${sw("remove_silence", "Jump cuts inside segments")}${sw("loudnorm", "Loudness normalise (−14 LUFS)")}${sw("denoise", "Reduce noise")}
+          <label class="slider"><span>Transitions</span><input type="range" data-tr="1" min="0" max="1" step="0.05" value="${+L.d.transition || 0}" ${ro}><output>${+L.d.transition ? L.d.transition + " s" : "off"}</output></label>
+          <div class="row wrap"><button class="btn sm" data-act="music" ${ro}>♫ ${e.music ? "Replace music" : "Add music"}</button>${e.music ? `<span class="dim grow">${esc(e.music.replace(/^music\//, ""))}</span><button class="btn xs ghost" data-act="nomusic" ${ro}>Remove</button>` : ""}
+            <input type="file" id="lf-musicf" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac" hidden></div>
+          ${e.music ? rng("music_volume", "Music level", 0, 1, 0.01) : ""}</div>
+        <div class="sec"><h3>Look</h3>${rng("brightness", "Brightness", -0.5, 0.5, 0.01)}${rng("contrast", "Contrast", 0.5, 2, 0.01)}${rng("saturation", "Saturation", 0, 2, 0.01)}${sw("sharpen", "Sharpen")}</div></div>`;
+      const tk = L.tsk, OW = (SIZES[e.aspect] || [1920, 1080])[0], OH = (SIZES[e.aspect] || [1920, 1080])[1];
+      if (!locked()) textStyleEditor($("#lf-ts"), { get: (k) => L.d.edit[`${tk}_${k}`], set: (k, v) => setEdit({ [`${tk}_${k}`]: v }, 400), def: tsDefaults(tk, e, OW, OH), sample: tk === "caption" ? "THIS IS THE CAPTION" : tk === "title" ? (e.title_text || "Title card") : (e.sticker_text || "@handle") });
+      el.oninput = (ev) => { const t = ev.target;
+        if (t.dataset.tr) { t.nextElementSibling.textContent = +t.value ? `${t.value} s` : "off"; L.d.transition = +t.value; return save({ transition: +t.value }, 400); }
+        if (!t.dataset.k || t.type === "checkbox") return;
+        if (t.type === "range") { t.nextElementSibling.textContent = (+t.value).toFixed(2); setEdit({ [t.dataset.k]: +t.value }, 300); }
+        else setEdit({ [t.dataset.k]: t.value }, 600); };
+      el.onchange = async (ev) => { const t = ev.target;
+        if (t.type === "checkbox" && t.dataset.k) setEdit({ [t.dataset.k]: t.checked }, 0);
+        if (t.id === "lf-musicf" && t.files[0]) { const fd = new FormData(); fd.append("file", t.files[0]);
+          try { L.d = await api(`/api/longform/${lid}/music`, { body: fd }); toast("Music added.", "ok"); renderTab(); } catch (err) { fail(err); } } };
+    } else if (L.tab === "overlays") {
+      if (!L.assets) { L.assets = []; api("/api/assets").then((x) => { L.assets = x; if (L.tab === "overlays") renderTab(); }).catch(fail); }
+      const ovs = e.overlays || [], lib = L.assets.filter((x) => ["image", "gif", "video", "sound"].includes(x.kind) && (!L.akind || x.kind === L.akind));
+      el.innerHTML = `<p class="muted" style="font-size:12.5px;margin-top:0">Added at the playhead (${fmt(L.t)}). Times are in the long-form video.</p>
+        <div class="row"><input type="text" id="lf-ovt" class="grow" maxlength="80" placeholder="Text pop-up" ${ro}><button class="btn sm" data-act="ov-text" ${ro}>＋ Text</button></div>
+        <div class="row" style="margin-top:6px"><input type="text" id="lf-ove" class="grow" maxlength="8" placeholder="Emoji 😂" ${ro}><button class="btn sm" data-act="ov-emoji" ${ro}>＋ Emoji</button></div>
+        <div class="sec"><h3>Memes, GIFs &amp; sound effects</h3><div class="seg">${[["", "All"], ["image", "Images"], ["gif", "GIFs"], ["video", "Video"], ["sound", "Sounds"]].map(([v, l]) => `<button class="${L.akind === v ? "on" : ""}" data-act="akind" data-v="${v}">${l}</button>`).join("")}</div>
+          <div class="stack lf-lib" style="gap:4px">${lib.slice(0, 120).map((x) => `<button class="btn xs ghost lf-asset" data-act="ov-asset" data-id="${esc(x.id)}" ${ro}>${{ image: "🖼", gif: "✨", video: "🎞", sound: "🔊" }[x.kind] || ""} ${esc(x.name)}</button>`).join("") || `<span class="dim">Nothing in the library yet — add files in a clip's Studio.</span>`}</div></div>
+        <div class="sec"><h3>On this video (${ovs.length})</h3>${ovs.map((o, j) => `<div class="lf-item"><button class="btn xs ghost" data-act="ov-go" data-i="${j}">${fmt(o.t)}</button>
+          <span class="grow">${esc(o.kind)} · ${esc(o.text || (L.assets.find((x) => x.id === o.asset_id)?.name) || o.asset_id || "")}</span><span class="dim">${(+o.d).toFixed(1)}s</span>
+          <button class="btn xs ghost danger" data-act="ov-del" data-i="${j}" ${ro}>✕</button></div>`).join("") || `<div class="dim">None yet.</div>`}</div>`;
+    } else if (L.tab === "ai") {
+      const p = L.plan;
+      el.innerHTML = `<p class="muted" style="font-size:12.5px;margin-top:0">Type a request; the AI proposes a plan for this long form; approve the items you want.</p>
+        <textarea id="lf-ask" rows="3" placeholder="e.g. add a sound effect on each big moment and pop the chapter names on screen" ${ro}></textarea>
+        <div class="row" style="margin-top:8px"><button class="btn sm primary" data-act="plan" ${ro || (S.settings?.ai_ready?.plan ? "" : "disabled title='Add a Claude key or route Edit plans to another AI in Settings'")}>✨ Plan edits</button></div>
+        ${p ? `<div class="sec"><b>${esc(p.summary)}</b>${p.items.map((it) => `<label class="st-item"><input type="checkbox" data-plan="${esc(it.id)}" ${L.picked.has(it.id) ? "checked" : ""}>
+            <span><b>${esc(it.title)}</b><br><span class="dim">${esc(it.why)}</span></span></label>`).join("")}
+          ${p.dropped ? `<p class="dim" style="font-size:11.5px">${p.dropped} suggestion${p.dropped > 1 ? "s" : ""} skipped (not applicable to a long form, or invalid).</p>` : ""}
+          <button class="btn sm primary" data-act="plan-apply" ${L.picked.size ? "" : "disabled"}>Apply selected (${L.picked.size})</button></div>` : ""}`;
+      el.onchange = (ev) => { const id = ev.target.dataset.plan; if (!id) return; ev.target.checked ? L.picked.add(id) : L.picked.delete(id); const b = $("[data-act=plan-apply]", el); b.disabled = !L.picked.size; b.textContent = `Apply selected (${L.picked.size})`; };
+    } else {
+      const d = L.d, ex = d.export || {};
+      el.innerHTML = `<div class="stack">
+        <div class="row">${pill(LF_STAGE, d.lf_stage)}<span class="dim grow">${fmt(total(), 0)} · ${esc(d.edit.aspect)}</span></div>
+        ${d.current && ex.cover ? `<img src="/files/${esc(pid())}/${esc(ex.cover)}?r=${+d.rev}" alt="Cover" style="width:100%;border-radius:8px;border:1px solid var(--line-2)" title="Auto-picked cover (YouTube thumbnail)">` : ""}
+        ${d.current ? `<p class="dim" style="margin:0;font-size:12px">Rendered ${esc(when(ex.at))} · ${fmt(ex.duration || 0, 0)}</p>` : `<p class="dim" style="margin:0;font-size:12px">${ex.status === "rendering" ? "Rendering…" : "Not rendered since the last change."} Publishing renders first when needed.</p>`}
+        <div class="sec"><h3>Posts</h3>${(d.uploads || []).map((u) => `<div class="lf-item">${platTag(u.platform)}<span class="grow">${esc(u.account || "")}</span>${pill(UPLOAD_STATUS, u.status)}
+            ${/^https:\/\//.test(u.url || "") ? `<a class="pl-link" href="${esc(u.url)}" target="_blank" rel="noopener">open ↗</a>` : ""}${u.error ? `<span class="dim" title="${esc(u.error)}">ⓘ</span>` : ""}</div>`).join("") || `<div class="dim">Not posted yet.</div>`}</div>
+        ${d.locked ? `<p class="dim" style="font-size:12px">🔒 Posted: the video is final. A new version copies everything into an editable edit.</p><button class="btn sm" data-act="version">Make a new version</button>`
+          : `<button class="btn sm primary" data-act="publish" ${d.status === "ready" ? "" : "disabled"}>⇪ Publish…</button>`}</div>`;
+    }
+  }
+}
+
+// ======================================================================
+// Settings → Phone remote (remote.py): an opt-in Wi-Fi listener that serves the phone app. A phone pairs by scanning a
+// QR code; each phone gets its own signing secret (never shown again after pairing) and can be revoked here.
+// ======================================================================
+function phoneRemoteCard() {
+  const page = $(".page", view);
+  if (!page || $("#phone-remote", page)) return;
+  page.insertAdjacentHTML("beforeend", `<div class="card stack" style="margin-top:20px" id="phone-remote"><span class="dim">Loading…</span></div>`);
+  const el = $("#phone-remote", page);
+  let st = null, pending = null, ip = "";
+  const agoS = (t) => { const s = Date.now() / 1000 - t; return s < 90 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : new Date(t * 1000).toLocaleDateString(); };
+  const draw = () => {
+    ip = st.ips.includes(ip) ? ip : st.ips[0] || "";
+    const paired = st.devices.filter((d) => d.paired);
+    el.innerHTML = `<div class="row wrap"><h2 class="grow" style="margin:0">Phone remote</h2>${st.running ? '<span class="pill ok">on</span>' : st.enabled ? '<span class="pill err">not running</span>' : '<span class="pill">off</span>'}</div>
+      <p class="muted" style="margin:0;font-size:12.5px">Control Reelwright from your phone over your Wi-Fi: keep or skip new clips, publish and schedule to approved accounts, pause Autopilot, import links, follow the pipeline and drive OBS. The phone never sees your keys, sign-ins, settings or files. It works on your own network only (away from home, use a VPN such as Tailscale).</p>
+      <label class="row" style="gap:8px"><input type="checkbox" id="pr-on" ${st.enabled ? "checked" : ""}> <span>Let my phone control Reelwright over Wi-Fi</span></label>
+      <div class="row wrap"><label class="field" style="width:130px">Port<input type="number" id="pr-port" min="1024" max="65535" value="${+st.port}"></label>
+        ${st.ips.length > 1 ? `<label class="field grow">This PC's address for the phone<select id="pr-ip">${st.ips.map((a) => `<option ${a === ip ? "selected" : ""}>${esc(a)}</option>`).join("")}</select></label>` : ""}
+        <button class="btn sm" id="pr-save" style="align-self:flex-end">Save port</button></div>
+      ${st.error ? `<p style="color:var(--err);font-size:12.5px;margin:0">${esc(st.error)}</p>` : ""}
+      ${st.running && ip ? `<div class="dim" style="font-size:12.5px">Phone address <span class="mono">http://${esc(ip)}:${+st.port}</span>. If Windows asks, allow Reelwright on <b>private</b> networks.</div>` : ""}
+      ${!st.running ? "" : pending ? `<div class="row wrap" style="align-items:flex-start;gap:16px">
+          <div style="background:#fff;padding:6px;border-radius:8px;line-height:0">${pending.svg}</div>
+          <div class="grow stack" style="gap:6px;font-size:12.5px"><b>Scan this with your phone's camera</b>
+            <span class="muted">Open the link on the phone (same Wi-Fi as this PC) and press Pair. The code is for one phone and expires at ${esc(when(new Date(pending.expires * 1000).toISOString()))} if unused: keep it off screen shares and streams.</span>
+            <span class="muted">Then add it to the Home Screen: iPhone Safari → Share → Add to Home Screen; Android Chrome → ⋮ → Add to Home screen.</span>
+            <div><button class="btn sm" id="pr-cancel">Cancel</button></div></div></div>`
+        : `<div><button class="btn sm primary" id="pr-pair">＋ Pair a phone</button></div>`}
+      ${paired.length ? `<table style="width:100%;font-size:12.5px"><tbody>${paired.map((d) => `<tr><td><b>${esc(d.name || "Phone")}</b></td>
+          <td class="dim">${d.last_seen ? `seen ${esc(agoS(d.last_seen))}${d.last_ip ? ` from ${esc(d.last_ip)}` : ""}` : "not seen yet"}</td>
+          <td style="text-align:right"><button class="btn xs danger" data-revoke="${esc(d.id)}" data-name="${esc(d.name || "this phone")}">Revoke</button></td></tr>`).join("")}</tbody></table>`
+        : `<div class="dim" style="font-size:12.5px">No phones paired.</div>`}`;
+  };
+  const load = async () => {
+    const was = pending;
+    st = await api("/api/remote");
+    if (pending && !st.devices.some((d) => d.id === pending.device_id && !d.paired)) {
+      const d = st.devices.find((x) => x.id === pending.device_id);
+      pending = null;
+      if (d?.paired) toast(`Paired with ${d.name || "your phone"}.`, "ok");
+    }
+    if (el.isConnected && (was || !$("input:focus", el))) draw();
+  };
+  const tick = setInterval(() => (el.isConnected ? (pending || !document.hidden) && load().catch(() => {}) : clearInterval(tick)), 4000);
+  const pairNew = async () => { pending = await api("/api/remote/pair", { body: { ip, device_id: pending?.device_id } }); draw(); };
+  el.onchange = async (e) => {
+    try {
+      if (e.target.id === "pr-on") { st = await api("/api/remote", { method: "PUT", body: { enabled: e.target.checked } }); if (!st.enabled) pending = null; draw(); }
+      if (e.target.id === "pr-ip") { ip = e.target.value; if (pending) await pairNew(); }
+    } catch (err) { fail(err); load().catch(() => {}); }
+  };
+  el.onclick = async (e) => {
+    const t = e.target.closest("button");
+    if (!t) return;
+    try {
+      if (t.id === "pr-save") { st = await api("/api/remote", { method: "PUT", body: { port: +$("#pr-port", el).value } }); pending = null; draw(); toast("Saved.", "ok", 1200); }
+      if (t.id === "pr-pair") await pairNew();
+      if (t.id === "pr-cancel") { st = await api(`/api/remote/devices/${encodeURIComponent(pending.device_id)}`, { method: "DELETE" }); pending = null; draw(); }
+      if (t.dataset.revoke && await confirmBox(`Revoke ${t.dataset.name}?`, "It stops working at once, including videos it has open. Pair it again to use it.", "Revoke")) {
+        st = await api(`/api/remote/devices/${encodeURIComponent(t.dataset.revoke)}`, { method: "DELETE" });
+        draw();
+      }
+    } catch (err) { fail(err); }
+  };
+  load().catch((err) => { el.innerHTML = `<h2 style="margin:0">Phone remote</h2><span class="dim">${esc(err.message)}</span>`; });
+}
+
+// ---------- signals (signals.py / routes_signals.py) ----------
+
+// Editor timeline: the signals lane between the waveform and the clips — viewer clips (purple bars), detected sounds
+// (ticks by kind) and markers ("clip that", OBS marks, game events: orange flags through the waveform).
+const SOUND_COLOR = { laughter: "#37d39a", scream: "#ff5d5d", cheering: "#ffc247", applause: "#ffc247", gunshot: "#ff8a3d", explosion: "#ff8a3d", crying: "#6aa8ff", music: "#8b90a8" };
+function drawSignalLane(ctx, sig, pps, top, y, h) {
+  ctx.fillStyle = "#b07cff99";
+  (sig.viewer_clips || []).forEach((c) => ctx.fillRect(c.t * pps, y, Math.max(2, c.d * pps), h));
+  (sig.audio_events || []).forEach((e) => { ctx.fillStyle = SOUND_COLOR[e.kind] || "#cfd3e6"; ctx.fillRect(e.t * pps - 1.5, y, 3, h); });
+  ctx.fillStyle = "#ff6a3d";
+  (sig.markers || []).forEach((m) => {
+    const x = m.t * pps;
+    ctx.fillRect(x - 1, top, 2, y + h - top);
+    ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x + 7, top + 4); ctx.lineTo(x, top + 8); ctx.fill();
+  });
+}
+
+// Settings → Signals: its own card and Save (returns the placeholder; fills itself in once the page is on screen).
+function signalsCard() {
+  setTimeout(async () => {
+    const el = $("#sigcard");
+    if (!el) return;
+    const LANGS = [["", "Detect for each video"], ["en", "English"], ["es", "Spanish"], ["pt", "Portuguese"], ["fr", "French"], ["de", "German"], ["it", "Italian"], ["nl", "Dutch"], ["pl", "Polish"], ["ru", "Russian"], ["tr", "Turkish"], ["ja", "Japanese"], ["ko", "Korean"], ["zh", "Chinese"]];
+    const draw = (st) => {
+      const s = st.settings, cl = st.chatlog, au = st.audio, tw = st.twitch;
+      const chat = !s.twitch_chat_channel ? "Off." : cl.connected ? `Recording #${esc(cl.channel)}: ${+cl.count} messages since Reelwright started.` : `Connecting to #${esc(cl.channel)}…${cl.error ? " " + esc(cl.error) : ""}`;
+      const lang = LANGS.some(([k]) => k === s.whisper_language) ? LANGS : [...LANGS, [s.whisper_language, s.whisper_language]];
+      el.innerHTML = `<h2 style="margin:0">Signals</h2>
+        <p class="muted" style="margin:0;font-size:12.5px">More evidence for finding clips: what you said, what chat and your viewers did, and what could be heard.</p>
+        <div class="row wrap"><label class="field grow">Speech language<select id="sg-lang">${lang.map(([k, l]) => `<option value="${esc(k)}" ${k === s.whisper_language ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></label></div>
+        <label class="field">Brand vocabulary <span class="dim" style="font-size:12px">— names, games, emotes and slang Whisper should spell right, separated by commas</span><textarea id="sg-vocab" maxlength="2000" placeholder="e.g. Reelwright, Valorant, Jett, KEKW">${esc(s.brand_vocab)}</textarea></label>
+        <label class="field">“Clip that” phrases <span class="dim" style="font-size:12px">— say one on stream and the 30–60 s before it becomes a clip</span><input type="text" id="sg-trig" maxlength="500" placeholder="${esc(st.default_triggers.join(", "))}" value="${esc(s.voice_triggers)}"></label>
+        <label class="field">Record my Twitch chat live <span class="dim" style="font-size:12px">— your channel login; read-only and anonymous, while Reelwright runs. Only chat recorded live can be used: Twitch offers no chat replay.</span><input type="text" id="sg-chan" maxlength="60" placeholder="yourchannel (empty = off)" value="${esc(s.twitch_chat_channel)}"></label>
+        <div class="dim" style="font-size:12px">${chat}</div>
+        <label class="field">Extra chat reactions <span class="dim" style="font-size:12px">— one per line, e.g. <span class="mono">laugh: myLaughEmote</span> or <span class="mono">#channel hype: myHypeEmote</span>. Kinds: ${Object.keys(st.emotes).map(esc).join(", ")}</span><textarea id="sg-emo" maxlength="5000">${esc(s.chat_emotes)}</textarea></label>
+        <label class="switch"><input type="checkbox" id="sg-audio" ${s.audio_events ? "checked" : ""} ${au.available ? "" : "disabled"}> Detect laughter, screams, cheering, applause, gunshots and explosions around the loud moments</label>
+        <div class="dim" style="font-size:12px">${au.available ? (au.model_ready ? "Model ready." : `Downloads a ${+au.size_mb} MB model the first time.`) : "Not available in this build."} Model: <a href="${esc(au.page)}" target="_blank">${esc(au.model)}</a> — ${esc(au.licence)}.</div>
+        <div><button type="button" class="btn sm primary" id="sg-save">Save signals</button></div>
+        <h3 style="margin:10px 0 0">Twitch viewer clips</h3>
+        <p class="muted" style="margin:0;font-size:12.5px">Clips your viewers made of a VOD show what they loved. Register an app at <a href="https://dev.twitch.tv/console/apps" target="_blank">dev.twitch.tv/console/apps</a> (category “Application Integration”, OAuth redirect <span class="mono">http://localhost</span>), then paste its Client ID and a new Client secret. Imported Twitch VODs are then checked when they are analyzed.</p>
+        <div class="row wrap"><label class="field grow">Client ID<input type="text" id="sg-cid" value="${esc(tw.client_id)}" autocomplete="off"></label>
+          <label class="field grow">Client secret ${tw.has_app ? '<span class="pill ok">saved</span>' : ""}<input type="password" id="sg-sec" placeholder="${tw.has_app ? "Paste again to replace" : ""}" autocomplete="off"></label></div>
+        <div class="row wrap"><button type="button" class="btn sm" id="sg-tsave">Save Twitch app</button>${tw.has_app ? '<button type="button" class="btn sm" id="sg-ttest">Test</button><button type="button" class="btn sm danger" id="sg-trm">Remove</button>' : ""}<span class="dim" id="sg-tout" style="font-size:12px"></span></div>`;
+    };
+    const load = async () => draw(await api("/api/signals"));
+    el.onclick = async (e) => {
+      const id = e.target.id;
+      try {
+        if (id === "sg-save") {
+          draw(await api("/api/signals", { method: "PUT", body: { whisper_language: $("#sg-lang").value, brand_vocab: $("#sg-vocab").value, voice_triggers: $("#sg-trig").value, twitch_chat_channel: $("#sg-chan").value, chat_emotes: $("#sg-emo").value, audio_events: $("#sg-audio").checked } }));
+          toast("Signals saved.", "ok", 1500);
+        }
+        if (id === "sg-tsave") { await api("/api/signals/twitch", { method: "PUT", body: { client_id: $("#sg-cid").value, client_secret: $("#sg-sec").value } }); toast("Twitch app saved.", "ok"); await load(); }
+        if (id === "sg-ttest") { $("#sg-tout").textContent = "Checking…"; await api("/api/signals/twitch/test", { method: "POST" }); $("#sg-tout").textContent = "✓ Twitch accepted the app."; }
+        if (id === "sg-trm") { await api("/api/signals/twitch", { method: "DELETE" }); toast("Twitch app removed."); await load(); }
+      } catch (err) { if (id === "sg-ttest") $("#sg-tout").textContent = ""; fail(err); }
+    };
+    load().catch((err) => { el.innerHTML = `<h2 style="margin:0">Signals</h2><span class="dim">${esc(err.message)}</span>`; });
+  }, 0);
+  return `<div class="card stack" style="margin-top:20px" id="sigcard"><span class="dim">Loading…</span></div>`;
+}
+
+// ---------- render & QA (WP2): caption animations, safe zones, the pre-publish check, Settings › Rendering ----------
+const CAP_ANIMS = [["highlight", "Highlight"], ["pop", "Pop"], ["bounce", "Bounce"], ["box", "Box"], ["reveal", "Reveal"]];
+const SAFE_ZONES = { // mirrors qa.SAFE_ZONES (share of a 9:16 frame each app's UI covers)
+  tiktok: { top: 0.07, bottom: 0.2, right: 0.12 }, youtube: { top: 0.06, bottom: 0.18, right: 0.12 }, instagram: { top: 0.1, bottom: 0.2, right: 0.12 } };
+const SAFE_NAMES = { tiktok: "TikTok", youtube: "Shorts", instagram: "Reels" };
+const CAP_PLAIN = new Set(["because", "actually", "literally", "basically", "something", "anything", "everything", "nothing", "probably", "through", "without", "another", "whatever", "already", "anyway", "honestly", "seriously"]);
+function capKeyword(w) { // mirrors media._keyword
+  const t = String(w).replace(/[^\p{L}\p{N}_]/gu, "");
+  return !!t && (/\d/.test(t) || (t.length >= 3 && t === t.toUpperCase() && t !== t.toLowerCase()) || (t.length >= 7 && !CAP_PLAIN.has(t.toLowerCase())));
+}
+function qaList(qa) { // clip.export.qa from qa.lint
+  if (!qa.length) return `<div class="qa-list" style="flex-basis:100%;color:var(--ok);font-size:12px">✓ Pre-publish check: no issues</div>`;
+  const err = qa.some((i) => i.level === "error");
+  return `<details class="qa-list" style="flex-basis:100%;font-size:12px" ${err ? "open" : ""}><summary style="cursor:pointer">${err ? "⛔" : "⚠"} Pre-publish check: ${qa.length} issue${qa.length > 1 ? "s" : ""}</summary>
+    <ul style="margin:6px 0 0;padding-left:18px">${qa.map((i) => `<li style="color:${i.level === "error" ? "var(--err)" : "inherit"}">${i.platform ? `<b>${esc(SAFE_NAMES[i.platform] || i.platform)}:</b> ` : ""}${esc(i.msg)}${i.fix ? ` <span class="dim">— ${esc(i.fix)}</span>` : ""}</li>`).join("")}</ul></details>`;
+}
+// Settings → Rendering: its own card and Save (returns the placeholder; fills itself in once the page is on screen).
+function renderCard() {
+  setTimeout(async () => {
+    const el = $("#rendercard");
+    if (!el) return;
+    try {
+      const [s, enc] = await Promise.all([api("/api/settings"), api("/api/render/encoders")]);
+      const opt = [["auto", "Auto (with NVENC or 8+ CPU cores)"], ["on", "On"], ["off", "Off: renders wait for analysis"]].map(([k, l]) => `<option value="${k}" ${k === s.parallel_render ? "selected" : ""}>${l}</option>`).join("");
+      el.innerHTML = `<h2>Rendering</h2>
+        <p class="muted" style="margin:0;font-size:13px">Encoders that work on this PC (best first): <b>${esc(enc.encoders.join(", ") || "none")}</b> · ffmpeg ${esc(enc.licence)} build · renders ${enc.parallel ? "run beside analysis" : "wait for analysis"} right now.</p>
+        <label class="field">Render while analysing<select id="rc-par">${opt}</select></label>
+        <label class="field">Bleep list <span class="muted" style="font-size:12px">(clips with Bleep on beep or mute these; * = any ending; captions show f***)</span><textarea id="rc-bleep" rows="2">${esc(s.bleep_words)}</textarea></label>
+        <div><button type="button" class="btn sm" id="rc-save">Save rendering settings</button></div>`;
+      $("#rc-save").onclick = async () => {
+        try { S.settings = await api("/api/settings", { method: "PUT", body: { parallel_render: $("#rc-par").value, bleep_words: $("#rc-bleep").value } }); toast("Rendering settings saved.", "ok"); } catch (err) { fail(err); }
+      };
+    } catch (err) { el.innerHTML = `<h2 style="margin:0">Rendering</h2><span class="dim">${esc(err.message)}</span>`; }
+  }, 0);
+  return `<div class="card stack" id="rendercard"><span class="dim">Loading…</span></div>`;
+}
+
+// ======================================================================
+// Live & integrations (WP6): game / VTube Studio telemetry and the mark hotkey (telemetry.py), taught screen events
+// (hud.py) and the Claude Desktop link (mcp_server.py). Settings cards plus the Editor's "Teach screen event" modal.
+// ======================================================================
+function liveCards() {
+  const page = $(".page", view);
+  if (!page || $("#live-card", page)) return;
+  page.insertAdjacentHTML("beforeend", `<div class="card stack" style="margin-top:20px" id="live-card"><span class="dim">Loading…</span></div>
+    <div class="card stack" style="margin-top:20px" id="mcp-card"><span class="dim">Loading…</span></div>`);
+  const el = $("#live-card", page), mc = $("#mcp-card", page);
+  let st = null, huds = [];
+  const pill2 = (on, okTxt, offTxt) => `<span class="pill ${on ? "ok" : ""}">${on ? okTxt : offTxt}</span>`;
+  const draw = () => {
+    el.innerHTML = `<div class="row wrap"><h2 class="grow" style="margin:0">Live integrations</h2>${st.recording.length ? `<span class="pill err">● recording: ${st.recording.map(esc).join(", ")}</span>` : '<span class="pill">not recording</span>'}</div>
+      <p class="muted" style="margin:0;font-size:12.5px">While an <b>OBS link</b> (OBS page) is recording, these mark moments in the recording (kills, deaths, round wins, objectives, VTube Studio reactions) so analysis looks there first. They use only the games' and VTube Studio's official local interfaces on this PC (no game memory is read, nothing is drawn over the game), run only while switched on <b>and</b> recording, and send nothing anywhere. Turn on “Import finished recordings” on the OBS page so the marks travel with the file.</p>
+      <label class="field">Mark hotkey <span class="dim" style="font-size:11.5px">(marks the running recording from anywhere, even in a game; e.g. ctrl+alt+m; empty = off)</span>
+        <div class="row"><input type="text" id="lv-hk" value="${esc(st.hotkey_spec)}" placeholder="ctrl+alt+m" style="width:180px"><button class="btn sm" id="lv-hk-save">Save</button>${st.hotkey.error ? `<span style="color:var(--err);font-size:12px">${esc(st.hotkey.error)}</span>` : st.hotkey.active ? '<span class="pill ok">active</span>' : ""}</div></label>
+      <label class="row" style="gap:8px"><input type="checkbox" data-lv="lol_enabled" ${st.lol.enabled ? "checked" : ""}> <span><b>League of Legends</b>: kills, deaths, multikills, objectives, wins (Riot's Live Client Data on this PC) ${st.lol.enabled ? pill2(st.lol.active, "game found", "waiting for a game") : ""}</span></label>
+      <div class="stack" style="gap:6px"><label class="row" style="gap:8px"><input type="checkbox" data-lv="gsi_enabled" ${st.gsi.enabled ? "checked" : ""}> <span><b>CS2 / Dota 2</b>: kills, multikills, deaths, round wins, Roshan (Valve's Game State Integration) ${st.gsi.enabled ? pill2(st.gsi.running, `listening on ${+st.gsi.port}`, "starts when recording") : ""}</span></label>
+        ${st.gsi.error ? `<div style="color:var(--err);font-size:12px">${esc(st.gsi.error)}</div>` : ""}
+        <div class="row wrap" style="font-size:12.5px"><label class="field" style="flex-direction:row;align-items:center;gap:6px">port <input type="number" id="lv-gport" value="${+st.gsi.port}" min="1024" max="65535" style="width:90px"></label>
+          <a class="btn sm" href="/api/live/gsi/cs2" download="gamestate_integration_reelwright.cfg">Generate CS2 config file</a>
+          <a class="btn sm" href="/api/live/gsi/dota2" download="gamestate_integration_reelwright.cfg">Generate Dota 2 config file</a>
+          <button class="btn sm ghost" id="lv-gtok" title="Old config files stop working">New token</button></div>
+        <ol class="list dim" style="font-size:12px;margin:0"><li><b>CS2:</b> put the file in <span class="mono">Steam\\steamapps\\common\\Counter-Strike Global Offensive\\game\\csgo\\cfg\\</span>, then restart CS2.</li>
+          <li><b>Dota 2:</b> put it in <span class="mono">Steam\\steamapps\\common\\dota 2 beta\\game\\dota\\cfg\\gamestate_integration\\</span> (create the folder), add <span class="mono">-gamestateintegration</span> to Dota 2's launch options (Steam → Properties), then restart Dota 2.</li>
+          <li>Changed the port or the token? Generate and replace the file again.</li></ol></div>
+      <div class="stack" style="gap:6px"><label class="row" style="gap:8px"><input type="checkbox" data-lv="vts_enabled" ${st.vts.enabled ? "checked" : ""}> <span><b>VTube Studio</b>: hotkey expressions and animations, item drops, face tracking lost ${st.vts.enabled ? pill2(st.vts.connected, "connected", st.vts.authorized ? "connects when recording" : "not authorized") : ""}</span></label>
+        ${st.vts.error ? `<div style="color:var(--err);font-size:12px">${esc(st.vts.error)}</div>` : ""}
+        <div class="row wrap" style="font-size:12.5px"><label class="field" style="flex-direction:row;align-items:center;gap:6px">API port <input type="number" id="lv-vport" value="${+st.vts.port}" min="1024" max="65535" style="width:90px"></label>
+          <button class="btn sm ${st.vts.authorized ? "" : "primary"}" id="lv-vauth">${st.vts.authorized ? "Authorize again" : "Authorize in VTube Studio"}</button>
+          ${st.vts.authorized ? '<button class="btn sm ghost" id="lv-vforget">Forget</button>' : ""}</div>
+        <div class="dim" style="font-size:12px">In VTube Studio: Settings → turn on <b>Start API</b> (port 8001). Press Authorize, then click <b>Allow</b> in the pop-up VTube Studio shows.</div></div>
+      <h3 style="margin:6px 0 0">Taught screen events</h3>
+      ${huds.length ? `<table style="width:100%;font-size:12.5px"><tbody>${huds.map((h) => `<tr><td style="width:120px"><img src="/api/live/hud/${esc(h.id)}.png" alt="${esc(h.name)}" style="max-width:110px;max-height:40px"></td>
+          <td><b>${esc(h.name)}</b>${h.game ? ` <span class="dim">· ${esc(h.game)}</span>` : ""}</td>
+          <td><label class="dim" title="How close a match must be (higher = stricter)">match ≥ <input type="number" data-hthr="${esc(h.id)}" value="${+h.threshold}" min="0.5" max="0.99" step="0.01" style="width:64px"></label></td>
+          <td><label class="switch"><input type="checkbox" data-hen="${esc(h.id)}" ${h.enabled ? "checked" : ""}> on</label></td>
+          <td style="text-align:right"><button class="btn xs danger" data-hrm="${esc(h.id)}">Delete</button></td></tr>`).join("")}</tbody></table>`
+        : `<div class="dim" style="font-size:12.5px">None yet: open a video in the Editor and press <b>◎ Teach screen event</b>.</div>`}
+      <div class="dim" style="font-size:12px">Switched-on events (up to 8) are looked for in every video Reelwright analyzes. Switch a game's events off when you play something else.</div>`;
+  };
+  const load = async () => { [st, huds] = await Promise.all([api("/api/live"), api("/api/live/hud")]); if (el.isConnected && !$("input:focus", el)) draw(); };
+  const put = async (body) => { st = await api("/api/live", { method: "PUT", body }); draw(); };
+  const tick = setInterval(() => (el.isConnected ? !document.hidden && load().catch(() => {}) : clearInterval(tick)), 5000);
+  el.onchange = async (e) => {
+    const t = e.target;
+    try {
+      if (t.dataset.lv) await put({ [t.dataset.lv]: t.checked });
+      if (t.id === "lv-gport") await put({ gsi_port: +t.value });
+      if (t.id === "lv-vport") await put({ vts_port: +t.value });
+      if (t.dataset.hen) { await api(`/api/live/hud/${t.dataset.hen}`, { method: "PATCH", body: { enabled: t.checked } }); await load(); }
+      if (t.dataset.hthr) { await api(`/api/live/hud/${t.dataset.hthr}`, { method: "PATCH", body: { threshold: +t.value } }); toast("Saved.", "ok", 1200); }
+    } catch (err) { fail(err); load().catch(() => {}); }
+  };
+  el.onclick = async (e) => {
+    const t = e.target.closest("button");
+    if (!t) return;
+    try {
+      if (t.id === "lv-hk-save") { await put({ live_mark_hotkey: $("#lv-hk", el).value }); toast("Saved: the hotkey works while OBS records.", "ok"); }
+      if (t.id === "lv-gtok" && await confirmBox("New GSI token?", "Config files you already put in CS2 / Dota 2 stop working until you generate and replace them.", "Replace")) {
+        st = await api("/api/live/gsi/token", { method: "POST" }); draw();
+      }
+      if (t.id === "lv-vauth") {
+        t.disabled = true; t.innerHTML = `<span class="spin"></span> Click Allow in VTube Studio…`;
+        try { st = await api("/api/live/vts/authorize", { method: "POST" }); toast("VTube Studio connected to Reelwright.", "ok"); } finally { draw(); }
+      }
+      if (t.id === "lv-vforget") { st = await api("/api/live/vts/forget", { method: "POST" }); draw(); }
+      if (t.dataset.hrm && await confirmBox("Delete this screen event?", "Markers it already found stay; new videos won't look for it.")) {
+        await api(`/api/live/hud/${t.dataset.hrm}`, { method: "DELETE" }); await load();
+      }
+    } catch (err) { fail(err); }
+  };
+  load().catch((err) => { el.innerHTML = `<h2 style="margin:0">Live integrations</h2><span class="dim">${esc(err.message)}</span>`; });
+  api("/api/live/mcp").then((cfg) => {
+    const json = JSON.stringify(cfg, null, 2);
+    mc.innerHTML = `<h2 style="margin:0">Claude Desktop (MCP)</h2>
+      <p class="muted" style="margin:0;font-size:12.5px">Let Claude Desktop work with Reelwright while it runs: list projects and clips, find clips, render, keep or skip new picks, schedule posts and pause Autopilot. It can't see or change your settings, keys, sign-ins or account approvals. Its posts count as Autopilot posts: they only go to accounts with both “Approved for uploads” and “Allow Autopilot to post here” on (Publish page), use your default privacy, and wait while Autopilot is paused. What these tools return (titles, transcript snippets) becomes part of your Claude conversation.</p>
+      <ol class="list" style="font-size:12.5px;margin:0"><li>In Claude Desktop: <b>Settings → Developer → Edit Config</b> (opens <span class="mono">%APPDATA%\\Claude\\claude_desktop_config.json</span>).</li>
+        <li>Paste this in (if the file already has <span class="mono">"mcpServers"</span>, add just the <span class="mono">"reelwright"</span> entry), save, and restart Claude Desktop.</li>
+        <li>Keep Reelwright open: Claude reaches it on this PC only.</li></ol>
+      <textarea readonly class="mono" rows="${json.split("\n").length}" style="width:100%;font-size:12px">${esc(json)}</textarea>
+      <div><button class="btn sm" id="mcp-copy">Copy</button></div>`;
+    $("#mcp-copy", mc).onclick = async () => { await navigator.clipboard.writeText(json); toast("Copied.", "ok"); };
+  }).catch((err) => { mc.innerHTML = `<h2 style="margin:0">Claude Desktop (MCP)</h2><span class="dim">${esc(err.message)}</span>`; });
+}
+
+function openHudTeach(pid, t0) { // Editor → ◎ Teach screen event: box something on one frame, name it, find it everywhere
+  let box = null, t = Math.max(0, t0);
+  modal(`<h2>Teach a screen event</h2>
+    <p class="muted" style="margin:0 0 8px;font-size:12.5px">Find a frame where it shows (a “YOU DIED” screen, a kill-feed entry, a VICTORY banner), then drag a box tightly around it. Reelwright then finds it in this and every later video and marks each appearance.</p>
+    <div class="row" style="gap:8px;margin-bottom:6px"><button class="btn xs" data-step="-5">−5 s</button><button class="btn xs" data-step="-1">−1 s</button><button class="btn xs" data-step="-0.2">−0.2</button>
+      <span class="mono" id="ht-t"></span><button class="btn xs" data-step="0.2">+0.2</button><button class="btn xs" data-step="1">+1 s</button><button class="btn xs" data-step="5">+5 s</button></div>
+    <div id="ht-wrap" style="position:relative;user-select:none;line-height:0;cursor:crosshair;background:#000;touch-action:none"><img id="ht-img" alt="Video frame" draggable="false" style="width:100%">
+      <div id="ht-box" hidden style="position:absolute;border:2px solid #ffd400;box-shadow:0 0 0 9999px rgba(0,0,0,.35)"></div></div>
+    <div class="row wrap" style="margin-top:10px"><label class="field grow">Name<input type="text" id="ht-name" maxlength="40" placeholder="You died"></label>
+      <label class="field grow">Game <span class="dim" style="font-size:11px">(groups events)</span><input type="text" id="ht-game" maxlength="40" placeholder="Elden Ring"></label>
+      <label class="field" style="width:110px" title="How close a match must be (higher = stricter)">Match ≥<input type="number" id="ht-thr" value="0.8" min="0.5" max="0.99" step="0.01"></label></div>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="ht-save">Save and scan this video</button></div>`, (m, close) => {
+    const img = $("#ht-img", m), wrap = $("#ht-wrap", m), bx = $("#ht-box", m);
+    const show = () => { $("#ht-t", m).textContent = fmt(t); img.src = `/api/live/hud/frame?pid=${encodeURIComponent(pid)}&t=${t.toFixed(2)}`; };
+    img.onerror = () => toast("Couldn't read that frame.", "err");
+    $$("[data-step]", m).forEach((b) => (b.onclick = () => { t = Math.max(0, t + +b.dataset.step); show(); }));
+    const rel = (e) => { const r = img.getBoundingClientRect(); return [Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1), Math.min(Math.max((e.clientY - r.top) / r.height, 0), 1)]; };
+    const paint = () => { bx.hidden = !box; if (box) Object.assign(bx.style, { left: box[0] * 100 + "%", top: box[1] * 100 + "%", width: box[2] * 100 + "%", height: box[3] * 100 + "%" }); };
+    wrap.onpointerdown = (e) => {
+      const [x0, y0] = rel(e);
+      wrap.setPointerCapture(e.pointerId);
+      wrap.onpointermove = (ev) => { const [x1, y1] = rel(ev); box = [Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0)]; paint(); };
+      wrap.onpointerup = () => { wrap.onpointermove = wrap.onpointerup = null; };
+    };
+    $("#ht-save", m).onclick = async (e) => {
+      if (!box || box[2] < 0.01 || box[3] < 0.01) return toast("Drag a box around the thing to look for first.", "err");
+      e.target.disabled = true;
+      try {
+        await api("/api/live/hud", { body: { pid, t, box, name: $("#ht-name", m).value, game: $("#ht-game", m).value, threshold: +$("#ht-thr", m).value } });
+        await api("/api/live/hud/scan", { body: { pid } });
+        close(); toast("Saved. Scanning this video; its matches become markers, and later videos are checked automatically.", "ok", 6000);
+      } catch (err) { fail(err); e.target.disabled = false; }
+    };
+    show();
+  }, true);
+}
+
+// ======================================================================
+// Models — hardware-aware model marketplace (reelwright/models, routes_models.py): every exact variant (Ollama on this
+// PC, Hugging Face search, curated picks, local GGUF) with its fit on this PC; compare, install, benchmark; per task a
+// versioned selection with release gates, activation and rollback (ai.route follows the active release).
+// ======================================================================
+routes.models = Models;
+const FIT_STATUS = { fits: ["ok", "Fits"], borderline: ["warn", "Borderline"], incompatible: ["err", "Too big"], unknown: ["", "Unknown"], inapplicable: ["info", "Cloud / CPU"] };
+const GATE_STATUS = { pass: ["ok", "pass"], fail: ["err", "fail"], unmeasured: ["warn", "unmeasured"], inapplicable: ["", "n/a"], borderline: ["warn", "borderline"], unknown: ["", "unknown"] };
+const SRC_LABEL = { publisher: "publisher-reported", tested: "locally tested", estimated: "estimated", unknown: "unknown" };
+const MODEL_FIELDS = [["params_b", "Parameters", (x) => x + " B"], ["quant", "Quantization"], ["size_bytes", "Size", (x) => (x / 1073741824).toFixed(1) + " GiB"],
+  ["context", "Context", (x) => num(x) + " tokens"], ["layers", "Layers"], ["kv_heads", "KV heads"], ["head_dim", "Head dim"], ["license", "License"]];
+const fitLine = (f) => !f ? "" : `${pill(FIT_STATUS, f.status)} ${f.range_gib ? `<span class="dim" style="font-size:12px">${f.range_gib[0]}–${f.range_gib[1]} GiB`
+  + `${f.pct_total ? ` · ${f.pct_total[0]}–${f.pct_total[1]}% of VRAM` : ""}${f.left_gib && f.status === "fits" ? ` · ${f.left_gib[0]}–${f.left_gib[1]} GiB left` : ""}`
+  + `${f.short_gib && f.status === "incompatible" ? ` · short ${f.short_gib[0]}–${f.short_gib[1]} GiB` : ""}${f.source === "tested" ? ` · measured ${esc((f.measured_at || "").slice(0, 10))}` : ""}</span>` : ""}`;
+const fieldVal = (v, [k, , f]) => (v[k] == null ? "—" : esc(f ? f(v[k]) : v[k]));
+const srcTag = (v, k) => { const s = (v.src || {})[k] || (v[k] == null ? "unknown" : "publisher"); return `<span class="dim" style="font-size:11px">${esc(SRC_LABEL[s] || s)}</span>`; };
+const checkList = (f) => f.checks.map((c) => `<li>${pill(GATE_STATUS, c.status)} <b>${esc(c.name)}</b> — ${esc(c.detail || "")}</li>`).join("");
+
+function Models() {
+  const load = (k, d) => { try { return JSON.parse(lsGet("models." + k) || "null") ?? d; } catch { return d; } };
+  const M = { tab: load("tab", "catalog"), f: load("f", { view: "all", sort: "relevance" }), pins: [], hfNext: "", tasks: null };
+  const save = () => { lsSet("models.tab", JSON.stringify(M.tab)); lsSet("models.f", JSON.stringify(M.f)); };
+  const wl = () => ({ context: M.f.context || 8192, concurrency: M.f.concurrency || 1 });
+  const qs = () => {
+    const f = M.f, p = new URLSearchParams();
+    for (const k of ["q", "task", "input", "output", "quant", "min_ctx", "max_params", "profile", "context", "concurrency", "sort"]) if (f[k]) p.set(k, f[k]);
+    if (f.view === "fit") p.set("fit", "1");
+    if (f.view === "installed") p.set("installed", "1");
+    return p.toString();
+  };
+
+  this.mount = async () => {
+    view.innerHTML = `<div class="page"><h1>Models</h1><p class="sub">Pick the exact model each AI task uses: sized to this PC, tested before it goes live, one click back.</p>
+      <div class="card" style="padding:0"><div class="tabs">${[["catalog", "Choose model"], ["tasks", "Tasks & releases"], ["hardware", "This PC"]]
+        .map(([k, l]) => `<button data-mtab="${k}" class="${M.tab === k ? "on" : ""}">${l}</button>`).join("")}</div>
+      <div class="tab-body" id="mtab" style="padding:14px"></div></div><div id="mjobs" style="margin-top:10px"></div></div>`;
+    view.onclick = (e) => { const t = e.target.closest("[data-mtab]"); if (t) { M.tab = t.dataset.mtab; save(); this.mount(); } };
+    await ({ catalog: catalogTab, tasks: tasksTab, hardware: hardwareTab }[M.tab] || catalogTab)();
+  };
+  this.every = 1500;
+  this.refresh = async () => { // pulls, benchmarks and measurements run in the background
+    const j = await api("/api/models/jobs");
+    if (!$("#mjobs")) return;
+    const pulls = j.pulls.filter((p) => p.state === "running" || p.state === "failed"), jobs = j.jobs.filter((x) => x.state !== "done");
+    $("#mjobs").innerHTML = pulls.map((p) => `<div class="card row wrap" style="gap:10px;margin-bottom:6px"><b>Installing ${esc(p.name)}</b><span class="dim">${esc(p.status)}</span>
+        <div class="grow">${bar(p.total ? p.completed / p.total : 0)}</div>${p.error ? `<span style="color:var(--err)">${esc(p.error)}</span>` : `<button class="btn sm" data-cancel="${esc(p.name)}">Cancel</button>`}</div>`).join("")
+      + jobs.map((x) => `<div class="card" style="margin-bottom:6px">${pill(JOB_STATUS, x.state)} ${esc(x.key.replace(/^bench:/, "Benchmark ").replace(/^measure:/, "Measure "))} ${x.error ? `<span style="color:var(--err)">${esc(x.error)}</span>` : ""}</div>`).join("");
+    $$("[data-cancel]").forEach((b) => (b.onclick = () => api("/api/models/pull/cancel", { body: { name: b.dataset.cancel } }).then(() => toast("Canceling…")).catch(fail)));
+  };
+  const install = (name, size) => api("/api/models/pull", { body: { name, size_bytes: size } }).then(() => { toast(`Installing ${name} with Ollama…`); this.refresh(); }).catch(fail);
+
+  // ---------- Choose model: catalog, filters, compare ----------
+  async function catalogTab() {
+    const f = M.f, hw = await api("/api/models/hardware");
+    const opt = (pairs, cur) => pairs.map(([v, l]) => `<option value="${esc(v)}" ${String(cur ?? "") === v ? "selected" : ""}>${esc(l)}</option>`).join("");
+    $("#mtab").innerHTML = `<div class="stack">
+      <div class="row wrap" style="gap:8px"><input class="grow" id="m-q" placeholder="Search by name, tag, family or Hub repo (typos are fine)" value="${esc(f.q || "")}">
+        <div class="seg">${[["all", "All models"], ["fit", "Fits my hardware"], ["installed", "Installed"]].map(([k, l]) => `<button type="button" data-view="${k}" class="${(f.view || "all") === k ? "on" : ""}">${l}</button>`).join("")}</div></div>
+      <div class="row wrap" style="gap:8px;font-size:12.5px">
+        <label>Task <select data-f="task">${opt([["", "any"], ["text-generation", "text (clip finding)"], ["image-text-to-text", "vision (frames)"], ["feature-extraction", "embeddings"], ["automatic-speech-recognition", "speech to text"]], f.task)}</select></label>
+        <label>Accepts <select data-f="input">${opt([["", "any"], ["image", "images"], ["audio", "audio"]], f.input)}</select></label>
+        <label>Generates <select data-f="output">${opt([["", "any"], ["text", "text"], ["image", "images"], ["embedding", "embeddings"]], f.output)}</select></label>
+        <label>Quant <input data-f="quant" size="7" value="${esc(f.quant || "")}" placeholder="Q4_K_M"></label>
+        <label>Min context <input data-f="min_ctx" type="number" style="width:90px" value="${esc(f.min_ctx || "")}"></label>
+        <label>Max size (B params) <input data-f="max_params" type="number" style="width:70px" value="${esc(f.max_params || "")}"></label>
+        <label>Sort <select data-f="sort">${opt([["relevance", "relevance"], ["name", "name"], ["params", "parameters"], ["size", "size"], ["context", "context"], ["downloads", "downloads"]], f.sort)}</select></label></div>
+      <div class="row wrap" style="gap:8px;font-size:12.5px"><span class="dim">Fit for</span>
+        <label>Profile <select data-f="profile">${opt(hw.profiles.map((p) => [p.name, `${p.name} (−${p.reserve_gib} GiB)`]), f.profile || hw.active)}</select></label>
+        <label>Context <input data-f="context" type="number" style="width:90px" value="${esc(f.context || 8192)}"></label>
+        <label>Parallel requests <input data-f="concurrency" type="number" min="1" style="width:55px" value="${esc(f.concurrency || 1)}"></label>
+        <span class="grow"></span>
+        <button class="btn sm" id="m-ollama">Refresh Ollama</button><button class="btn sm" id="m-hf">Search Hugging Face</button>
+        <button class="btn sm" id="m-hfnext" ${M.hfNext ? "" : "hidden"}>More from the Hub</button><button class="btn sm" id="m-gguf">Import GGUF…</button></div>
+      <div id="m-cmp"></div><div id="m-res"><span class="dim">Loading…</span></div></div>`;
+    let t;
+    $("#m-q").oninput = (e) => { clearTimeout(t); t = setTimeout(() => { f.q = e.target.value; save(); results(); }, 250); };
+    $$("[data-view]").forEach((b) => (b.onclick = () => { f.view = b.dataset.view; save(); catalogTab(); }));
+    $$("[data-f]").forEach((el) => (el.onchange = () => { f[el.dataset.f] = el.value; save(); results(); compare(); }));
+    $("#m-ollama").onclick = () => api("/api/models/sync", { body: { source: "ollama" } }).then((r) => { toast(`${r.count} installed models read.`, "ok"); results(); }).catch(fail);
+    const hf = (next) => api("/api/models/sync", { body: { source: "hf", search: f.q || "", pipeline_tag: f.task || "", next: next || "", limit: 30 } })
+      .then((r) => { M.hfNext = r.next; $("#m-hfnext").hidden = !r.next; toast(`${r.count} Hub variants · synced ${when(r.synced_at)}`, "ok"); results(); }).catch(fail);
+    $("#m-hf").onclick = () => hf();
+    $("#m-hfnext").onclick = () => hf(M.hfNext);
+    $("#m-gguf").onclick = () => modal(`<h2>Import a local GGUF</h2><p class="muted">Reelwright reads the file's header (architecture, layers, context) to estimate its fit. Nothing is copied.</p>
+      <label class="field">Path to the .gguf file<input id="gg-path" placeholder="D:\\models\\my-model.Q4_K_M.gguf"></label>
+      <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="gg-ok">Import</button></div>`,
+      (m, close) => ($("#gg-ok", m).onclick = () => api("/api/models/import", { body: { path: $("#gg-path", m).value } })
+        .then((r) => { close(); toast(`Imported ${r.variant.name}.`, "ok"); results(); }).catch(fail)));
+    await Promise.all([results(), compare()]);
+  }
+
+  async function results() {
+    const r = await api(`/api/models/catalog?${qs()}`), p = r.profile;
+    const gpuLine = p.gpus?.length ? p.gpus.map((g) => `GPU ${g.index}: ${g.free_gib.toFixed(1)} of ${g.total_gib.toFixed(1)} GiB free, budget ${g.budget_gib.toFixed(1)} GiB`).join(" · ")
+      : `GPU memory: ${p.telemetry === "denied" ? "telemetry denied" : "no NVIDIA reading"} (fit shows as unknown)`;
+    const row = (v) => `<tr><td><b>${esc(v.name)}</b><div class="dim mono" style="font-size:11px">${esc(v.source)} · ${esc((v.digest || v.revision || "not pinned until installed").replace(/^sha256:/, "").slice(0, 16))}</div></td>
+      <td>${esc(v.quant || "—")}</td><td>${v.params_b ? +v.params_b.toFixed(2) + " B" : "—"}</td><td>${v.size_bytes ? (v.size_bytes / 1073741824).toFixed(1) + " GiB" : "—"}</td><td>${v.context ? num(v.context) : "—"}</td>
+      <td>${(v.inputs || []).includes("image") ? `<span class="chip" title="accepts images">images in</span> ` : ""}${(v.outputs || []).includes("image") ? `<span class="chip" title="generates images">images out</span> ` : ""}${v.installed ? `<span class="chip">installed</span>` : ""}</td>
+      <td>${fitLine(v.fit)}</td><td style="white-space:nowrap"><button class="btn sm" data-open="${esc(v.id)}">Details</button> <button class="btn sm" data-pin="${esc(v.id)}">${M.pins.includes(v.id) ? "Unpin" : "Pin"}</button>`
+      + `${v.pull && !v.installed ? ` <button class="btn sm" data-pull="${esc(v.pull)}" data-size="${+v.size_bytes || ""}">Install</button>` : ""}</td></tr>`;
+    $("#m-res").innerHTML = `<div class="dim" style="font-size:12px;margin-bottom:8px">${r.count} variants · ${gpuLine}${p.stale ? " · stale reading" : ""}${r.hf ? ` · Hub last synced ${when(r.hf)}` : ""}</div>`
+      + (r.groups.length ? r.groups.map((g) => `<div class="card" style="margin-bottom:10px;overflow-x:auto"><h3 style="margin:0 0 6px">${esc(g.family)} <span class="dim" style="font-size:12px;font-weight:400">${g.variants.length} variant${g.variants.length > 1 ? "s" : ""}</span></h3>
+          <table><tbody>${g.variants.map(row).join("")}</tbody></table></div>`).join("")
+        : `<div class="empty"><b>No models match</b>Clear a filter, switch to All models, or search the Hugging Face Hub.</div>`);
+    $$("[data-open]").forEach((b) => (b.onclick = () => detail(b.dataset.open).catch(fail)));
+    $$("[data-pin]").forEach((b) => (b.onclick = () => { const id = b.dataset.pin; M.pins = M.pins.includes(id) ? M.pins.filter((x) => x !== id) : [...M.pins, id].slice(-4); results(); compare(); }));
+    $$("[data-pull]").forEach((b) => (b.onclick = () => install(b.dataset.pull, +b.dataset.size || null)));
+  }
+
+  async function compare() {
+    if (M.pins.length < 2) return ($("#m-cmp").innerHTML = M.pins.length ? `<div class="dim" style="font-size:12px">Pin one more to compare side by side (2–4).</div>` : "");
+    const r = await api("/api/models/compare", { body: { ids: M.pins, workload: wl(), profile: M.f.profile || "" } }).catch(fail);
+    if (!r) return;
+    $("#m-cmp").innerHTML = `<div class="card" style="overflow-x:auto"><h3 style="margin:0 0 6px">Compare</h3><table><thead><tr><th></th>${r.rows.map((x) => `<th>${esc(x.variant.name)}</th>`).join("")}</tr></thead><tbody>
+      ${MODEL_FIELDS.map((fd) => `<tr><td class="dim">${fd[1]}</td>${r.rows.map((x) => `<td>${fieldVal(x.variant, fd)} ${srcTag(x.variant, fd[0])}</td>`).join("")}</tr>`).join("")}
+      <tr><td class="dim">Fit (${esc(r.profile.name)})</td>${r.rows.map((x) => `<td>${fitLine(x.fit)}</td>`).join("")}</tr>
+      <tr><td class="dim">Checks</td>${r.rows.map((x) => `<td style="font-size:12px"><ul style="margin:0;padding-left:16px">${checkList(x.fit)}</ul></td>`).join("")}</tr></tbody></table></div>`;
+  }
+
+  async function detail(id) {
+    const r = await api(`/api/models/variant/${encodeURIComponent(id)}?${new URLSearchParams({ ...wl(), profile: M.f.profile || "" })}`);
+    const v = r.variant, f = r.fit, tasks = (M.tasks || (M.tasks = await api("/api/models/tasks"))).tasks;
+    modal(`<h2>${esc(v.name)}</h2><p class="dim mono" style="font-size:11.5px;word-break:break-all">${esc(v.id)}</p>${v.why ? `<p class="muted">${esc(v.why)}</p>` : ""}
+      <table><tbody>${MODEL_FIELDS.map((fd) => `<tr><td class="dim">${fd[1]}</td><td>${fieldVal(v, fd)}</td><td>${srcTag(v, fd[0])}</td></tr>`).join("")}
+        <tr><td class="dim">Accepts → generates</td><td>${esc((v.inputs || []).join(", "))} → ${esc((v.outputs || []).join(", "))}</td><td></td></tr>
+        ${v.measured ? `<tr><td class="dim">Measured</td><td>${v.measured.vram_gib} GiB VRAM · ${v.measured.tokens_per_s ?? "—"} tok/s at ${num(v.measured.context)} ctx</td><td><span class="dim" style="font-size:11px">locally tested ${esc(v.measured.at.slice(0, 10))}</span></td></tr>` : ""}</tbody></table>
+      <h3>Fit on this PC${f.workload ? ` (${esc(f.profile || "")}, ${num(f.workload.context)} ctx × ${f.workload.concurrency})` : ""}</h3><p>${fitLine(f)}</p>
+      <ul style="margin:0;padding-left:18px;font-size:12.5px">${checkList(f)}</ul>
+      <div class="row wrap" style="gap:8px;margin-top:12px">${v.provider === "ollama" && v.installed ? `<button class="btn" id="md-bench">Benchmark on this PC</button>` : ""}
+        ${v.source === "hf" ? `<button class="btn" id="md-card">Load model card</button>` : ""}${v.pull && !v.installed ? `<button class="btn" id="md-pull">Install with Ollama</button>` : ""}</div>
+      ${v.provider && (v.digest || v.revision) ? `<h3>Use it for a task</h3><div class="row wrap" style="gap:8px"><select id="md-task">${tasks.map((t) => `<option value="${t.task}">${esc(t.label)}</option>`).join("")}</select>
+        <select id="md-mode"><option value="existing">as is (existing)</option><option value="scratch">as the base of a trained specialist (scratch)</option></select><button class="btn primary" id="md-use">Propose as candidate</button></div>`
+        : `<p class="dim" style="font-size:12.5px">To select it for a task, install it first: selections pin the installed digest, never a name.</p>`}
+      <div class="foot"><button class="btn" data-close>Close</button></div>`, (m, close) => {
+      $("#md-bench", m)?.addEventListener("click", () => api("/api/models/benchmark", { body: { id: v.id, context: wl().context } })
+        .then(() => { close(); toast("Benchmark running: loads the model, runs a prompt, reads the VRAM it took."); }).catch(fail));
+      $("#md-card", m)?.addEventListener("click", () => api("/api/models/card", { body: { id: v.id } }).then(() => { close(); detail(id).catch(fail); }).catch(fail));
+      $("#md-pull", m)?.addEventListener("click", () => { close(); install(v.pull, v.size_bytes || null); });
+      $("#md-use", m)?.addEventListener("click", () => api("/api/models/propose", { body: { task: $("#md-task", m).value, id: v.id, mode: { kind: $("#md-mode", m).value }, workload: wl() } })
+        .then((s) => { close(); M.tasks = null; toast(`Candidate v${s.version} for ${s.task} saved: review its gates under Tasks & releases.`, "ok", 6000); }).catch(fail));
+    }, true);
+  }
+
+  // ---------- Tasks & releases ----------
+  async function tasksTab() {
+    const r = M.tasks = await api("/api/models/tasks");
+    const short = (s) => esc(String(s || "").replace(/^sha256:/, "").slice(0, 12));
+    const selLine = (s) => s ? `<b>${esc(s.provider || "—")}</b> · ${esc(s.model || "—")}${s.digest ? ` <span class="mono dim" style="font-size:11px">@${short(s.digest)}</span>` : ""}${s.origin === "settings" ? ` <span class="chip">follows Settings → AI</span>` : ""}` : "—";
+    const selRow = (s, rel, task) => `<tr><td><input type="checkbox" data-pick="${s.id}"></td>
+      <td>v${s.version}${s.id === rel.active ? ` <span class="pill ok">active</span>` : ""}${s.id === rel.desired && s.id !== rel.active ? ` <span class="chip">desired</span>` : ""}<div class="dim" style="font-size:11px">${esc(s.mode.kind)}</div></td>
+      <td style="font-size:12.5px">${selLine(s)}${s.fit?.status ? `<div>${fitLine(s.fit)}</div>` : ""}${s.choice?.override_reason ? `<div class="dim" style="font-size:11px">override: ${esc(s.choice.override_reason)}</div>` : ""}</td>
+      <td style="font-size:11.5px">${Object.entries(s.gates || {}).map(([g, st]) => `${pill(GATE_STATUS, st)} ${g}`).join("<br>") || "—"}</td>
+      <td style="font-size:12px">${s.metrics?.at ? `quality ${s.metrics.quality ?? "—"} · support ${s.metrics.support ?? "—"} · ${s.metrics.latency} s<div class="dim" style="font-size:11px">${esc(s.metrics.at.slice(0, 10))}</div>` : "—"}</td>
+      <td>${s.score ?? "—"}</td><td style="white-space:nowrap">${s.origin !== "settings" ? `<button class="btn sm" data-measure="${s.id}">Measure</button> ` : ""}${s.id !== rel.active ? `<button class="btn sm primary" data-activate="${s.id}" data-t="${task}" data-rev="${rel.rev}">Activate</button>` : ""}</td></tr>`;
+    $("#mtab").innerHTML = `<p class="muted" style="margin-top:0">Each task keeps its desired selection, the candidate you last tried and the active release apart. A candidate that fails a gate leaves the active release running; Roll back returns to the one before.</p>`
+      + r.tasks.map((t) => {
+        const rel = t.release, byId = Object.fromEntries(t.selections.map((s) => [s.id, s]));
+        return `<div class="card" style="margin-bottom:12px;overflow-x:auto" data-task="${t.task}"><div class="row wrap"><h3 class="grow" style="margin:0">${esc(t.label)} <span class="dim" style="font-size:12px;font-weight:400">rev ${rel.rev}</span></h3>
+          ${rel.history.length > 1 ? `<button class="btn sm" data-rollback="${t.task}" data-rev="${rel.rev}">Roll back</button>` : ""}</div>
+          <div style="font-size:13px;margin:6px 0">Active: ${selLine(byId[rel.active])}${rel.candidate && rel.candidate_status === "failed" ? ` · <span style="color:var(--err)">candidate v${byId[rel.candidate]?.version ?? "?"} failed its gates</span>` : ""}</div>
+          <table><thead><tr><th></th><th>Version</th><th>Model</th><th>Gates</th><th>Measured</th><th>Score</th><th></th></tr></thead><tbody>${t.selections.map((s) => selRow(s, rel, t.task)).join("")}</tbody></table>
+          <div class="row" style="gap:8px;margin-top:8px"><button class="btn sm" data-choose="${t.task}">Help me choose (ticked versions)</button></div><div data-chosen></div></div>`;
+      }).join("");
+    $$("[data-rollback]").forEach((b) => (b.onclick = () => api("/api/models/rollback", { body: { task: b.dataset.rollback, rev: +b.dataset.rev } }).then(() => { toast("Rolled back.", "ok"); tasksTab(); }).catch(fail)));
+    $$("[data-activate]").forEach((b) => (b.onclick = () => activate(b.dataset.t, b.dataset.activate, +b.dataset.rev)));
+    $$("[data-measure]").forEach((b) => (b.onclick = () => measure(b.dataset.measure)));
+    $$("[data-choose]").forEach((b) => (b.onclick = async () => {
+      const card = b.closest("[data-task]"), ids = $$("[data-pick]:checked", card).map((c) => c.dataset.pick);
+      if (ids.length < 2) return toast("Tick 2 or more versions to compare.");
+      const c = await api("/api/models/choose", { body: { task: card.dataset.task, ids } }).catch(fail);
+      if (!c) return;
+      const gateNames = Object.keys(c.rows.find((s) => Object.keys(s.gates || {}).length)?.gates || {});
+      $("[data-chosen]", card).innerHTML = `<table style="margin-top:8px"><thead><tr><th>Rank</th><th>Version</th>${gateNames.map((g) => `<th>${g}</th>`).join("")}${c.metrics.map((m) => `<th title="worst ${m.worst} → best ${m.best}, weight ${m.weight}">${m.name}</th>`).join("")}<th>Score</th></tr></thead><tbody>
+        ${c.rows.map((s) => `<tr><td>${s.rank ?? "—"}</td><td>v${s.version} · ${esc(s.model)}</td>${gateNames.map((g) => `<td>${pill(GATE_STATUS, (s.gates || {})[g] || "unmeasured")}</td>`).join("")}${c.metrics.map((m) => `<td>${s.metrics?.[m.name] ?? "unmeasured"}</td>`).join("")}<td><b>${s.score ?? "no rank"}</b></td></tr>`).join("")}</tbody></table>
+        <div class="dim" style="font-size:11.5px">Score = 100 × Σ weight × (value − worst) / (best − worst). A version without measurements gets no rank: Measure it first.</div>`;
+    }));
+  }
+  async function activate(task, id, rev, reason = "") {
+    try {
+      const r = await api("/api/models/activate", { body: { task, candidate: id, rev, override_reason: reason } });
+      if (r.ok) { toast(`Activated: ${task} now uses this model.`, "ok"); return tasksTab(); }
+      tasksTab();
+      modal(`<h2>Gates failed</h2><p class="muted">The active release stays in place. Failing: <b>${esc(r.failed_gates.join(", "))}</b>. To activate anyway, say why (it's saved on the selection).</p>
+        <label class="field">Override reason<input id="ov-r" placeholder="e.g. I close OBS before running this"></label>
+        <div class="foot"><button class="btn" data-close>Keep the current release</button><button class="btn primary" id="ov-ok">Activate anyway</button></div>`,
+        (m, close) => ($("#ov-ok", m).onclick = () => { const why = $("#ov-r", m).value.trim(); if (!why) return toast("Give a reason, or keep the current release."); close(); activate(task, id, r.release.rev, why); }));
+    } catch (e) { fail(e); if (e.status === 409) tasksTab(); }
+  }
+  async function measure(id, confirm = false) {
+    const r = await api("/api/models/measure", { body: { selection: id, confirm } }).catch(fail);
+    if (!r) return;
+    if (r.needs_confirm) return modal(`<h2>This benchmark costs money</h2><p class="muted">It runs the golden eval cases through a paid API. ${esc(r.cost.line)}</p>
+      <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="ms-ok">Run it</button></div>`, (m, close) => ($("#ms-ok", m).onclick = () => { close(); measure(id, true); }));
+    toast("Measuring through the eval cases: open Tasks & releases again when it's done.");
+  }
+
+  // ---------- This PC: hardware profile ----------
+  async function hardwareTab() {
+    const r = await api("/api/models/hardware"), p = r.profile;
+    const prow = (x, on) => `<div class="row" style="gap:8px;margin-bottom:6px"><input type="radio" name="hw-act" ${on ? "checked" : ""}><input data-pn value="${esc(x.name)}"><label>reserve <input data-pr type="number" step="0.5" min="0" style="width:70px" value="${+x.reserve_gib}"> GiB</label><button class="btn sm" data-del>✕</button></div>`;
+    $("#mtab").innerHTML = `<div class="stack">
+      <div class="card"><h3 style="margin:0 0 6px">GPUs <span class="dim" style="font-size:12px;font-weight:400">read ${when(new Date(p.at * 1000).toISOString())}${p.stale ? " · stale" : ""} · driver ${esc(p.driver || "—")}</span></h3>
+        ${p.gpus.length ? `<table><thead><tr><th>GPU</th><th>Total</th><th>Used</th><th>Free</th><th>Budget (${esc(p.name)}, −${p.reserve_gib} GiB)</th></tr></thead><tbody>${p.gpus.map((g) => `<tr><td>${g.index}: ${esc(g.name)}</td><td>${g.total_gib.toFixed(1)} GiB</td><td>${g.used_gib.toFixed(1)}</td><td>${g.free_gib.toFixed(1)}</td><td><b>${g.budget_gib.toFixed(1)} GiB</b></td></tr>`).join("")}</tbody></table>`
+          : `<p class="dim">${p.telemetry === "denied" ? "GPU telemetry was denied (nvidia-smi refused): fits show as unknown." : "No NVIDIA GPU reading (nvidia-smi not found): fits show as unknown."}</p>`}
+        <p style="font-size:12.5px;margin:8px 0 0">RAM ${p.ram_free_gib?.toFixed(1) ?? "—"} of ${p.ram_total_gib?.toFixed(1) ?? "—"} GiB free · disk for models ${p.disk_free_gib?.toFixed(0) ?? "—"} GiB free${p.loaded?.length ? ` · loaded in Ollama: ${p.loaded.map((l) => `${esc(l.name)} (${l.size_vram_gib.toFixed(1)} GiB)`).join(", ")}` : ""}</p></div>
+      <div class="card"><h3 style="margin:0 0 6px">Profiles</h3><p class="muted" style="font-size:12.5px;margin:0 0 8px">A profile holds VRAM back for what else runs (a game, OBS). Budget = free − reserve. The selected one is the default for fit estimates.</p>
+        <div id="hw-ps">${r.profiles.map((x) => prow(x, x.name === r.active)).join("")}</div>
+        <div class="row" style="gap:8px"><button class="btn sm" id="hw-add">Add profile</button><button class="btn sm primary" id="hw-save">Save profiles</button></div></div></div>`;
+    $("#hw-add").onclick = () => $("#hw-ps").insertAdjacentHTML("beforeend", prow({ name: "New", reserve_gib: 0 }, false));
+    $("#hw-ps").onclick = (e) => e.target.closest("[data-del]")?.parentElement.remove();
+    $("#hw-save").onclick = () => {
+      const rows = $$("#hw-ps > .row"), profiles = rows.map((x) => ({ name: $("[data-pn]", x).value, reserve_gib: +$("[data-pr]", x).value || 0 }));
+      const i = rows.findIndex((x) => $("input[type=radio]", x).checked);
+      api("/api/models/hardware", { method: "PUT", body: { profiles, active: profiles[Math.max(0, i)]?.name } }).then(() => { toast("Profiles saved.", "ok"); hardwareTab(); }).catch(fail);
+    };
+  }
+}
+
+// ======================================================================
+// Model Lab — a local "specialist" that learns the creator's clip judgment (training/, routes_training.py): the dataset
+// from reviewed decisions, the external training env, the model designer, jobs, candidates with scorecards, promote/rollback.
+// ======================================================================
+routes.modellab = ModelLab;
+function ModelLab() {
+  this.every = 3000;
+  let st = null, ds = null, checkT = 0;
+  const num = (id) => Number($(id)?.value);
+  const pct = (v) => (v == null ? "—" : (v * 100).toFixed(0) + "%");
+  const spark = (m) => {
+    const pts = m.filter((x) => x.loss != null).slice(-120);
+    if (pts.length < 2) return "";
+    const lo = Math.min(...pts.map((p) => p.loss)), hi = Math.max(...pts.map((p) => p.loss)) || 1;
+    const xy = pts.map((p, i) => `${(i / (pts.length - 1)) * 160},${30 - ((p.loss - lo) / (hi - lo || 1)) * 28}`).join(" ");
+    return `<svg width="160" height="32" aria-label="loss curve"><polyline points="${xy}" fill="none" stroke="var(--accent, #ff9a3c)" stroke-width="1.5"/></svg>`;
+  };
+  const design = () => {
+    const mode = $("#ml-mode").value;
+    const b = { mode, target: $("#ml-target").value.trim(), pilot: { tokens: num("#ml-tokens"), seq: num("#ml-seq"), micro: num("#ml-micro"), accum: num("#ml-accum"), lr: num("#ml-lr") } };
+    if (mode === "scratch") b.arch = Object.fromEntries(["vocab", "layers", "width", "mlp", "heads", "kv_heads", "context", "seed"].map((k) => [k, num(`#ml-a-${k}`)]).concat([["tied", $("#ml-a-tied").checked], ["tokenizer", $("#ml-a-tok").value]]));
+    else {
+      const [src, ...rest] = $("#ml-base").value.split("|");
+      b.base = src === "ollama" ? { source: "ollama", name: rest.join("|") } : { source: "hf", repo: $("#ml-repo").value.trim(), revision: $("#ml-rev").value.trim() || "main" };
+      b.recipe = Object.fromEntries(["r", "alpha", "dropout", "lr", "epochs"].map((k) => [k, num(`#ml-r-${k}`)]));
+    }
+    return b;
+  };
+  const check = () => {
+    clearTimeout(checkT);
+    checkT = setTimeout(async () => {
+      const out = $("#ml-check");
+      if (!out) return;
+      try {
+        const d = await api("/api/training/design", { body: design() });
+        const p = d.pilot, e = d.estimate;
+        out.innerHTML = `${d.params ? `<div><b>${d.params.toLocaleString()}</b> parameters</div>` : d.params_b ? `<div>Base: ~${d.params_b}B parameters</div>` : ""}
+          ${d.errors.length ? `<ul style="color:var(--err);margin:4px 0;padding-left:18px">${d.errors.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : `<div style="color:var(--ok)">✓ Valid</div>`}
+          ${p ? `<div class="muted" style="font-size:12.5px">${p.tokens_per_update.toLocaleString()} tokens/update · ${p.updates.toLocaleString()} updates · ${p.tok_s.toLocaleString()} tok/s · ${p.hours.toFixed(2)} h · ${p.vram_gb} GB VRAM · ${p.disk_gb} GB disk — <b>${esc(p.label)}</b>${p.label === "estimated" ? " (run a pilot to measure)" : ""}</div>` : ""}
+          ${e ? `<div class="muted" style="font-size:12.5px">~${e.vram_gb} GB VRAM · ~${e.disk_gb} GB disk — <b>${esc(e.label)}</b></div>` : ""}
+          <div style="font-size:12.5px">Fit on ${esc(d.profile.host)}${d.profile.gpu ? ` (${esc(d.profile.gpu)})` : ""}: ${d.fit.fits === true ? "✓" : d.fit.fits === false ? "✗" : "?"} ${esc(d.fit.notes.join(" "))}</div>
+          ${d.profile.target ? `<div class="muted" style="font-size:12px">${esc(d.profile.target.warning)}</div>` : ""}
+          ${d.license ? `<div style="font-size:12px">Licence: <b>${esc(d.license)}</b></div>` : d.mode !== "scratch" ? `<div style="font-size:12px">Licence: check the base model's card before training.</div>` : ""}`;
+      } catch (err) { out.innerHTML = `<span style="color:var(--err)">${esc(err.message)}</span>`; }
+    }, 300);
+  };
+  const envCard = (env) => `<h2>Training environment</h2>
+    <p class="muted" style="font-size:12.5px;margin-top:-6px">PyTorch, transformers and PEFT live in their own folder (several GB), never inside Reelwright. Pinned: ${esc(env.pins.join(", "))}; llama.cpp ${esc(env.llama_cpp_tag)}.</p>
+    <div>${env.ready ? `✓ Ready: torch ${esc(env.torch)}, CUDA ${env.cuda ? esc(env.cuda_version) + " on " + esc(env.gpu) : "<b>not available</b> (CPU only)"}${env.tools ? " · llama.cpp tools ✓" : " · llama.cpp tools missing"}` : "Not set up yet."}</div>
+    <div class="dim" style="font-size:12px">${esc(env.wsl ? "WSL: " : "")}${esc(env.python.join(" "))}</div>
+    <label class="field">Folder<input type="text" id="ml-envdir" placeholder="${esc(env.root)}"></label>
+    <div><button class="btn primary" id="ml-setup">Set up training environment</button></div>
+    <details><summary style="cursor:pointer;font-size:13px">Use an existing env or WSL2</summary>
+      <label class="field">Python of the env, or a WSL command<input type="text" id="ml-py" placeholder="C:\\envs\\train\\Scripts\\python.exe  or  wsl -d Ubuntu -- /home/me/rw/bin/python"></label>
+      <label style="font-size:13px"><input type="checkbox" id="ml-wsl"> It's a WSL command</label> <button class="btn sm" id="ml-use">Use it</button></details>`;
+  const dataCard = () => `<h2>Dataset</h2>
+    <p class="muted" style="font-size:12.5px;margin-top:-6px">Examples come from your reviewed decisions (👍, 👎, published, your trims and published titles), in the exact prompt shape the app uses. Nothing is used until you confirm it.</p>
+    <label style="font-size:13px"><input type="checkbox" id="ml-consent" ${st.consent.all ? "checked" : ""}> Use my reviewed decisions from all projects</label>
+    ${st.consent.all ? "" : `<details><summary style="cursor:pointer;font-size:13px">Or pick projects (${st.consent.projects.length})</summary>${st.projects.map((p) => `<label style="display:block;font-size:13px"><input type="checkbox" data-mlproj="${p.id}" ${st.consent.projects.includes(p.id) ? "checked" : ""}> ${esc(p.name)}</label>`).join("")}</details>`}
+    <div><button class="btn" id="ml-build">Build dataset</button></div>
+    <div id="ml-ds">${ds ? dsView(ds) : st.dataset ? `<span class="dim">Last build ${esc(st.dataset.id.slice(0, 12))}: ${st.dataset.counts.sft} examples</span>` : ""}</div>
+    <h3 style="margin:10px 0 4px;font-size:14px">Claude as teacher</h3>
+    <p class="muted" style="font-size:12.5px;margin:0">Claude labels confirmed projects through the app's own clip finder (paid; your own picks always win).</p>
+    <select id="ml-tproj" multiple size="3" style="width:100%">${st.projects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}</select>
+    <div><button class="btn sm" id="ml-teach">Estimate cost…</button></div>`;
+  const dsView = (b) => `<div style="font-size:13px">Dataset <b>${esc(b.hash.slice(0, 12))}</b>: ${b.counts.sft} examples (train ${b.counts.train} / dev ${b.counts.dev} / test ${b.counts.test}) · find ${b.counts.by_task.find}, judge ${b.counts.by_task.judge}, meta ${b.counts.by_task.meta} · ${b.counts.dpo} DPO pairs · ${b.counts.teacher} teacher${b.stats ? ` · ${b.stats.excluded_examples} excluded, ${b.stats.deleted_clips_skipped} deleted clips left out` : ""}</div>
+    ${b.note ? `<div class="muted" style="font-size:12.5px">${esc(b.note)}</div>` : ""}
+    ${b.counts.sft ? `<details><summary style="cursor:pointer;font-size:13px">Browse examples</summary><div id="ml-ex" class="dim">Loading…</div></details>` : ""}`;
+  const designCard = () => `<h2>Design the model</h2>
+    <p class="muted" style="font-size:12.5px;margin-top:-6px">Fit it to this PC (or a host on your network). Fine-tune an existing base with LoRA/QLoRA, or build a small Llama-style model from scratch.</p>
+    <label class="field">Approach<select id="ml-mode"><option value="scratch">From scratch</option><option value="qlora">QLoRA (4-bit NF4) on a base</option><option value="lora">LoRA on a base</option></select></label>
+    <div id="ml-scratch" class="cols" style="grid-template-columns:repeat(4,1fr);gap:6px">
+      ${[["vocab", "Vocab"], ["layers", "Layers"], ["width", "Width"], ["mlp", "MLP width"], ["heads", "Heads"], ["kv_heads", "KV heads"], ["context", "Context"], ["seed", "Seed"]].map(([k, l]) => `<label class="field">${l}<input type="number" min="1" id="ml-a-${k}" value="${st.defaults.arch[k]}"></label>`).join("")}
+      <label style="font-size:13px;align-self:end"><input type="checkbox" id="ml-a-tied" checked> Tied embeddings</label>
+      <label class="field" style="grid-column:span 3">Tokenizer<select id="ml-a-tok"><option value="bpe">Train a new BPE on the dataset</option>${Object.entries(st.defaults.tokenizers).map(([k, t]) => `<option value="${esc(k)}">${esc(k)} (pinned, ${t.vocab} tokens, ${esc(t.license)})</option>`).join("")}</select></label></div>
+    <div id="ml-lora" hidden>
+      <label class="field">Base<select id="ml-base"><option value="hf|">Hugging Face repo (type below)</option></select></label>
+      <div class="cols" style="grid-template-columns:2fr 1fr;gap:6px"><label class="field">Repo<input type="text" id="ml-repo" placeholder="Qwen/Qwen2.5-0.5B-Instruct"></label><label class="field">Revision<input type="text" id="ml-rev" value="main"></label></div>
+      <div class="cols" style="grid-template-columns:repeat(5,1fr);gap:6px">${[["r", 16], ["alpha", 32], ["dropout", 0.05], ["lr", 0.0001], ["epochs", 1]].map(([k, v]) => `<label class="field">${k}<input type="number" step="any" id="ml-r-${k}" value="${v}"></label>`).join("")}</div></div>
+    <div class="cols" style="grid-template-columns:repeat(5,1fr);gap:6px">${[["tokens", 50000000, "Tokens"], ["seq", 1024, "Sequence"], ["micro", 2, "Micro-batch"], ["accum", 8, "Grad. accum."], ["lr", 0.0006, "Learning rate"]].map(([k, v, l]) => `<label class="field">${l}<input type="number" step="any" id="ml-${k}" value="${v}"></label>`).join("")}</div>
+    <label class="field">Target host <span class="muted" style="font-size:12px">(blank = this PC; or a remote Ollama / Reelwright URL)</span><input type="text" id="ml-target" placeholder="http://192.168.1.20:11434"></label>
+    <div id="ml-check" class="stack" style="gap:2px"></div>
+    <div style="display:flex;gap:8px"><button class="btn" id="ml-pilot">Run 20-step pilot</button><button class="btn primary" id="ml-train">Train</button></div>`;
+  const jobsHtml = () => `<h2>Jobs</h2>${st.blocked ? `<div style="color:var(--warn, #e6b34a);font-size:13px">⏸ ${esc(st.blocked)}</div>` : ""}
+    ${st.jobs.length ? st.jobs.map((j) => {
+      const l = j.last || {}, r = j.result || {};
+      return `<div class="card" style="padding:10px;margin-top:8px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <b>${esc(j.kind)}</b> <span class="pill">${esc(j.status)}</span> <span class="dim" style="font-size:12.5px">${esc(j.message || "")}</span>
+        ${l.step ? `<span style="font-size:12.5px">step ${esc(l.step)}/${esc(l.of)} · loss ${esc(l.loss)} · ${l.tok_s ? l.tok_s.toLocaleString() + " tok/s" : "…"}</span>` : ""}${spark(j.metrics || [])}
+        <span style="margin-left:auto;display:flex;gap:6px">
+        ${j.status === "running" ? `<button class="btn sm" data-mljob="pause" data-id="${j.id}">Pause</button>` : ""}
+        ${j.status === "paused" ? `<button class="btn sm" data-mljob="resume" data-id="${j.id}">Resume</button>` : ""}
+        ${["queued", "running", "paused"].includes(j.status) ? `<button class="btn sm" data-mljob="cancel" data-id="${j.id}">Cancel</button>` : ""}
+        ${j.kind === "train" && j.status === "done" ? `<label style="font-size:12px"><input type="checkbox" data-mlpaid="${j.id}"> also score Claude (paid)</label><button class="btn sm primary" data-mljob="export" data-id="${j.id}">Export &amp; evaluate</button>` : ""}</span></div>
+        ${r.tok_s && j.kind === "pilot" ? `<div style="font-size:12.5px">Measured: <b>${r.tok_s.toLocaleString()} tok/s</b>, peak VRAM <b>${esc(r.peak_vram_gb)} GB</b> on ${esc(r.device)}</div>` : ""}
+        ${j.events?.tokenizer && j.events.tokenizer.vocab !== j.events.tokenizer.requested ? `<div class="muted" style="font-size:12px">The tokenizer learned ${j.events.tokenizer.vocab} of ${j.events.tokenizer.requested} tokens (small dataset).</div>` : ""}
+        ${j.error ? `<div style="color:var(--err);font-size:12.5px">${esc(j.error)}</div>` : ""}
+        ${(j.log || []).length ? `<details><summary style="cursor:pointer;font-size:12px">Log</summary><pre style="font-size:11px;max-height:160px;overflow:auto;white-space:pre-wrap">${esc(j.log.slice(-40).join("\n"))}</pre></details>` : ""}</div>`;
+    }).join("") : `<div class="dim">No jobs yet.</div>`}`;
+  const card = (c) => c ? `${pct(c.test_summary?.precision_at_k)} test · ${pct(c.evals_summary?.precision_at_k)} evals (IoU ${esc(c.evals_summary?.iou ?? "—")})` : "not scored";
+  const relHtml = () => `<h2>Candidates</h2>
+    <div style="font-size:13px">Active for finding clips: <b>${esc(st.active.find.provider)}:${esc(st.active.find.model)}</b> <button class="btn sm" id="ml-rollback">Roll back</button></div>
+    ${st.releases.length ? st.releases.map((r) => `<div class="card" style="padding:10px;margin-top:8px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <b>${esc(r.id)}</b> <code>${esc(r.tag || "")}</code> <span class="pill">${esc(r.status)}</span>
+      ${r.status === "candidate" ? `<span style="margin-left:auto;display:flex;gap:6px"><select data-mltask="${r.id}"><option>find</option><option>judge</option><option>meta</option></select><button class="btn sm primary" data-mlpromote="${r.id}">Promote</button></span>` : ""}</div>
+      <div style="font-size:12.5px">Candidate: ${card(r.card)} · vs ${esc(r.active_model || "active")}: ${card(r.active_card)}</div>
+      ${r.reason ? `<div class="muted" style="font-size:12.5px">${esc(r.reason)}</div>` : ""}
+      ${r.model?.license ? `<div style="font-size:12px">Licence: ${esc(r.model.license)}</div>` : ""}
+      <details><summary style="cursor:pointer;font-size:12px">Hashes</summary><pre style="font-size:11px;white-space:pre-wrap">${esc(JSON.stringify(r.hashes, null, 1))}</pre></details></div>`).join("") : `<div class="dim">Export a finished training job to get a candidate.</div>`}`;
+  const loadExamples = async (h) => {
+    const ex = await api(`/api/training/dataset/${h.slice(0, 16)}/examples`);
+    $("#ml-ex").innerHTML = `<table style="font-size:12px;width:100%"><tr><th>Task</th><th>Split</th><th>By</th><th>Target</th><th>Use</th></tr>${ex.map((e) => `<tr><td>${esc(e.task)}</td><td>${esc(e.split)}</td><td>${esc(e.reviewer)}</td><td><details><summary>${esc(e.target.slice(0, 80))}…</summary><pre style="white-space:pre-wrap;font-size:11px">${esc(e.prompt)}\n\n→ ${esc(e.target)}</pre></details></td><td><input type="checkbox" data-mlex="${e.id}" ${e.excluded ? "" : "checked"} title="Use this example"></td></tr>`).join("")}</table>`;
+  };
+  this.mount = async () => {
+    st = await api("/api/training/status");
+    view.innerHTML = `<div class="page"><h1>Model Lab</h1><p class="sub">Train a local specialist on your own clip judgment, with Claude as its teacher. It only replaces the current model after it beats it on the same tests.</p>
+      <div class="cols"><div class="stack"><div class="card stack" id="ml-env">${envCard(st.env)}</div><div class="card stack" id="ml-data">${dataCard()}</div></div>
+      <div class="stack"><div class="card stack" id="ml-design">${designCard()}</div><div class="card" id="ml-jobs">${jobsHtml()}</div><div class="card" id="ml-rel">${relHtml()}</div></div></div></div>`;
+    api("/api/training/bases").then((bs) => { $("#ml-base").innerHTML += bs.map((b) => `<option value="${b.source}|${esc(b.source === "hf" ? b.repo + "@" + b.revision : b.name)}">${esc(b.name)} — ${b.source === "hf" ? "trainable" : "Ollama (inference only)"}${b.license ? " · " + esc(b.license) : ""}</option>`).join(""); }).catch(() => {});
+    check();
+    view.oninput = (e) => { if (e.target.closest("#ml-design")) check(); };
+    view.onchange = async (e) => {
+      const t = e.target;
+      if (t.id === "ml-mode") { $("#ml-scratch").hidden = t.value !== "scratch"; $("#ml-lora").hidden = t.value === "scratch"; return check(); }
+      if (t.id === "ml-base") { const [src, v] = t.value.split("|"); if (src === "hf" && v) { const [repo, rev] = v.split("@"); $("#ml-repo").value = repo; $("#ml-rev").value = rev || "main"; } return check(); }
+      if (t.id === "ml-consent") { await api("/api/training/consent", { body: { all: t.checked } }).catch(fail); st = await api("/api/training/status"); $("#ml-data").innerHTML = dataCard(); return; }
+      if (t.dataset.mlproj) return api("/api/training/consent", { body: { project: t.dataset.mlproj, on: t.checked } }).catch(fail);
+      if (t.dataset.mlex) return api(`/api/training/examples/${t.dataset.mlex}/exclude`, { body: { on: !t.checked } }).then(() => toast(t.checked ? "Example used again." : "Example excluded from the next build.")).catch(fail);
+    };
+    view.onclick = async (e) => {
+      const t = e.target.closest("button, summary");
+      if (!t) return;
+      try {
+        if (t.id === "ml-setup") { await api("/api/training/env/setup", { body: { folder: $("#ml-envdir").value.trim() } }); toast("Setting up: this downloads several GB and takes a while.", "ok"); }
+        else if (t.id === "ml-use") { await api("/api/training/env/existing", { body: { python: $("#ml-py").value, wsl: $("#ml-wsl").checked } }); toast("Checking that environment…", "ok"); }
+        else if (t.id === "ml-build") { ds = await api("/api/training/dataset/build", { body: {} }); $("#ml-ds").innerHTML = dsView(ds); }
+        else if (t.tagName === "SUMMARY" && t.parentElement.querySelector("#ml-ex")) { const h = ds?.hash || st.dataset?.id; if (h) loadExamples(h); return; }
+        else if (t.id === "ml-teach") {
+          const projects = [...$("#ml-tproj").selectedOptions].map((o) => o.value);
+          if (!projects.length) return toast("Pick one or more projects first.");
+          const est = await api("/api/training/teacher", { body: { projects } });
+          if (!est.parts) return toast("None of those projects is confirmed for training.");
+          if (await confirmBox("Label with Claude?", `${est.line}. Claude's labels are added as "teacher" examples.`, "Spend it")) { await api("/api/training/teacher", { body: { projects, confirm: true } }); toast("Labelling started.", "ok"); }
+        }
+        else if (t.id === "ml-pilot" || t.id === "ml-train") { await api("/api/training/jobs", { body: { ...design(), kind: t.id === "ml-pilot" ? "pilot" : "train" } }); toast("Queued.", "ok"); }
+        else if (t.dataset.mljob) { await api(`/api/training/jobs/${t.dataset.id}/${t.dataset.mljob}`, { body: { eval_active: !!$(`[data-mlpaid="${t.dataset.id}"]`)?.checked } }); }
+        else if (t.dataset.mlpromote) { const r = await api(`/api/training/releases/${t.dataset.mlpromote}/promote`, { body: { task: $(`[data-mltask="${t.dataset.mlpromote}"]`).value } }); toast(r.reason, r.promoted ? "ok" : "err", 8000); }
+        else if (t.id === "ml-rollback") { if (await confirmBox("Roll back?", "The task goes back to the model that was active before the last promotion.", "Roll back")) { const r = await api("/api/training/rollback", { body: { task: "find" } }); toast(`Back to ${r.active}.`, "ok"); } }
+        else return;
+        this.refresh();
+      } catch (err) { fail(err); }
+    };
+  };
+  this.refresh = async () => {
+    st = await api("/api/training/status");
+    // a card being used (focused control, ticked box, open log or hashes) keeps its state until the user is done with it
+    const busy = (el) => el && (el.contains(document.activeElement) || !!$("details[open], input:checked", el) || $$("select", el).some((s) => s.selectedIndex > 0));
+    if ($("#ml-jobs") && !busy($("#ml-jobs"))) $("#ml-jobs").innerHTML = jobsHtml();
+    if ($("#ml-rel") && !busy($("#ml-rel"))) $("#ml-rel").innerHTML = relHtml();
+    if ($("#ml-env") && !$("#ml-env").contains(document.activeElement)) $("#ml-env").innerHTML = envCard(st.env);
+  };
+}

@@ -1,0 +1,38 @@
+{
+  "about": "Hand-made travel vlog: driving filler, a cheap-hotel story, a pleasant but flat beach day.",
+  "video_type": "vlog",
+  "duration": 79.0,
+  "lengths": [15, 30, 45],
+  "segments": [
+    {"start": 0.0, "end": 4.6, "text": "Good morning from the car, we are driving to the coast."},
+    {"start": 4.8, "end": 9.5, "text": "Traffic is terrible but the snacks are great."},
+    {"start": 9.7, "end": 14.4, "text": "We booked the cheapest hotel we could find."},
+    {"start": 14.6, "end": 19.3, "text": "Forty dollars a night, which should have been a warning."},
+    {"start": 19.5, "end": 24.2, "text": "So we finally get there and check in."},
+    {"start": 24.4, "end": 29.0, "text": "And the lady at the desk just laughs at us."},
+    {"start": 29.2, "end": 34.0, "text": "We open the door to our room."},
+    {"start": 34.2, "end": 39.0, "text": "The bed is inside the bathroom."},
+    {"start": 39.2, "end": 44.0, "text": "Not next to the bathroom. Inside it."},
+    {"start": 44.2, "end": 48.8, "text": "There is a shower curtain around the bed."},
+    {"start": 49.0, "end": 53.5, "text": "I'm never booking anything cheap again."},
+    {"start": 53.7, "end": 58.4, "text": "Anyway, the beach the next day was gorgeous."},
+    {"start": 58.6, "end": 63.4, "text": "The water was crystal clear and warm."},
+    {"start": 63.6, "end": 68.0, "text": "We swam until the sun went down."},
+    {"start": 68.2, "end": 73.0, "text": "Then we grabbed fish tacos from a little stand."},
+    {"start": 73.2, "end": 78.0, "text": "Best tacos of the whole trip, easily."}
+  ],
+  "signals": {"loud": [{"t": 35.0, "energy": 0.9}, {"t": 40.0, "energy": 0.8}], "scenes": [9.6, 29.1, 53.6]},
+  "gold": {
+    "good": [
+      {"start": 9.7, "end": 53.5, "setup": 9.7, "payoff": 53.5, "why": "cheapest hotel, bed in the bathroom"}
+    ],
+    "bad": [
+      {"start": 0.0, "end": 9.5, "why": "driving filler"}
+    ]
+  },
+  "stub": [
+    {"start": 19.5, "end": 53.5, "score": 89, "title": "The bed was in the bathroom"},
+    {"start": 58.6, "end": 78.0, "score": 60, "title": "Beach day"},
+    {"start": 0.0, "end": 14.4, "score": 40, "title": "Road trip"}
+  ]
+}

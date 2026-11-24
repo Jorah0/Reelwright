@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+import bisect
+import contextvars
 import math
 import threading
 from typing import Literal, Optional
@@ -10,7 +12,8 @@ import anthropic
 import numpy as np
 from pydantic import BaseModel, Field
 
-from . import config, log, usage
+from . import config, log, media, providers, usage
+from .media import LAYOUTS, REGION_LAYOUTS
 
 # ---------- transcription (faster-whisper, GPU when available) ----------
 
@@ -48,7 +51,35 @@ def _model(size: str, device: str):
     return _whisper[key]
 
 
-def transcribe(path, duration: float, progress=None) -> dict:
+WINDOW_S, WINDOW_PRE_S, WINDOW_POST_S = 30 * 60.0, 10.0, 30.0  # Whisper hears 30-minute windows of 16 kHz audio
+# (~115 MB) instead of the whole file as float32 (~1.4 GB for 6 h); the overlap lets speech across a boundary be heard whole
+BATCH = 8  # RTX 4090, 2 h of speech: batch 16 was no faster than 8 (41.7 vs 42.9 s) and reserved 1.7 GB more RAM
+
+
+def _stitch(out: list, segs, off: float, floor: float, until: float | None, progress, duration) -> float:
+    """Append one window's segments (window clock + off = source clock). Words before floor came from the previous
+    window's overlap and are dropped; segments starting at/after until belong to the next window. -> the next floor."""
+    cut = floor
+    for seg in segs:
+        if until is not None and off + seg.start >= until:
+            break  # the next window hears this part with its own lead-in
+        words = [{"s": round(off + w.start, 2), "e": round(off + w.end, 2), "w": w.word} for w in (seg.words or [])]
+        kept = [w for w in words if w["s"] >= floor]
+        if (not kept) if words else off + seg.end <= floor:
+            continue
+        whole = len(kept) == len(words)
+        out.append({"start": round(off + seg.start, 2) if whole else kept[0]["s"], "end": round(off + seg.end, 2),
+                    "text": seg.text.strip() if whole else "".join(w["w"] for w in kept).strip(), "words": kept})
+        cut = max(cut, out[-1]["end"], *(w["e"] for w in kept))
+        if progress and duration:
+            progress(min(out[-1]["end"] / duration, 1.0))
+    return cut
+
+
+def transcribe(path, duration: float, progress=None, vocab: str = "") -> dict:
+    """Speech -> segments with word times. Audio goes in WINDOW_S windows (media.pcm), on CUDA through faster-whisper's
+    batched pipeline. vocab = hotwords (brand names, slang) for every window; setting "whisper_language" pins the
+    language, else the first window with speech (or a confident detection) decides it for the rest."""
     global _cuda_broken
     s = config.load()
     devices = ["cuda", "cpu"] if s["whisper_device"] == "auto" else [s["whisper_device"]]
@@ -58,16 +89,26 @@ def transcribe(path, duration: float, progress=None) -> dict:
     with _whisper_lock:
         for device in devices:
             try:
-                segs, info = _model(s["whisper_model"], device).transcribe(str(path), word_timestamps=True, vad_filter=True)
-                out = []
-                for seg in segs:
-                    out.append({
-                        "start": round(seg.start, 2), "end": round(seg.end, 2), "text": seg.text.strip(),
-                        "words": [{"s": round(w.start, 2), "e": round(w.end, 2), "w": w.word} for w in (seg.words or [])],
-                    })
-                    if progress and duration:
-                        progress(min(seg.end / duration, 1.0))
-                return {"language": info.language, "device": device, "segments": out}
+                model = _model(s["whisper_model"], device)
+                opts = {"word_timestamps": True, "vad_filter": True, "hotwords": vocab or None,
+                        **({"beam_size": 2} if "turbo" in s["whisper_model"] else {})}  # turbo loses ~nothing at beam 2
+                if device == "cuda":
+                    from faster_whisper import BatchedInferencePipeline
+
+                    model, opts = BatchedInferencePipeline(model), {**opts, "batch_size": BATCH}
+                lang, out, cut = s.get("whisper_language") or None, [], 0.0
+                n = max(1, math.ceil((duration or 0) / WINDOW_S))
+                for k in range(n):
+                    off, end, final = max(0.0, k * WINDOW_S - WINDOW_PRE_S), (k + 1) * WINDOW_S, k == n - 1
+                    length = None if final else min(duration, end + WINDOW_POST_S) - off  # the last reads to the real end
+                    had = len(out)
+                    segs, info = model.transcribe(media.pcm(path, off, length), language=lang, **opts)
+                    cut = _stitch(out, segs, off, cut, None if final else end, progress, duration)
+                    if not lang and (len(out) > had or (getattr(info, "language_probability", 0) or 0) >= 0.5):
+                        lang = info.language  # a silent or music-only opening doesn't decide the whole video's language
+                return {"language": lang or info.language, "device": device, "segments": out}
+            except media.DecodeError:
+                raise  # the file, not the GPU: no CPU retry, and CUDA stays trusted
             except Exception as e:  # CUDA libs missing etc. → fall back to CPU
                 last = e
                 _whisper.clear()
@@ -79,15 +120,59 @@ def transcribe(path, duration: float, progress=None) -> dict:
 
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5", "claude-fable-5-2", "claude-fable-5-1"}
 
+# Settings "ai_routes" picks a provider per task; the task comes from the schema, so callers stay unchanged
+TASKS = {"find": "Finding clips", "judge": "Ranking clips (long videos)", "classify": "Video type", "meta": "Titles & captions",
+         "plan": "Edit plans", "assist": "Edit assistant", "other": "Everything else (virality, profiles, research)"}
+TASK_OF = {"MomentList": "find", "Ranking": "judge", "VideoType": "classify", "YouTubeMeta": "meta", "Plan": "plan",
+           "EditPatch": "assist"}
 
-def _ask(system: str, user: str | list | tuple[str, str | list], schema: type[BaseModel], effort: str = "high") -> BaseModel:
+
+def _release(task: str) -> dict | None:
+    """The Models page's active release for a task ({provider, model, digest}); None = Settings → AI decides."""
+    try:
+        from . import models  # lazy; inside the try so even an import failure leaves Settings → AI in charge
+        return models.routing(task)
+    except Exception as e:  # a broken release record must never stop AI calls: Settings → AI still works
+        log.event("models", f"release lookup for {task} failed: {e}")
+        return None
+
+
+def route(task: str) -> str:
+    rel = _release(task)
+    p = (rel or {}).get("provider") or (config.load().get("ai_routes") or {}).get(task) or "anthropic"
+    return p if p in providers.NAMES else "anthropic"
+
+
+def provider_cfg(provider: str, task: str) -> dict:
+    """A provider's settings, with the model pinned by the task's active release when it routes there."""
+    cfg, rel = config.provider(provider), _release(task)
+    return {**cfg, "model": rel["model"]} if rel and rel["provider"] == provider and rel.get("model") else cfg
+
+
+def provider_ready(name: str) -> bool:
+    return bool(config.api_key()) if name == "anthropic" else bool(config.provider(name).get("model"))
+
+
+def ready(task: str) -> bool:
+    """Whether the AI path for a task can run (callers fall back to heuristics when not)."""
+    p = route(task)
+    return provider_ready(p) or (p != "anthropic" and bool(provider_cfg(p, task).get("model")))
+
+
+def _ask(system: str, user: str | list | tuple[str, str | list], schema: type[BaseModel], effort: str = "high",
+         model: str | None = None, provider: str | None = None) -> BaseModel:
     """One structured Claude call. Pass user as (context, task) to cache the context: repeated searches or analyses
     of the same video then re-read the transcript from cache (~10% of the price, faster). Keep volatile text in task.
-    user (or task) may also be a list of content blocks, e.g. text interleaved with image blocks."""
+    user (or task) may also be a list of content blocks, e.g. text interleaved with image blocks.
+    Routed (setting "ai_routes", or provider=) to another provider, the same call goes through providers.ask."""
+    routed = TASK_OF.get(schema.__name__, "other")
+    provider = provider or route(routed)
+    if provider != "anthropic":
+        return providers.ask(provider, provider_cfg(provider, routed), system, user, schema)
     key = config.api_key()
     if not key:
         raise RuntimeError("Add your Anthropic API key in Settings to use Claude-powered features.")
-    model = config.load()["model"]
+    model = model or (provider_cfg("anthropic", routed).get("model") if _release(routed) else None) or config.load()["model"]
     client = anthropic.Anthropic(api_key=key, max_retries=4)  # rides out short 429/529 overload bursts
     if isinstance(user, tuple):
         context, task = user
@@ -135,6 +220,159 @@ class MomentList(BaseModel):
     clips: list[Moment]
 
 
+# ---------- video type: decided before the expensive analysis, it steers what the finder and the judge look for ----------
+
+VIDEO_TYPES = {"gaming": "Gaming", "vtuber": "VTuber", "just_chatting": "Just chatting / IRL", "podcast": "Podcast / interview",
+               "reaction": "Reaction", "tutorial": "Tutorial / educational", "sports": "Sports", "music": "Music / performance",
+               "vlog": "Vlog", "comedy": "Comedy / sketch", "other": "Other"}
+SUB_GENRES = {"fps": "FPS / competitive", "horror": "Horror", "variety": "Variety / casual", "speedrun": "Speedrun"}  # gaming only
+
+PLAYBOOKS = {
+    "gaming": "Payoffs are visual: clutch plays, wins, deaths, fails, rage and hype. Trust ACTION / FLASH / LOUD / CHAT SPIKE "
+              "tags over the words; a clip may carry little speech. Start a few seconds before the play (the setup), end on the "
+              "outcome plus the streamer's reaction. Typical length 15-45 s. Down-weight menus, loading, lobby chatter and "
+              "long quiet stretches of routine play.",
+    "vtuber": "The avatar's reaction and the voice carry the clip: screams, laughter, in-character bits, chat interactions and "
+              "lore moments. LOUD, fast and CHAT SPIKE matter most; ON-CAM is the avatar reacting. Hook on the funniest line "
+              "or scream. Typical length 15-45 s. Down-weight long gameplay with no talking and reading superchats aloud.",
+    "just_chatting": "Stories, hot takes, chat-bait questions and reactions to chat. CHAT SPIKE and LOUD lines mark the moments; "
+                     "ON-CAM faces reacting help. The clip must open on the topic, not mid-thought. Typical length 20-60 s. "
+                     "Down-weight thanking subs/donations, setup, and dead air.",
+    "podcast": "Words are the clip: quotable one-liners, strong opinions, surprising facts, a full mini-story, laughs, and "
+               "back-and-forth between speakers (a question and its answer belong together). Hook on the boldest line. "
+               "Typical length 30-75 s. Down-weight visual tags (ACTION/FLASH mean little in a studio), intros, ad reads "
+               "and housekeeping.",
+    "reaction": "Show the thing AND the reaction: the clip needs the moment being reacted to plus the strongest reaction "
+                "(LOUD, ON-CAM, laughter, disbelief). Keep it understandable without the original. Typical length 15-45 s. "
+                "Down-weight long silent watching and pauses to explain.",
+    "tutorial": "Complete, self-contained explanations: one tip, one fix or one 'aha' with its result, start to finish. A "
+                "clear promise in the first line ('how to…', 'the mistake everyone makes…'). Typical length 30-90 s. "
+                "Down-weight loudness, chat and action tags; never cut mid-step or before the result is shown.",
+    "sports": "Plays and crowd energy: goals, saves, big hits, finishes, celebrations. ACTION plus LOUD (crowd/commentator) mark "
+              "them; include a short build-up and the replay or reaction if close. Typical length 10-40 s. Down-weight "
+              "studio talk, stoppages and ads.",
+    "music": "Peak musical moments: the drop, the chorus, a solo, a high note, a crowd singing along. LOUD and ACTION help; "
+             "start on a bar/phrase boundary and end on a resolved phrase, never mid-word. Typical length 15-60 s. "
+             "Down-weight tuning, banter between songs and quiet stretches.",
+    "vlog": "Story beats and personality: a reveal, a funny mishap, a striking place, a relatable confession. Needs a clear "
+            "setup and payoff in one clip. Typical length 20-60 s. Down-weight transit filler and b-roll without narration.",
+    "comedy": "Setup-punchline structure: keep the full setup and end right after the laugh (LOUD laughter is the marker). "
+              "One bit per clip. Typical length 15-60 s. Down-weight scene-setting with no joke.",
+    "other": "Use the general rules: a strong hook, self-contained, a clear payoff, and the measured tags as evidence.",
+}
+SUB_PLAYBOOKS = {
+    "fps": "FPS / competitive: kills, multi-kills, clutches and aces (ACTION + FLASH bursts, kill-feed moments), loud callouts "
+           "and comms; round wins and losses. Tight cuts, 10-35 s.",
+    "horror": "Horror: jump scares are FLASH + LOUD + an ON-CAM face reaction within a second or two; include ~5 s of tension "
+              "before the scare and the scream after. Laughing it off afterwards is part of the payoff.",
+    "variety": "Variety / casual: funny fails, glitches, surprising events and banter; personality beats raw skill.",
+    "speedrun": "Speedrun: records, near-misses, tricks and skips, resets in frustration; the timer or split matters, so keep "
+                "the moment of success or failure in frame.",
+}
+
+
+class VideoType(BaseModel):
+    type: Literal["gaming", "vtuber", "just_chatting", "podcast", "reaction", "tutorial", "sports", "music", "vlog",
+                  "comedy", "other"]
+    sub_genre: Optional[Literal["fps", "horror", "variety", "speedrun"]] = Field(default=None, description="gaming only")
+    confidence: float = Field(description="0-1")
+    people_on_cam: int = Field(description="people visibly on camera (0 if none, e.g. gameplay only)")
+    facecam: bool = Field(description="a streamer facecam overlay over gameplay/screen content")
+    language: str = Field(description="primary spoken language, ISO 639-1 code, or 'unknown'")
+    reasons: list[str] = Field(description="up to 3 short reasons")
+
+
+CLASSIFY_SYSTEM = ("You classify a video before it is clipped, from its title/metadata and a few small frames spread across it. "
+                   "Types: " + ", ".join(f"{k} ({v})" for k, v in VIDEO_TYPES.items()) + ". For gaming also pick sub_genre: "
+                   + ", ".join(f"{k} ({v})" for k, v in SUB_GENRES.items()) + ". Be honest about confidence.")
+
+
+def classify_video(about: str, shots: list[bytes], excerpt: str = "") -> dict:
+    """One cheap Claude call (low effort, setting "classify_model") → the video type dict stored on the project."""
+    text = about + (f"\n\nTranscript excerpt:\n{excerpt[:4000]}" if excerpt else "")
+    user = [{"type": "text", "text": text}] + [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(j).decode()}}
+        for j in shots]
+    s = config.load()
+    cm = s.get("classify_model") or None
+    try:
+        vt = _ask(CLASSIFY_SYSTEM, user, VideoType, effort="low", model=cm)
+    except RuntimeError as e:  # e.g. the cheap model rejects the effort setting: one retry on the main model
+        if not cm or cm == s["model"]:
+            raise
+        log.event("classify", f"{cm} failed ({e}); retrying with {s['model']}")
+        vt = _ask(CLASSIFY_SYSTEM, user, VideoType, effort="low", model=s["model"])
+    vt = vt.model_dump()
+    if vt["type"] != "gaming":
+        vt["sub_genre"] = None
+    return {**vt, "confidence": round(max(0.0, min(1.0, vt["confidence"])), 2), "reasons": vt["reasons"][:3], "source": "ai"}
+
+
+# ponytail: keyword regexes on title/tags, first match wins (order matters: "minecraft speedrun" is a speedrun, "Elden Ring
+# episode 5" is gaming); extend as misses show up
+_KEYWORDS = [
+    ("vtuber", None, r"vtuber|vtube"),
+    ("gaming", "speedrun", r"speedrun|any%|world record|\bwr\b"),
+    ("gaming", "horror", r"horror|phasmophobia|scary|resident evil|outlast|fnaf|five nights|lethal company|dead by daylight"),
+    ("gaming", "fps", r"valorant|\bcs2\b|cs:?go|counter.strike|\bapex\b|warzone|call of duty|\bcod\b|fortnite|overwatch|"
+                      r"rainbow six|\br6\b|pubg|\bhalo\b|battlefield|tarkov|ranked|clutch"),
+    ("gaming", "variety", r"minecraft|let'?s play|gameplay|playthrough|walkthrough|gaming|\bgta\b|elden ring|roblox"),
+    ("podcast", None, r"podcast|episode|\bep\.? ?\d|interview|talk show"),
+    ("reaction", None, r"\breact|reaction"),
+    ("tutorial", None, r"tutorial|how to|\bguide\b|explained|(crash|full|free|online) course|\blessons? \d"),
+    ("sports", None, r"\bnba\b|\bnfl\b|football|soccer|basketball|\bufc\b|boxing|\bf1\b|tennis|hockey"),
+    ("music", None, r"music video|official video|live performance|concert|\bsong\b|\bcover\b|lyrics"),
+    ("comedy", None, r"sketch|comedy|stand.?up|\bskit\b|parody|prank"),
+    ("vlog", None, r"\bvlog|day in the life|\bgrwm\b"),
+    ("just_chatting", None, r"just chatting|\birl\b|chatting|q ?& ?a"),
+]
+
+
+def heuristic_type(about: str, signals: dict | None = None, segments: list | None = None, duration: float = 0) -> dict:
+    """No-key fallback: title keywords first, then the measured signals (motion, faces on screen, speech density)."""
+    import re
+
+    vis = (signals or {}).get("visual") or {}
+    motion = float(np.median(vis["motion"])) if vis.get("motion") else None
+    face = float(np.mean(vis["face"])) if vis.get("face") else 0.0
+    wps = sum(len(s["text"].split()) for s in segments or []) / duration if duration else 0.0
+    out = {"type": "other", "sub_genre": None, "confidence": 0.2, "people_on_cam": int(face >= 0.3), "facecam": False,
+           "language": "unknown", "reasons": [], "source": "heuristic"}
+    low = (about or "").lower()
+    hit = next(((t, sub, m.group(0)) for t, sub, rx in _KEYWORDS if (m := re.search(rx, low))), None)
+    if hit:
+        out.update(type=hit[0], sub_genre=hit[1], confidence=0.6, reasons=[f"title/metadata mentions “{hit[2]}”"])
+    elif motion is not None and motion >= 0.03:
+        out.update(type="gaming", sub_genre="variety", confidence=0.4, reasons=["lots of on-screen motion"])
+    elif face >= 0.5:
+        out.update(type="just_chatting", confidence=0.4, reasons=["a face on camera most of the time"])
+    elif wps >= 1.5:
+        out.update(type="podcast", confidence=0.35, reasons=["dense speech with little on-screen action"])
+    out["facecam"] = out["type"] == "gaming" and face >= 0.2
+    return out
+
+
+def fixed_type(kind, sub=None) -> dict | None:
+    """A creator-chosen type (None for "auto"). Raises ValueError for anything outside the taxonomy."""
+    if kind in (None, "", "auto"):
+        return None
+    if (not isinstance(kind, str) or kind not in VIDEO_TYPES
+            or (sub not in (None, "") and (kind != "gaming" or not isinstance(sub, str) or sub not in SUB_GENRES))):
+        raise ValueError(f"Unknown video type {kind!r}{f' / {sub!r}' if sub else ''}.")
+    return {"type": kind, "sub_genre": sub or None, "confidence": 1.0, "source": "user", "reasons": ["set by the creator"]}
+
+
+def playbook(vt: dict | None) -> str:
+    """The per-type 'what to comb for' block for the finder's cached context and the judge's system prompt."""
+    t = (vt or {}).get("type")
+    if t not in VIDEO_TYPES:
+        return ""
+    sub = vt.get("sub_genre") if t == "gaming" and vt.get("sub_genre") in SUB_GENRES else None
+    label = VIDEO_TYPES[t] + (f" — {SUB_GENRES[sub]}" if sub else "") + (" (set by the creator)" if vt.get("source") == "user" else "")
+    return (f"VIDEO TYPE: {label}\nWhat makes a good clip in this kind of video (playbook):\n{PLAYBOOKS[t]}"
+            + (f"\n{SUB_PLAYBOOKS[sub]}" if sub else ""))
+
+
 FIND_SYSTEM = """You are a world-class short-form video editor and content strategist (YouTube Shorts, TikTok, Reels).
 You find the moments in long videos that work as standalone clips. A great clip:
 - opens with a hook in the first 3 seconds (bold claim, question, conflict, surprise, emotion) — never mid-sentence;
@@ -146,7 +384,16 @@ Transcript lines may carry measured tags: LOUD / VERY LOUD (audio well above thi
 shouting, hype), fast (rapid speech), CHAT SPIKE (live chat exploded) — strong evidence of a reaction-worthy moment,
 but the words still have to stand alone. On-screen tags come from the picture: ACTION (far more motion than usual:
 fights, clutch plays, chases), FLASH (a sudden flash: explosion, jump scare, hit), ON-CAM (the streamer's face reacting
-on camera). In gaming and VTuber streams a visual payoff can carry a clip that has little speech."""
+on camera). In gaming and VTuber streams a visual payoff can carry a clip that has little speech.
+Streams may also carry: CLIP-MARKER (the creator said "clip that" or pressed a mark button: the 30-60 s BEFORE it is a
+clip they asked for — include its setup), EVENT <kind> (a game or app event), VIEWER-CLIPPED ×n (n viewers clipped
+this part on Twitch: proven demand), CHAT: laughing/hype/scared/... (what chat reacted with), and detected sounds
+LAUGHTER, SCREAM, CHEERING, APPLAUSE, GUNSHOT, EXPLOSION, CRYING, MUSIC.
+When the context names a VIDEO TYPE with a playbook, follow it: it says which signals matter and which to discount
+(its typical lengths are only a guide: the lengths in the TASK always win)."""
+CLIP_MARKS = {"voice", "obs", "comment"}  # marker kinds meaning "the creator wants this clipped" (others are events)
+CHAT_WORDS = {"laugh": "laughing", "hype": "hype", "scary": "scared", "sad": "sad", "cringe": "cringe", "shock": "shocked",
+              "clip": "asking to clip"}
 
 
 def even_sample(xs: list, k: int) -> list:
@@ -158,7 +405,14 @@ def even_sample(xs: list, k: int) -> list:
 
 def tagged_lines(segments: list[dict], signals: dict) -> str:
     """Transcript lines annotated with what the audio/chat/picture was doing: (LOUD/VERY LOUD, fast, CHAT SPIKE,
-    ACTION, FLASH, ON-CAM). Gives the model per-line prosody instead of a separate list of timestamps it has to line up."""
+    ACTION, FLASH, ON-CAM, plus CLIP-MARKER / EVENT, VIEWER-CLIPPED ×n, CHAT: <reaction>, LAUGHTER/GUNSHOT/… from
+    signals.enrich). Gives the model per-line prosody instead of a separate list of timestamps it has to line up."""
+    marks = sorted(signals.get("markers") or [], key=lambda m: m["t"])
+    vclips = signals.get("viewer_clips") or []
+    kinds = {k: np.asarray(v, dtype=np.float32) for k, v in (signals.get("chat_kinds") or {}).items() if v}
+    kind_hi = {k: max(float(np.percentile(v, 95)), 3.0) for k, v in kinds.items()}
+    sounds = sorted(signals.get("audio_events") or [], key=lambda e: e["t"])
+    mark_t, sound_t = [m["t"] for m in marks], [e["t"] for e in sounds]
     wave = np.asarray(signals.get("waveform") or [], dtype=np.float32)
     wmed = float(np.median(wave)) if wave.size else 0.0
     chat = np.asarray(signals.get("chat") or [], dtype=np.float32)  # messages per 10 s
@@ -191,6 +445,18 @@ def tagged_lines(segments: list[dict], signals: dict) -> str:
             tags.append("FLASH")
         if "face_reaction" in near or (cam_rare and face[a:b].size and float(face[a:b].mean()) >= 0.5):
             tags.append("ON-CAM")
+        lo, hi = s["start"] - 0.5, s["end"] + 0.5
+        mk = marks[bisect.bisect_left(mark_t, lo):bisect.bisect_right(mark_t, hi)]
+        if any(m.get("kind") in CLIP_MARKS for m in mk):
+            tags.append("CLIP-MARKER")
+        tags += sorted({f"EVENT {m['kind']}" for m in mk if m.get("kind") not in CLIP_MARKS})
+        if n := sum(c["t"] < s["end"] and c["t"] + c.get("d", 0) > s["start"] for c in vclips):
+            tags.append(f"VIEWER-CLIPPED ×{n}")
+        hot = [CHAT_WORDS.get(k, k) for k, v in kinds.items()
+               if (part := v[int(s["start"] // 10):int(s["end"] // 10) + 1]).size and float(part.max()) >= kind_hi[k]]
+        if hot:
+            tags.append("CHAT: " + "/".join(hot))
+        tags += sorted({e["kind"].upper() for e in sounds[bisect.bisect_left(sound_t, lo):bisect.bisect_right(sound_t, hi)]})
         out.append(f"[{s['start']:.1f}-{s['end']:.1f}]{' (' + ', '.join(tags) + ')' if tags else ''} {s['text']}")
     return "\n".join(out)
 
@@ -213,13 +479,48 @@ def find_moments(segments, duration, signals: dict, count: int, min_len: int, ma
     on one scale (a single pass over a 6-hour transcript under-samples its later hours). signals["video"] (the source
     file, when known) lets the judge look at a few frames of each candidate (setting "visual_judge")."""
     kw = dict(query=query, guidance=guidance, taste=taste, avoid=avoid, **({"target": target} if target else {}))
+    pair = consensus_pair()
+    if pair:  # "local first, Claude agrees": a cheap scout over-collects, the reviewer rules on each candidate
+        try:
+            cands, _ = _scan(segments, duration, signals, math.ceil(count * 2.5), min_len, max_len, kw, progress, pair[0])
+            if not cands:
+                raise RuntimeError("no candidates")
+        except Exception as e:
+            log.event("consensus", f"scout {pair[0]} failed ({e}); using the single-model path")
+        else:
+            try:
+                out = review_moments(cands, segments, signals, count, guidance=guidance, taste=taste, query=query,
+                                     scout=pair[0], reviewer=pair[1])
+                if out:
+                    return out
+                log.event("consensus", f"{pair[1]} kept none of the picks; showing {pair[0]}'s best instead")
+            except Exception as e:  # never throw away a finished scout pass
+                log.event("consensus", f"reviewer {pair[1]} failed ({e}); showing {pair[0]}'s best picks unreviewed")
+            return sorted(cands, key=lambda c: -c.get("score", 0))[:count]
+    cands, chunked = _scan(segments, duration, signals, count, min_len, max_len, kw, progress)
+    if not chunked or len(cands) <= count:
+        return cands
+    try:
+        return rank_moments(cands, segments, count, guidance=guidance, taste=taste, query=query, video=signals.get("video"),
+                            video_type=signals.get("video_type"))
+    except Exception as e:
+        if route("judge") == route("find"):
+            raise  # same provider: the error is real news (bad key, outage), not a missing judge
+        log.event("ai", f"judge ({route('judge')}) failed ({e}); keeping the finder's own ranking")
+        return sorted(cands, key=lambda c: -c.get("score", 0))[:count]
+
+
+def _scan(segments, duration, signals, count, min_len, max_len, kw, progress=None, provider=None) -> tuple[list[dict], bool]:
+    """The find pass: one call for short videos, parallel windows (deduped) for long ones. -> (candidates, chunked)"""
+    if provider:
+        kw = {**kw, "provider": provider}
     if duration <= CHUNK_S * 1.5:
-        return _find_pass(segments, duration, signals, count, min_len, max_len, **kw)
+        return _find_pass(segments, duration, signals, count, min_len, max_len, **kw), False
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     windows = [(t, min(t + CHUNK_S + OVERLAP_S, duration)) for t in range(0, int(duration), CHUNK_S)]
     per = max(2, math.ceil(count * 2 * CHUNK_S / duration))
-    jobs = []
+    jobs, avoid = [], kw.get("avoid") or ()
     for a, b in windows:
         segs = [s for s in segments if a <= s["start"] < b]
         if segs:
@@ -227,18 +528,18 @@ def find_moments(segments, duration, signals: dict, count: int, min_len: int, ma
                    "loud": [m for m in signals.get("loud", []) if a <= m["t"] < b]}
             jobs.append((segs, sig, [r for r in avoid if a <= r[0] < b]))
     cands, done = [], 0
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futs = [pool.submit(_find_pass, segs, duration, sig, per, min_len, max_len, **{**kw, "avoid": av},
-                            window=(segs[0]["start"], segs[-1]["end"])) for segs, sig, av in jobs]
+    workers = 1 if (kw.get("provider") or route("find")) == "ollama" else 4  # Ollama serves one request at a time
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # each window runs in a copy of the caller's context: a model benchmark's routing (a ContextVar) must reach
+        # every chunk, or long videos would silently fall back to the default (possibly paid) provider
+        futs = [pool.submit(contextvars.copy_context().run, _find_pass, segs, duration, sig, per, min_len, max_len,
+                            **{**kw, "avoid": av}, window=(segs[0]["start"], segs[-1]["end"])) for segs, sig, av in jobs]
         for f in as_completed(futs):
             cands += f.result()
             done += 1
             if progress:
                 progress(done / (len(futs) + 1))
-    cands = _dedupe(cands)
-    if len(cands) <= count:
-        return cands
-    return rank_moments(cands, segments, count, guidance=guidance, taste=taste, query=query, video=signals.get("video"))
+    return _dedupe(cands), True
 
 
 def _dedupe(clips: list[dict]) -> list[dict]:
@@ -278,8 +579,23 @@ def _judge_frames(cands: list[dict], video) -> dict[int, list[str]]:
     return out
 
 
+def _with_frames(system: str, entries: list[str], tail: str, shots: dict) -> tuple[str, str | list]:
+    """Candidate listing for a judge, with each candidate's still frames right after it when there are any."""
+    if not shots:
+        listing = "\n\n".join(entries)
+        return system, f"CANDIDATES:\n{listing}\n\n{tail}"
+    system += (" Some candidates come with still frames from inside the clip, in time order: judge the visual payoff "
+               "too (action, reactions, on-screen events), not only the words.")
+    user = [{"type": "text", "text": "CANDIDATES:"}]
+    for i, entry in enumerate(entries):
+        user.append({"type": "text", "text": entry})
+        user += [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": d}} for d in shots.get(i, [])]
+    user.append({"type": "text", "text": tail})
+    return system, user
+
+
 def rank_moments(cands: list[dict], segments: list[dict], count: int, guidance: str = "", taste: str = "",
-                 query: str = "", video=None) -> list[dict]:
+                 query: str = "", video=None, video_type: dict | None = None) -> list[dict]:
     """Judge pass: compare candidates from different parts of a long video side by side and keep the best.
     With the source video (and the "visual_judge" setting on) the top candidates carry a few still frames each."""
     entries = [f"#{i} [{c['start']:.0f}-{c['end']:.0f}s] {c.get('title', '')} — hook: {c.get('hook', '')}\n"
@@ -288,20 +604,10 @@ def rank_moments(cands: list[dict], segments: list[dict], count: int, guidance: 
     goal = f'matching the request "{query}"' if query else "for short-form (Shorts/TikTok/Reels)"
     system = ("You are the final editor choosing which candidate clips to publish. Candidates were found in separate "
               "parts of one long video by different passes, so their original scores are not comparable: rescore them "
-              "on one honest scale." + (f"\n\nCreator style profile:\n{guidance}" if guidance else ""))
+              "on one honest scale." + (f"\n\n{book}" if (book := playbook(video_type)) else "")
+              + (f"\n\nCreator style profile:\n{guidance}" if guidance else ""))
     tail = (f"The creator's reactions to earlier picks:\n{taste}\n\n" if taste else "") + f"Pick the {count} strongest {goal}, best first."
-    shots = _judge_frames(cands, video)
-    if shots:
-        system += (" Some candidates come with still frames from inside the clip, in time order: judge the visual payoff "
-                   "too (action, reactions, on-screen events), not only the words.")
-        user = [{"type": "text", "text": "CANDIDATES:"}]
-        for i, entry in enumerate(entries):
-            user.append({"type": "text", "text": entry})
-            user += [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": d}} for d in shots.get(i, [])]
-        user.append({"type": "text", "text": tail})
-    else:
-        listing = "\n\n".join(entries)
-        user = f"CANDIDATES:\n{listing}\n\n{tail}"
+    system, user = _with_frames(system, entries, tail, _judge_frames(cands, video))
     res = _ask(system, user, Ranking, effort="medium")
     out, seen = [], set()
     for r in res.ranked:
@@ -313,11 +619,13 @@ def rank_moments(cands: list[dict], segments: list[dict], count: int, guidance: 
 
 
 def _find_pass(segments, duration, signals: dict, count: int, min_len: int, max_len: int, query: str = "",
-               guidance: str = "", taste: str = "", avoid=(), window=None, target: float | None = None) -> list[dict]:
+               guidance: str = "", taste: str = "", avoid=(), window=None, target: float | None = None,
+               provider: str | None = None) -> list[dict]:
     aim = (f" Aim for about {target:.0f}s each (shorter is fine when the moment is complete); never longer than {max_len:.0f}s."
            if target else f" Never longer than {max_len:.0f}s.")
-    task = (f'Find up to {count} moments matching this request: "{query}". Length may be {max(5, min_len // 2)}-{max_len * 2}s; '
-            "relevance to the request matters most." if query else
+    span = f"{min_len:.0f}-{max_len:.0f}s.{aim}" if target else f"{max(5, min_len // 2):.0f}-{max_len * 2:.0f}s."  # picked length vs open search
+    task = (f'Find up to {count} moments matching this request: "{query}". Length may be {span} '
+            "Relevance to the request matters most." if query else
             f"Find the {count} best clips, each {min_len:.0f}-{max_len:.0f} seconds long, sorted best first.{aim}")
     if window:
         task += f" This is the part of the video from {window[0]:.0f}s to {window[1]:.0f}s; only pick moments inside it."
@@ -325,7 +633,8 @@ def _find_pass(segments, duration, signals: dict, count: int, min_len: int, max_
     vspikes = [(m["t"], m["kind"], m["strength"]) for m in (signals.get("visual") or {}).get("spikes", [])
                if not window or window[0] <= m["t"] < window[1]]
     # stable per video → cached; taste and task change between calls so they come after the cache breakpoint
-    context = (f"Video duration: {duration:.1f}s\n"
+    book = playbook(signals.get("video_type"))
+    context = ((f"{book}\n\n" if book else "") + f"Video duration: {duration:.1f}s\n"
                f"Scene cuts (s): {even_sample(signals.get('scenes', []), 400)}\n"
                f"Audio energy spikes (t, relative energy): {[(m['t'], m['energy']) for m in signals.get('loud', [])]}\n"
                + (f"Visual spikes (t, kind, strength): {vspikes}\n" if vspikes else "")
@@ -339,8 +648,90 @@ def _find_pass(segments, duration, signals: dict, count: int, min_len: int, max_
     else:
         task = f"TASK: {task}"
     system = FIND_SYSTEM + (f"\n\nThis creator's trained style profile (follow it):\n{guidance}" if guidance else "")
-    res = _ask(system, (context, task), MomentList, effort="high")
+    res = _ask(system, (context, task), MomentList, effort="high", **({"provider": provider} if provider else {}))
     return [m.model_dump() for m in res.clips]
+
+
+# ---------- consensus: a scout model over-collects, a reviewer model rules on every candidate ----------
+
+def consensus_pair() -> tuple[str, str] | None:
+    """(scout, reviewer) from setting "ai_consensus" when both are set up, else None (single-model path)."""
+    mode = config.load().get("ai_consensus") or "off"
+    if mode == "off":
+        return None
+    scout, _, reviewer = ("ollama:anthropic" if mode == "local_then_claude" else mode).partition(":")
+    if scout == reviewer or not {scout, reviewer} <= set(providers.NAMES):
+        return None
+    if not (provider_ready(scout) and provider_ready(reviewer)):
+        log.event("consensus", f"{mode} is on but {scout} or {reviewer} isn't set up; using the single-model path")
+        return None
+    return scout, reviewer
+
+
+def model_name(provider: str) -> str:
+    return config.load()["model"] if provider == "anthropic" else config.provider(provider).get("model", "")
+
+
+class Verdict(BaseModel):
+    index: int = Field(description="candidate number")
+    verdict: Literal["agree", "adjust", "reject"]
+    start: Optional[float] = Field(default=None, description="adjust only: new start time in seconds")
+    end: Optional[float] = Field(default=None, description="adjust only: new end time in seconds")
+    score: int = Field(description="0-100, your own score on one honest scale")
+    reason: str = Field(description="one sentence")
+
+
+class Review(BaseModel):
+    verdicts: list[Verdict] = Field(description="exactly one verdict per candidate, in candidate order")
+
+
+REVIEW_SYSTEM = """You are the senior short-form editor double-checking clip picks made by a faster first-pass model.
+Go through EVERY candidate and rule on it:
+- agree: it works as a standalone clip as cut (hook in the first seconds, self-contained, a payoff, ends on a complete sentence);
+- adjust: the moment is good but the cut is wrong (opens mid-thought, misses the setup or the payoff, runs long) - give the
+  new start/end on transcript line boundaries;
+- reject: not a strong standalone clip.
+Score every candidate 0-100 on one honest scale. Transcript tags are measured: LOUD / VERY LOUD, fast, CHAT SPIKE,
+ACTION, FLASH, ON-CAM."""
+
+
+def review_moments(cands: list[dict], segments: list[dict], signals: dict, count: int, guidance: str = "", taste: str = "",
+                   query: str = "", scout: str = "ollama", reviewer: str = "anthropic") -> list[dict]:
+    """The reviewer's pass over the scout's candidates -> agreed and adjusted clips, best first, each carrying both
+    models' reasons in clip["consensus"]. Rejected candidates go to the event log only."""
+    entries = [f"#{i} [{c['start']:.1f}-{c['end']:.1f}s] {c.get('title', '')} — hook: {c.get('hook', '')}\n"
+               f"First pass (score {c.get('score', '?')}): {c.get('reason', '')}\n"
+               + tagged_lines([s for s in segments if c["start"] - 8 <= s["start"] < c["end"] + 8], signals)[:2500]
+               for i, c in enumerate(cands)]
+    goal = f' matching the request "{query}"' if query else ""
+    system = (REVIEW_SYSTEM + (f"\n\n{book}" if (book := playbook(signals.get("video_type"))) else "")
+              + (f"\n\nCreator style profile:\n{guidance}" if guidance else ""))
+    tail = ((f"The creator's reactions to earlier picks:\n{taste}\n\n" if taste else "")
+            + f"Rule on all {len(cands)} candidates{goal}; about {count} should make the final cut.")
+    system, user = _with_frames(system, entries, tail, _judge_frames(cands, signals.get("video")))
+    res = _ask(system, user, Review, effort="medium", provider=reviewer)
+    who = {"scout": {"provider": scout, "model": model_name(scout)}, "reviewer": {"provider": reviewer, "model": model_name(reviewer)}}
+    out, seen = [], set()
+    for v in res.verdicts:
+        if not 0 <= v.index < len(cands) or v.index in seen:
+            continue
+        seen.add(v.index)
+        c = cands[v.index]
+        if v.verdict == "reject":
+            log.event("consensus", f"{reviewer} rejected {c['start']:.0f}-{c['end']:.0f}s “{c.get('title', '')}”: {v.reason}")
+            continue
+        moved = v.verdict == "adjust" and v.start is not None and v.end is not None and v.end > v.start
+        s, e = (float(v.start), float(v.end)) if moved else (c["start"], c["end"])
+        out.append({**c, "start": s, "end": e, "score": max(0, min(100, v.score)), "reason": v.reason or c.get("reason", ""),
+                    "consensus": {"verdict": "adjust" if moved else "agree",
+                                  "scout": {**who["scout"], "score": c.get("score"), "reason": c.get("reason", "")},
+                                  "reviewer": {**who["reviewer"], "score": v.score, "reason": v.reason},
+                                  **({"from": [c["start"], c["end"]]} if moved else {})}})
+    for i, c in enumerate(cands):
+        if i not in seen:
+            log.event("consensus", f"{reviewer} skipped {c['start']:.0f}-{c['end']:.0f}s “{c.get('title', '')}” (dropped)")
+    log.event("consensus", f"{scout} proposed {len(cands)}, {reviewer} kept {len(out)}")
+    return sorted(out, key=lambda c: -c["score"])[:count]
 
 
 def refine(clips: list[dict], segments: list[dict], duration: float, min_len: float, max_len: float,
@@ -374,9 +765,25 @@ def refine(clips: list[dict], segments: list[dict], duration: float, min_len: fl
     return out
 
 
-def heuristic_moments(segments, loud: list[dict], duration: float, count: int, min_len: float, max_len: float) -> list[dict]:
-    """No-API-key fallback: windows of whole sentences scored by speech density and audio energy."""
+def heuristic_moments(segments, loud: list[dict], duration: float, count: int, min_len: float, max_len: float,
+                      marks=()) -> list[dict]:
+    """No-API-key fallback: windows of whole sentences scored by speech density and audio energy. marks (signals'
+    markers and viewer_clips) seed their own windows first: the ~45 s before a clip marker, a viewer clip's own span."""
     cands = []
+    for m in marks or ():
+        t = float(m["t"])
+        if m.get("d"):  # a Twitch viewer clip: its span with a short lead-in; more views, more trust
+            a, b, views = t - 3, t + float(m["d"]), int(m.get("views") or 0)
+            score, why = min(95, 80 + int(math.log10(1 + views) * 5)), f"Viewers clipped this moment on Twitch ({views} views)."
+        else:  # "clip that" comes after the moment: end just past it, start up to 50 s earlier
+            b = t + 5
+            a = b - min(50.0, max_len)
+            score = 100 if m.get("kind") in CLIP_MARKS else 90
+            why = f"Clip marker ({m.get('label') or m.get('kind')}) at {int(t // 60)}:{int(t % 60):02d}."
+        a, b = max(0.0, a), min(duration, b)
+        text = " ".join(s["text"] for s in segments if a <= s["start"] < b).strip()
+        cands.append({"start": a, "end": b, "score": score, "title": (text[:60] + "…") if text else why[:60], "hook": text[:120],
+                      "reason": why, "hashtags": []})
     for i, seg in enumerate(segments):
         j, words = i, 0
         while j < len(segments) and segments[j]["end"] - seg["start"] < min_len:
@@ -618,12 +1025,16 @@ def virality(segments, signals, start, end, title: str, guidance: str = "", quer
 
 # ---------- custom training: a creator style profile ----------
 
+THEME_LAYOUTS = tuple(x for x in LAYOUTS if x not in REGION_LAYOUTS)  # a trained theme styles new clips: no regions
+
+
 class Theme(BaseModel):
     caption_style: Literal["bold", "clean", "boxed", "neon"]
     caption_color: str = Field(description="hex colour for the highlighted caption word, e.g. #FFD400")
     caption_pos: Literal["low", "middle", "high"]
     aspect: Literal["9:16", "1:1", "4:5", "16:9"]
-    layout: Literal["single", "split"] = Field(description="split = facecam on top (streamers/gaming), single otherwise")
+    layout: Literal[THEME_LAYOUTS] = Field(description="split = facecam on top (streamers/gaming), split_rev = facecam below, "
+                                                     "blurcam = the whole frame over its own blur, single otherwise")
 
 
 class StyleProfile(BaseModel):
@@ -792,3 +1203,64 @@ def intake_questions(name: str, notes: str, references: list[str], answers: dict
             "competitors/creators to emulate, content boundaries, posting capacity...). Do not repeat answered topics.")
     q = _ask("You are onboarding a creator onto an AI clipping and publishing tool. Ask short, concrete questions.", user, Questions, effort="low")
     return [x.model_dump() for x in q.questions][:6]
+
+
+# ---------- long-form edits (longform.py): chapter titles and regular-video metadata ----------
+
+class ChapterTitles(BaseModel):
+    titles: list[str] = Field(description="one title per chapter, in order, each 2-6 words, max 60 characters")
+
+
+def longform_chapter_titles(texts: list[str], guidance: str = "") -> list[str]:
+    """A short title per chapter of a long-form video, from what is said in each (in order)."""
+    listing = "\n\n".join(f"CHAPTER {i + 1}:\n{t or '(no speech)'}" for i, t in enumerate(texts))
+    system = ("You title the chapters of a long YouTube video. Each title says what happens in that chapter, plainly and "
+              "specifically, like a table of contents. No numbering, no emoji, no clickbait."
+              + (f"\nThis creator's style profile:\n{guidance}" if guidance else ""))
+    res = _ask(system, f"{listing}\n\nWrite exactly {len(texts)} titles, in order.", ChapterTitles, effort="low")
+    return [t.strip()[:60] for t in res.titles]
+
+
+def longform_meta(title: str, chapters_text: str, transcript: str, guidance: str = "") -> dict:
+    """Title, description, tags and category for a regular (not #shorts) YouTube video. The chapter block is placed in
+    the description by the caller exactly as given, so YouTube shows chapters."""
+    system = ("You are a YouTube growth strategist writing searchable, honest, high-CTR metadata for a regular long-form "
+              "YouTube video (not a Short: never add #Shorts)." + (f"\nThis creator's trained style profile:\n{guidance}" if guidance else ""))
+    user = (f"Working title: {title}\nChapters:\n{chapters_text or '(none)'}\n\nTranscript excerpt:\n{transcript[:12000]}\n\n"
+            "Write the metadata. The description: 2-3 short paragraphs and a few hashtags; leave out timestamps (the chapter "
+            "list is added separately).")
+    import re
+
+    d = _ask(system, user, YouTubeMeta, effort="low").model_dump()
+    d["title"] = d["title"][:100]
+    d["description"] = re.sub(r"(?i)\s*#shorts\b", "", d["description"]).strip()
+    tags, total = [], 0
+    for t in d["tags"]:  # YouTube caps tags at ~500 chars total
+        if total + len(t) + 1 > 480:
+            break
+        tags.append(t)
+        total += len(t) + 1
+    d["tags"] = tags
+    return d
+
+
+
+# ---------- headline banner ----------
+
+class HeadlineOptions(BaseModel):
+    options: list[str] = Field(description="exactly 3 different on-screen headlines for the clip, each at most 60 characters")
+    kicker: str = Field(description="a short top line above the headline (at most 24 characters), e.g. the speaker or show "
+                                    "name, 'PART 2', or the topic; empty if nothing fits honestly")
+
+
+def headline_options(clip: dict, segments: list[dict]) -> dict:
+    """3 short headline options and a kicker for the clip's banner, grounded in what is actually said."""
+    user = (f"Working title: {clip.get('title')}\nHook: {clip.get('hook')}\n"
+            f"Transcript:\n{transcript_lines(segments, clip['start'], clip['end'])}\n\n"
+            "Write 3 different headlines for the banner above this vertical clip, plus a kicker.")
+    system = ("You write the bold headline banner that sits above a short vertical video. Each headline is punchy, at most "
+              "60 characters, and honest: it only claims what really happens in the clip. No clickbait lies, no invented "
+              "events, numbers or quotes; no hashtags.")
+    r = _ask(system, user, HeadlineOptions, effort="low")
+    opts = list(dict.fromkeys(" ".join(o.split())[:90] for o in r.options if o.strip()))[:3]
+    return {"options": opts, "kicker": " ".join(r.kicker.split())[:40]}

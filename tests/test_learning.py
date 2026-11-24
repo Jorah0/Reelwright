@@ -5,6 +5,7 @@ import tempfile
 os.environ["REELWRIGHT_DATA"] = os.environ.get("REELWRIGHT_DATA") or tempfile.mkdtemp()
 
 import numpy as np  # noqa: E402
+import pytest  # noqa: E402
 
 from reelwright import ai, learn  # noqa: E402
 
@@ -104,3 +105,34 @@ def test_long_videos_are_scanned_in_chunks_then_judged(monkeypatch):
     calls.clear()
     ai.find_moments(segs[:300], 3000.0, {}, 3, 20, 60)  # short: one pass, no judge
     assert len(calls) == 1
+
+
+def test_every_layout_survives_import_sanitization_and_old_values_still_work():
+    from reelwright import media
+    for lay in media.LAYOUTS:
+        assert learn.clean_edit({"layout": lay}) == {"layout": lay}
+    assert learn.clean_edit({"layout": "split"}) == {"layout": "split"}  # data saved before the new layouts
+    assert learn.clean_edit({"layout": "bogus"}) == {}
+
+
+def test_house_style_never_auto_applies_a_layout_that_needs_regions():
+    from reelwright import media
+    liked = lambda lay: [{"signal": 1, "edit": {"layout": lay, "aspect": "9:16"}} for _ in range(4)]  # noqa: E731
+    assert learn.house_style(liked("split_rev"))["layout"] == "split_rev"
+    assert learn.house_style(liked("blurcam"))["layout"] == "blurcam"
+    assert learn.house_style(liked("split"))["layout"] == "split"
+    for lay in media.REGION_LAYOUTS:  # duo / stack3 / free / pip on a new clip with no regions would mean nothing
+        hs = learn.house_style(liked(lay))
+        assert "layout" not in hs and hs["aspect"] == "9:16", lay
+
+
+def test_trained_theme_offers_every_layout_that_works_without_regions():
+    import pydantic
+    from reelwright import ai, media
+    base = {"caption_style": "bold", "caption_color": "#FFD400", "caption_pos": "low", "aspect": "9:16"}
+    for lay in media.LAYOUTS:
+        if lay in media.REGION_LAYOUTS:
+            with pytest.raises(pydantic.ValidationError):
+                ai.Theme(**base, layout=lay)
+        else:
+            assert ai.Theme(**base, layout=lay).layout == lay

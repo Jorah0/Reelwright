@@ -1,0 +1,43 @@
+{
+  "about": "Hand-made cooking tutorial: a like-and-subscribe intro, a myth-then-fix tip, a gravy method.",
+  "video_type": "tutorial",
+  "duration": 95.0,
+  "lengths": [15, 30, 45],
+  "segments": [
+    {"start": 0.0, "end": 4.5, "text": "Hey guys, welcome back to the kitchen."},
+    {"start": 4.7, "end": 9.4, "text": "Smash that like button and subscribe."},
+    {"start": 9.6, "end": 14.2, "text": "Today we are making roast potatoes."},
+    {"start": 14.4, "end": 19.3, "text": "Most people get roast potatoes completely wrong."},
+    {"start": 19.5, "end": 24.6, "text": "They throw raw potatoes straight into the oven."},
+    {"start": 24.8, "end": 29.5, "text": "That gives you a soft, sad potato."},
+    {"start": 29.7, "end": 34.6, "text": "The secret is to boil them first with baking soda."},
+    {"start": 34.8, "end": 39.5, "text": "It roughs up the outside and makes a crust."},
+    {"start": 39.7, "end": 44.3, "text": "Then shake them in the pot until the edges go fluffy."},
+    {"start": 44.5, "end": 49.6, "text": "Those fluffy edges turn into the crunchiest bits."},
+    {"start": 49.8, "end": 54.0, "text": "Listen to that crunch."},
+    {"start": 54.2, "end": 59.0, "text": "Next, let me show you my gravy."},
+    {"start": 59.2, "end": 64.0, "text": "Gravy starts with the roasting pan."},
+    {"start": 64.2, "end": 69.3, "text": "Scrape up every brown bit from the bottom."},
+    {"start": 69.5, "end": 74.0, "text": "Add a spoon of flour and stir for a minute."},
+    {"start": 74.2, "end": 79.1, "text": "Pour in the stock slowly, always slowly."},
+    {"start": 79.3, "end": 84.0, "text": "If you rush it, you get lumps."},
+    {"start": 84.2, "end": 89.0, "text": "And nobody wants lumpy gravy."},
+    {"start": 89.2, "end": 94.0, "text": "That's it for today, see you next week."}
+  ],
+  "signals": {"loud": [{"t": 51.0, "energy": 0.7}], "scenes": [14.3, 54.1, 89.1]},
+  "gold": {
+    "good": [
+      {"start": 14.4, "end": 54.0, "setup": 14.4, "payoff": 54.0, "why": "the common mistake, then the fix and the crunch"},
+      {"start": 59.2, "end": 89.0, "setup": 59.2, "payoff": 89.0, "why": "gravy method start to finish"}
+    ],
+    "bad": [
+      {"start": 0.0, "end": 14.2, "why": "intro and like-and-subscribe"},
+      {"start": 89.2, "end": 95.0, "why": "outro"}
+    ]
+  },
+  "stub": [
+    {"start": 29.7, "end": 54.0, "score": 85, "title": "The crispy potato secret"},
+    {"start": 64.2, "end": 89.0, "score": 70, "title": "Lump-free gravy"},
+    {"start": 0.0, "end": 19.3, "score": 40, "title": "Welcome back"}
+  ]
+}
