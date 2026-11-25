@@ -78,12 +78,16 @@ uses developer apps that you create, so each platform's permissions are granted 
     the videos Reelwright posted, so it learns what works on TikTok. Only requested after you turn on <b>Ask TikTok for view
     counts</b> in the Virality Lab; add the Display API to your app first (it is part of TikTok's app review), then Reconnect.</td></tr>
 </table></div>
+<div class="note" id="tiktok-port"><b>Set TikTok up before November 2026?</b> Reelwright moved from port 8765 to <b>38765</b> so it no
+  longer collides with other local apps. In your TikTok app → <b>Login Kit → Redirect URI</b>, replace
+  <code>http://localhost:8765/oauth/tiktok/callback</code> with <code>http://localhost:38765/oauth/tiktok/callback</code>
+  (or add it next to the old one), save, then <b>Reconnect</b> each TikTok account on the Publish page if sign-in fails.</div>
 <h3>Setup</h3>
 <ol>
   <li>Go to <a href="https://developers.tiktok.com/apps" target="_blank">developers.tiktok.com → Manage apps</a> → <b>Connect an app</b>.</li>
   <li>Fill in the app details: icon, name, category, description, and your public <b>Terms of Service</b> and <b>Privacy Policy</b> URLs
     (see <a href="#urls">Policy URLs</a>). Under <b>Platforms</b>, choose <b>Desktop</b>.</li>
-  <li><b>Add products → Login Kit</b>. Under Redirect URI add exactly <code>http://localhost:8765/oauth/tiktok/callback</code>
+  <li><b>Add products → Login Kit</b>. Under Redirect URI add exactly <code>http://localhost:38765/oauth/tiktok/callback</code>
     (the Publish page shows the exact value if you changed Reelwright's port).</li>
   <li><b>Add products → Content Posting API</b> and turn on <b>Direct Post</b>.</li>
   <li><b>Scopes</b>: make sure <code>user.info.basic</code> and <code>video.publish</code> are added.</li>
@@ -185,13 +189,15 @@ ways to get a token; Reelwright accepts either.</p>
   <li>In OBS: <b>Tools → WebSocket Server Settings → Enable WebSocket server</b> (port <code>4455</code>), and keep authentication on.</li>
   <li><b>Show Connect Info</b> → copy the server password.</li>
   <li>Reelwright → <b>OBS link → Connect OBS directly</b>: the PC's address, port and password. OBS on another PC: also allow port 4455 through
-    that PC's firewall, and either map its recording folder or use the Relay (instructions on the OBS link page).</li>
+    that PC's firewall, and either map its recording folder or use the Relay (instructions on the OBS link page). The network receiver moved from port 8766 to <b>38766</b> in November 2026:
+    on each PC that runs an older <code>reelwright_relay.py</code>, download it again from the OBS link page (or pass
+    <code>--server http://THIS-PC-IP:38766</code>), and allow 38766 (TCP and UDP) through this PC's firewall.</li>
 </ol>
 
 <h2 id="phone">Phone remote (optional)</h2>
 <ol>
-  <li>Reelwright → <b>Settings → Phone remote</b>: turn on <b>Let my phone control Reelwright over Wi-Fi</b> (port <code>8810</code>
-    unless you change it). If Windows asks, allow Reelwright on <b>private</b> networks only.</li>
+  <li>Reelwright → <b>Settings → Phone remote</b>: turn on <b>Let my phone control Reelwright over Wi-Fi</b> (port <code>38810</code>
+    unless you change it; it was 8810 before November 2026: phones paired then must scan a new QR code). If Windows asks, allow Reelwright on <b>private</b> networks only.</li>
   <li>Press <b>Pair a phone</b> and scan the QR code with the phone's camera (same Wi-Fi as the PC), then press <b>Pair</b> on the phone.
     The code is for one phone and expires after 15 minutes if unused.</li>
   <li>Add it to the Home Screen. <b>iPhone</b>: Safari → Share → Add to Home Screen; the first time you open it from the Home Screen, paste

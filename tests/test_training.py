@@ -300,6 +300,38 @@ def test_export_commands(tmp_path):
     assert "/mnt/c/rw/job/merged" in conv
 
 
+def test_a_scratch_models_merged_folder_is_the_model_and_stays(tmp_path):
+    for lora in (True, False):
+        d = tmp_path / str(lora)
+        (d / "merged").mkdir(parents=True)
+        (d / "merged" / "model.safetensors").write_bytes(b"w" * 10)
+        (d / "model-f16.gguf").write_bytes(b"f" * 20)
+        (d / "model-q4_k_m.gguf").write_bytes(b"q")
+        assert runner.drop_export_intermediates(d, lora) == {"export_freed": 20 + (10 if lora else 0)}
+        assert not (d / "model-f16.gguf").exists() and (d / "model-q4_k_m.gguf").exists()
+        assert (d / "merged").exists() is not lora  # scratch: the worker trained straight into merged/, a re-export needs it
+
+
+def test_worker_progress_is_batched_into_few_store_writes(monkeypatch, tmp_path):
+    """Each write rewrites the whole job doc (2000 metrics + 200 log lines): one per stdout line was ~2 a second."""
+    j = store.put("train_job", {"kind": "train", "status": "running", "gpu": False, "dir": str(tmp_path), "spec": {}})
+    lines = [json.dumps({"event": "step", "step": i, "loss": 1.0, "tok_s": 5}) + "\n" for i in range(300)] + ["warn\n"]
+
+    class Proc:
+        stdout = iter(lines)
+
+        def wait(self):
+            return 0
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *a, **k: Proc())
+    writes, real = [], store.update
+    monkeypatch.setattr(store, "update", lambda kind, id, *a, **k: (writes.append(kind) if id == j["id"] else None) or real(kind, id, *a, **k))
+    runner._subprocess(j["id"], ["python", "worker.py"])
+    done = store.get("train_job", j["id"])
+    assert len(done["metrics"]) == 300 and done["log"] == ["warn"]  # nothing lost: the last batch is always written
+    assert len(writes) <= 3
+    store.delete("train_job", j["id"])
+
+
 def test_modelfile_for_a_scratch_model_carries_its_chat_template():
     mf = runner.modelfile("model-q4_k_m.gguf", scratch=True)
     assert mf.startswith("FROM ./model-q4_k_m.gguf") and "<|assistant|>" in mf and 'PARAMETER stop "<|end|>"' in mf
@@ -416,9 +448,9 @@ def test_settings_route_cannot_point_training_at_a_program():
     """Which program training runs may only be set through the validated training routes."""
     from fastapi.testclient import TestClient
     from reelwright import config
-    from reelwright.server import app
+    from reelwright.server import PORT, app
     before = {k: config.load()[k] for k in ("training_python", "training_wsl", "training_env_dir")}
-    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    c = TestClient(app, base_url=f"http://127.0.0.1:{PORT}")
     c.put("/api/settings", json={"training_python": ["C:/evil.exe"], "training_wsl": True, "training_env_dir": "C:/x"})
     after = {k: config.load()[k] for k in before}
     assert after == before

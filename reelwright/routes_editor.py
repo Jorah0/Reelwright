@@ -16,13 +16,14 @@ router = APIRouter()
 def triage(project: str = "", new_only: bool = True, min_score: float | None = None, limit: int = 50):
     """AI picks to judge, best first: never posted, not montages or expired; new_only = not rated yet."""
     posted = {u.get("clip_id") for u in store.find("upload", status="done")}
-    clips = [c for c in store.find("clip") if c.get("source") in ("ai", "auto") and not c.get("parts") and not c.get("expired")
-             and c["id"] not in posted and (not new_only or not c.get("rating")) and (not project or c["project_id"] == project)
+    clips = [c for c in store.slim("clip", "source", "parts", "expired", "rating", "project_id", "score")  # no edit parsed
+             if c.get("source") in ("ai", "auto") and not c.get("parts") and not c.get("expired")
+             and c["id"] not in posted and (not new_only or not c.get("rating")) and (not project or c.get("project_id") == project)
              and (min_score is None or (c.get("score") or 0) >= min_score)]
     clips.sort(key=lambda c: -(c.get("score") or 0))
     projects = {p["id"]: p for p in store.find("project")}
     cards = []
-    for c in clips[:max(1, min(limit, 200))]:
+    for c in filter(None, (store.get("clip", c["id"]) for c in clips[:max(1, min(limit, 200))])):  # whole docs: shown cards only
         p = projects.get(c["project_id"]) or {}
         exp = c.get("export") or {}
         rendered = pipeline.clip_export_current(c)

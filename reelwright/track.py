@@ -21,7 +21,9 @@ MAX_JUMP = 0.25       # a detection this far from the locked subject is someone 
 REACQUIRE = 1.5       # ...unless the subject has been missing this long (s)
 BLEND = 1.5           # manual keyframes pull the path within ± this many seconds
 MAX_KEYS = 160        # bounds the ffmpeg expression (~35 chars a keyframe)
-ANIME_URL = "https://raw.githubusercontent.com/nagadomi/lbpcascade_animeface/master/lbpcascade_animeface.xml"  # MIT
+# MIT; pinned to a commit (master on 2026-11-25) and its SHA-256
+ANIME_URL = "https://raw.githubusercontent.com/nagadomi/lbpcascade_animeface/4433ab1ae1166ea75acfe99eb0f18709dac329a0/lbpcascade_animeface.xml"
+ANIME_SHA256 = "9376d30ac38db6bda2a68b88b3b76bbd7e6aa33af47f7f5c76bc88ca75f1ce30"
 
 
 # ---------- detection ----------
@@ -39,7 +41,7 @@ def _detectors(w: int, h: int):
     if cascade is None:  # ponytail: OpenCV 5 moved cascades to opencv-contrib; without it motion covers VTubers
         return yunet, None
     try:
-        path = media.fetch_model("lbpcascade_animeface.xml", ANIME_URL)
+        path = media.fetch_model("lbpcascade_animeface.xml", ANIME_URL, sha256=ANIME_SHA256)
         anime = cascade(str(path))
         if anime.empty():
             path.unlink(missing_ok=True)  # corrupt download: fetch fresh next time
@@ -440,9 +442,9 @@ def crop_filter(edit: dict, sw: int, sh: int, ratio: float, out: tuple[int, int]
 
 def decode(src: Path, start: float, end: float, w: int, h: int, rate: float):
     """Frames of [start, end] at `rate` per second, scaled to w×h BGR (an ffmpeg pipe: exact sample times, cheap scaling)."""
-    proc = subprocess.Popen([media.FFMPEG, "-v", "error", "-ss", f"{start:.3f}", "-t", f"{max(end - start, 0.05):.3f}",
-                             "-i", str(src), "-an", "-vf", f"fps={rate:.4f},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=media.NO_WINDOW)
+    proc = media.popen([media.FFMPEG, "-v", "error", "-ss", f"{start:.3f}", "-t", f"{max(end - start, 0.05):.3f}",
+                        "-i", str(src), "-an", "-vf", f"fps={rate:.4f},scale={w}:{h}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
         while len(buf := proc.stdout.read(w * h * 3)) == w * h * 3:
             yield np.frombuffer(bytearray(buf), np.uint8).reshape(h, w, 3)

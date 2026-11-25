@@ -91,7 +91,7 @@ def analyze(src, meta: dict, progress=None, faces: bool = True, scenes: bool = F
     else:
         cmd = [media.FFMPEG, "-v", "error", "-i", str(src), "-an", "-sn", "-dn", "-vf", ours, "-f", "rawvideo", "-"]
     errf = tempfile.TemporaryFile()  # showinfo lines; a file (not a pipe) so ffmpeg can never block on a full stderr
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, creationflags=media.NO_WINDOW)
+    p = media.popen(cmd, stdout=subprocess.PIPE, stderr=errf)
     size = w * h * 3
     diff, bright, sat, face, fmove = [], [], [], [], []
     # each tile's sample: an fps filter's output frame k is the last input frame before (k + 0.5) / rate, for the sprite's

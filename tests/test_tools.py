@@ -128,7 +128,8 @@ def test_privacy_policy_discloses_every_service_the_code_contacts():
                  "www.youtube.com": "youtube", "www.googleapis.com": "google", "rupload.facebook.com": "instagram", "graph.instagram.com": "instagram",
                  "raw.githubusercontent.com": "raw.githubusercontent.com"}
     hosts = set(re.findall(r"https?://([a-z0-9.-]+\.[a-z]{2,})", code)) | {k for k in ("googleapiclient", "yt_dlp", "anthropic") if k in code}
-    hosts -= {"localhost", "console.anthropic.com", "www.python.org"}  # links shown to the user, not data flows
+    hosts -= {"localhost", "console.anthropic.com", "www.python.org",  # links shown to the user, not data flows
+              "demo.invalid"}  # demo mode's pretend post links (a reserved name that never resolves: nothing is contacted)
     missing = [h for h in hosts if disclosed.get(h, h) not in policy]
     assert not missing, f"privacy.html doesn't disclose: {missing}"
     terms = (root / "static" / "legal" / "terms.html").read_text("utf-8")
@@ -138,10 +139,10 @@ def test_privacy_policy_discloses_every_service_the_code_contacts():
 def test_connection_guide_lists_every_permission_the_code_requests():
     """If the code starts asking for a new scope, the setup guide must say so (and why), or verify fails."""
     from pathlib import Path
-    from reelwright import platforms, youtube
+    from reelwright import config, platforms, youtube
     guide = (Path(media.__file__).parent / "static" / "guide" / "connect.html").read_text("utf-8")
     wanted = [*youtube.SCOPES, *platforms.TT_SCOPES.split(","), "instagram_business_basic", "instagram_business_content_publish",
-              "instagram_basic", "instagram_content_publish", "pages_read_engagement", platforms.tiktok_redirect_uri(8765)]
+              "instagram_basic", "instagram_content_publish", "pages_read_engagement", platforms.tiktok_redirect_uri(config.DEFAULT_PORT)]
     assert [w for w in wanted if w not in guide] == []
 
 
@@ -181,8 +182,8 @@ def test_update_exe_rebuilds_only_when_the_source_is_newer(tmp_path):
 
 def test_ui_scale_is_saved_and_clamped():
     from fastapi.testclient import TestClient
-    from reelwright.server import app
-    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    from reelwright.server import PORT, app
+    c = TestClient(app, base_url=f"http://127.0.0.1:{PORT}")
     r = c.put("/api/settings", json={"ui_scale": {"app": 1.25, "text": 9, "timeline": 0.1, "evil": 2, "preview": "big", "panels": True}})
     assert r.json()["ui_scale"] == {"app": 1.25, "text": 2.0, "timeline": 0.6}
     assert c.get("/api/settings").json()["ui_scale"]["app"] == 1.25  # persisted
@@ -203,8 +204,8 @@ def test_project_paths_cannot_escape_the_projects_folder():
             pipeline.pdir(bad)
     assert pipeline.pdir("abc123def456").parent == pipeline.config.projects_dir()
     from fastapi.testclient import TestClient
-    from reelwright.server import app
-    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    from reelwright.server import PORT, app
+    c = TestClient(app, base_url=f"http://127.0.0.1:{PORT}")
     assert c.delete("/api/projects/%2E%2E").status_code in (400, 404)
     from fastapi import HTTPException
     from reelwright import server
@@ -225,16 +226,16 @@ def test_app_shell_loads_nothing_from_the_internet():
 
 def test_desktop_moves_off_a_port_another_program_holds(monkeypatch):
     from reelwright import desktop
-    busy = {8765, 8767}  # another app (e.g. a different local tool) has the default port
+    busy = {38765, 38767}  # another app (e.g. a different local tool) has the default port
     mine = set()
     monkeypatch.setattr(desktop, "_port_in_use", lambda p: p in busy or p in mine)
     monkeypatch.setattr(desktop, "_is_reelwright", lambda p: p in mine)
-    assert desktop.pick_port(8765) == (8768, False)  # skips 8766 (the LAN receiver's default) and the busy 8767
-    mine.add(8768)
-    assert desktop.pick_port(8765) == (8768, True)   # a second launch finds the running copy instead of starting another
+    assert desktop.pick_port(38765) == (38768, False)  # skips 38766 (the LAN receiver's default) and the busy 38767
+    mine.add(38768)
+    assert desktop.pick_port(38765) == (38768, True)   # a second launch finds the running copy instead of starting another
     mine.clear()
-    mine.add(8765)
-    assert desktop.pick_port(8765) == (8765, True)
+    mine.add(38765)
+    assert desktop.pick_port(38765) == (38765, True)
 
 
 def test_every_module_is_imported_statically_so_the_exe_bundles_it():

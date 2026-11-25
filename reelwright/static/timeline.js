@@ -106,8 +106,34 @@
   // ids of items overlapping [a, b] (marquee selection)
   const inRange = (items, a, b) => items.filter((it) => it.t < Math.max(a, b) && it.t + it.d > Math.min(a, b)).map((it) => it.id);
 
+  // Caption text for one block on the scrubber: [{text, x, size}]. Zoomed in, each word sits at its own spoken time;
+  // otherwise the phrase shrinks (base → min px), then cuts with "…", then shows its first letter; [] only when nothing fits.
+  // words: [{s, w}] (seconds), toX: seconds → px, measure(text, size) → px.
+  function captionText(words, x0, x1, toX, measure, base, min) {
+    const sizes = [];
+    for (let z = base; z > min + 1e-9; z *= 0.85) sizes.push(+z.toFixed(2));
+    sizes.push(min);
+    const fit = (s, avail) => sizes.find((z) => measure(s, z) <= avail);
+    const cut = (s, avail) => { // longest "abc…" that fits at the min size
+      for (let n = s.length - 1; n >= 2; n--) if (measure(s.slice(0, n) + "…", min) <= avail) return s.slice(0, n) + "…";
+      return "";
+    };
+    const per = words.map((w, i) => {
+      const x = toX(w.s), right = i < words.length - 1 ? toX(words[i + 1].s) - 2 : x1 - 3, z = fit(String(w.w).trim(), right - x);
+      return z ? { text: String(w.w).trim(), x, size: z } : null;
+    });
+    if (words.length && per.every(Boolean)) return per;            // room for every word on its own time
+    const text = words.map((w) => String(w.w).trim()).join(" "), avail = x1 - x0 - 8;
+    const z = fit(text, avail);
+    if (z) return [{ text, x: x0 + 4, size: z }];
+    const c = cut(text, avail);
+    if (c) return [{ text: c, x: x0 + 4, size: min }];
+    if (text && measure(text[0], min) <= x1 - x0 - 2) return [{ text: text[0], x: x0 + 1, size: min }];
+    return [];
+  }
+
   const api = { fpsExact, toFrame, frameTime, snapFrame, timecode, snap, interp, splitItem, addCut, rippleDelete, removeCutAt, segments,
-    nudge, packLanes, ticks, inRange };
+    nudge, packLanes, ticks, inRange, captionText };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.RWTimeline = api;
 })(typeof self !== "undefined" ? self : this);

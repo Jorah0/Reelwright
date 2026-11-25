@@ -10,7 +10,7 @@ Everything runs on your computer. AI calls go to Claude (Anthropic) with your ow
 |---|---|
 | Desktop app (.exe) | `python scripts/build_exe.py`, then run `dist/Reelwright/Reelwright.exe` |
 | Desktop app from source | double-click `Reelwright.pyw` (or `python Reelwright.pyw`) |
-| In a browser | `python -m reelwright` → http://127.0.0.1:8765 |
+| In a browser | `python -m reelwright` → http://127.0.0.1:38765 |
 
 Requirements from source: Python 3.12+, `pip install -r requirements.txt`, and `ffmpeg`/`ffprobe` on PATH (the .exe bundles them). An NVIDIA GPU makes transcription and rendering much faster (NVENC + CUDA Whisper); the CPU works too.
 
@@ -76,3 +76,9 @@ python -m reelwright doctor    # toolchain health: ffmpeg, NVENC, CUDA, Claude k
 python -m reelwright relay --help   # the OBS relay, from a source checkout
 ```
 The same diagnostics are in Settings → Diagnostics. Activity shows Claude usage (calls, prompt-cache hit rate, estimated cost per feature) and the event log (`events.log` in the data folder, rotated at 2 MB). Virality Lab → “What Reelwright has learned” exports/imports the learning memory as JSON (backup, or carry it to another PC).
+
+### Phone app: simulator, demo mode, mobile tests
+
+- **Phone simulator.** In Settings → Phone remote, turn the remote on, then under *Developer* tick **Phone simulator** and press **Open phone simulator**. It opens the real phone app from the local listener at iPhone 15 / SE, Pixel 8, small Android or tablet size, with rotation, a notch/home-bar frame and a Wi-Fi / slow / offline toggle. It pairs itself through a shortcut that only works from this PC (127.0.0.1) and only while that toggle is on; turning the toggle off revokes the simulator's device.
+- **Demo mode.** `python -m reelwright demo --open` (or **Start a demo sandbox** in the same panel) runs a separate copy of Reelwright in a new temporary data folder, seeded with sample projects (small generated videos), AI clips to review, rendered clips, sandbox accounts (one not approved), scheduled posts, a preset and a long form. In demo mode nothing is posted (uploads return a `demo.invalid` link), no AI provider is called, only sandbox accounts look connected, and it refuses to run on your real library folder.
+- **Mobile tests.** `pip install -r requirements-dev.txt && python -m playwright install chromium`, then `python scripts/mobile_test.py`. It starts a demo server on free ports and drives the phone app with Playwright's iPhone 15 and Pixel 8 profiles (touch, viewport, user agent): pairing, every tab, a review swipe, trim + re-render, a preset, a schedule move, a publish refused by account approval and an action queued offline then sent. Screenshots per page per device go to `%TEMP%\reelwright-mobile-test` (`--out` to change). It isn't part of `verify.py`; the API-level tests in `tests/test_remote_mobile.py` are.

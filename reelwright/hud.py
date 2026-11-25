@@ -30,7 +30,7 @@ def grab(src, t: float, width: int | None = None):
     """One BGR frame at t seconds (scaled to width when given)."""
     import cv2
     vf = ["-vf", f"scale={int(width)}:-2"] if width else []
-    r = subprocess.run([media.FFMPEG, "-v", "error", "-ss", f"{max(float(t), 0.0):.3f}", "-i", str(src), "-frames:v", "1", *vf,
+    r = subprocess.run([media.FFMPEG, "-v", "error", "-ss", f"{max(float(t), 0.0):.3f}", *media.LOCAL_ONLY, "-i", str(src), "-frames:v", "1", *vf,
                         "-f", "image2pipe", "-vcodec", "png", "-"], capture_output=True, timeout=60, creationflags=media.NO_WINDOW)
     img = cv2.imdecode(np.frombuffer(r.stdout, np.uint8), cv2.IMREAD_COLOR) if r.stdout else None
     if img is None:

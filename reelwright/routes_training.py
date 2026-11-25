@@ -43,7 +43,7 @@ def active():
         step, total = (j.get("last") or {}).get("step"), ((j.get("spec") or {}).get("train") or {}).get("max_steps")
         return round(min(step / total, 1.0), 3) if step and total else None
     return [{"id": j["id"], "kind": j["kind"], "status": j["status"], "message": j.get("message") or "", "progress": prog(j)}
-            for j in store.find("train_job")[:20] if j.get("status") in ("queued", "running", "paused")]
+            for j in store.newest("train_job", 20) if j.get("status") in ("queued", "running", "paused")]
 
 
 @router.get("/api/training/profile")
@@ -213,6 +213,24 @@ def job_action(jid: str, action: str, body: dict | None = None):
     return _err(fn, jid)
 
 
+def _gone(fn, *a):
+    try:
+        return _err(fn, *a)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from None
+
+
+@router.delete("/api/training/jobs/{jid}")
+def delete_job(jid: str):
+    """A finished job's folder (checkpoint, adapter, exports) and record; never a live job or the active/rollback model's."""
+    return _gone(runner.delete_job, jid)
+
+
+@router.delete("/api/training/releases/{rid}")
+def delete_release(rid: str):
+    return _gone(release.delete_release, rid)
+
+
 @router.post("/api/training/releases/{rid}/promote")
 def promote(rid: str, body: dict):
     rel = store.get("train_release", rid)
@@ -322,7 +340,9 @@ def _export_steps(job: dict) -> list:
     steps = [(n, a) for n, a in cmds if n != "create"]
     return [*steps, ("Write the Modelfile", modelfile), *[(n, a) for n, a in cmds if n == "create"],
             ("Smoke test through the app's provider path", smoke), ("Evaluate against the active model", evaluate),
-            ("Record the release", record)]
+            ("Record the release", record),
+            ("Free the training checkpoint", lambda j: {**runner.drop_checkpoint(store.get("train_job", src["id"])),
+                                                         **runner.drop_export_intermediates(tdir, lora)})]
 
 
 runner.STEPS.update({

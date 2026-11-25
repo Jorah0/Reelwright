@@ -15,7 +15,9 @@ PRICES = {
     "claude-fable-5-2": (8.0, 40.0, 0.20),
     "claude-haiku-5-5": (0.10, 0.50, None),
 }
-KEEP = 5000  # usage rows kept (oldest pruned)
+KEEP = 5000  # usage rows kept (oldest pruned; up to PRUNE_EVERY more between prunes)
+PRUNE_EVERY = 100
+_calls = 0
 
 
 def _tokens(u) -> dict:
@@ -38,9 +40,10 @@ def record(kind: str, model: str, u) -> None:
     """Best-effort: metering must never break the feature that was metered."""
     try:
         store.put("usage", {"kind": kind, "model": model, **_tokens(u), "cost": cost(model, u), "at": time.time()})
-        rows = store.find("usage")
-        for old in rows[KEEP:]:
-            store.delete("usage", old["id"])
+        global _calls
+        _calls += 1
+        if _calls % PRUNE_EVERY == 1:  # one SQL delete now and then, not a parse of all KEEP rows per AI call
+            store.keep_newest("usage", KEEP)
     except Exception:
         pass
 

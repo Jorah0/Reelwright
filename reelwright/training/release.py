@@ -191,6 +191,32 @@ def promote(rid: str, task: str, active_card: dict | None, margin: float, tolera
     return {"promoted": True, "reason": why}
 
 
+def protected() -> tuple[set, set, set]:
+    """(release ids, training job ids, dataset hashes) that must stay: the active release of any task and every release
+    the Models pointer can roll back to (its history), with the job whose files they came from and its dataset."""
+    hist = {s for t in models.TASKS for s in (store.get(models.selections.REL, t) or {}).get("history") or []}
+    rels = [r for r in store.find("train_release") if r.get("status") == "active" or r.get("selection") in hist]
+    return ({r["id"] for r in rels}, {(r.get("manifest") or {}).get("train_job") for r in rels} - {None},
+            {(r.get("hashes") or {}).get("dataset") for r in rels} - {None})
+
+
+def delete_release(rid: str) -> dict:
+    """Forget a candidate and its manifest file. Its Ollama model stays (remove it with `ollama rm` if unwanted)."""
+    if not rid.isalnum():
+        raise ValueError("Bad release id.")
+    rel = store.get("train_release", rid)
+    if not rel:
+        raise LookupError("No such candidate.")
+    if rid in protected()[0]:
+        raise RuntimeError("This is the active release or the one Roll back returns to: it stays.")
+    job = (rel.get("manifest") or {}).get("train_job")
+    if job:
+        (runner.job_dir(job) / f"release-{rid}.json").unlink(missing_ok=True)
+    store.delete("train_release", rid)
+    log.event("training", f"deleted candidate {rid}")
+    return {"ok": True}
+
+
 def rollback(task: str = "find") -> dict:
     """One click back to the release that was active before (the Models pointer's history)."""
     models.rollback(task)

@@ -143,7 +143,7 @@ def srt(tl: dict, max_words: int = 7, gap: float = 0.6, max_len: float = 3.5) ->
 # ---------- timelines from the store ----------
 
 def _words(pid: str) -> list[dict]:
-    return [w for seg in pipeline.load_json(pid, "transcript.json", {"segments": []})["segments"] for w in seg.get("words", [])]
+    return pipeline.transcript_words(pid)
 
 
 def _base(pid: str, name: str, e: dict, keeps: list, cap_words: list) -> dict:

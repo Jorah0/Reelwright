@@ -52,35 +52,41 @@ def test_free_port_survives_a_reserved_udp_block(monkeypatch):
     assert port == tried[-1] and max(tried) - min(tried) > 100
 
 
-@pytest.fixture
-def fake_obs():
-    """A tiny obs-websocket v5 server: checks auth per the spec, answers requests, emits one replay-saved event."""
-    seen = []
+def obs_handler(seen: list, state: dict | None = None, password: str = PASSWORD):
+    """A tiny obs-websocket v5 server's connection handler: checks auth per the spec, answers requests, emits one
+    replay-saved event. state["recording"] / state["duration_ms"] drive GetRecordStatus (test_obs_autolink reuses it)."""
+    state = {} if state is None else state
 
     def handler(ws):
         ws.send(json.dumps({"op": 0, "d": {"obsWebSocketVersion": "5.5.0", "rpcVersion": 1,
                                            "authentication": {"salt": SALT, "challenge": CHALLENGE}}}))
         ident = json.loads(ws.recv())["d"]
-        secret = base64.b64encode(hashlib.sha256((PASSWORD + SALT).encode()).digest()).decode()
+        secret = base64.b64encode(hashlib.sha256((password + SALT).encode()).digest()).decode()
         if ident.get("authentication") != base64.b64encode(hashlib.sha256((secret + CHALLENGE).encode()).digest()).decode():
             ws.close(4009, "Authentication failed")
             return
         ws.send(json.dumps({"op": 2, "d": {"negotiatedRpcVersion": 1}}))
-        if ident.get("eventSubscriptions"):
+        if ident.get("eventSubscriptions") and state.get("replay_event", True):
             ws.send(json.dumps({"op": 5, "d": {"eventType": "ReplayBufferSaved", "eventIntent": 64,
                                                "eventData": {"savedReplayPath": "D:\\OBS\\Replays\\Replay 1.mkv"}}}))
         for raw in ws:
             d = json.loads(raw)["d"]
             seen.append(d["requestType"])
             data = {"GetVersion": {"obsVersion": "31.0.0", "obsWebSocketVersion": "5.5.0"},
-                    "GetReplayBufferStatus": {"outputActive": True}, "GetRecordStatus": {"outputActive": False}}
+                    "GetReplayBufferStatus": {"outputActive": True},
+                    "GetRecordStatus": {"outputActive": bool(state.get("recording")), "outputDuration": state.get("duration_ms", 0)}}
             ok = d["requestType"] in data or d["requestType"] in obs.ACTIONS.values()
             ws.send(json.dumps({"op": 7, "d": {"requestType": d["requestType"], "requestId": d["requestId"],
                                                "requestStatus": {"result": ok, "code": 100 if ok else 204},
                                                "responseData": data.get(d["requestType"], {})}}))
+    return handler
 
+
+@pytest.fixture
+def fake_obs():
+    seen = []
     port = _free_port()
-    srv = serve(handler, "127.0.0.1", port)
+    srv = serve(obs_handler(seen), "127.0.0.1", port)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"ws://127.0.0.1:{port}", seen
     srv.shutdown()
@@ -94,8 +100,10 @@ def test_obs_client_auth_requests_and_events(fake_obs):
     assert relay.saved_file(*ev) == ("D:\\OBS\\Replays\\Replay 1.mkv", "replay")
     with pytest.raises(relay.OBSError, match="Wrong OBS websocket password"):
         relay.OBS(url, "nope").connect()
+    o = relay.OBS(url, "")
     with pytest.raises(relay.OBSError, match="requires a password"):
-        relay.OBS(url, "").connect()
+        o.connect()
+    assert o.ws is None  # a refused connect closes its websocket (no `with`, so __exit__ never runs)
 
 
 def test_obs_remote_actions_and_probe(fake_obs):

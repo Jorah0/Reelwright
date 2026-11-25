@@ -2,9 +2,11 @@
 a copied settings or accounts file opens on no other PC and under no other Windows account.
 
 Each secret is sealed on its own, inside the file it always lived in, so the rest stays readable JSON:
-  settings.json     anthropic_api_key, lan_token, gsi_token, vts_token, remote_devices, ai_providers.*.api_key (config.SEALED)
+  settings.json     anthropic_api_key, lan_token, gsi_token, vts_token, remote_devices, media_keys, ai_providers.*.api_key
+                    (config.SEALED)
   accounts.json     each account's token / access_token / refresh_token (accounts.SEALED)
   connections.json  the TikTok and Twitch apps' client_secret (platforms.SEALED)
+  the store (obs)   each direct OBS connection's websocket password (obs.reseal)
 A sealed value is the string "dpapi:<base64>" (of the value's JSON). One that won't open here (sealed on another PC or
 Windows user, or damaged) reads as empty, so that sign-in shows "reconnect"; it is never overwritten by an empty value,
 only by a new one (or by forget_locked()).
@@ -12,8 +14,9 @@ only by a new one (or by forget_locked()).
 Migration: every writer seals the whole file, after first copying a file that still holds plain-text secrets to
 <name>.pre-vault.bak (never overwritten, so it keeps the original). migrate() runs at each start and is idempotent: it
 rewrites files that still hold plain text and drops the pre-accounts copies of sign-ins (youtube_token.json, the old
-TikTok fields in connections.json) once accounts.json holds them. The .bak copies are deleted after KEEP_STARTS clean
-starts in a row (everything sealed, everything opened); until then they are the way back if the vault misbehaves.
+TikTok fields in connections.json) once accounts.json holds them. The .bak copies hold secrets in plain text, so they go
+after KEEP_STARTS (2) clean starts in a row (everything sealed, everything opened): the start that sealed them and the next
+one, which proves the sealed files open again in a new process; until then they are the way back if the vault misbehaves.
 Rollback: rollback() (Publish page → Security, or `python -m reelwright.vault rollback`) writes every secret back as plain
 text and keeps sealing off (marker file DATA/vault-off) until enable().
 Without DPAPI (not Windows) nothing is sealed: values stay plain text and status() says "not encrypted".
@@ -27,13 +30,14 @@ import time
 
 PREFIX = "dpapi:"
 BAK = ".pre-vault.bak"
-KEEP_STARTS = 5
+KEEP_STARTS = 2  # the sealing start, then one start that reopened everything from disk
 STATE = None  # DATA/vault.json: clean starts counted towards deleting the backups (set below, once config is importable)
 OFF = None    # DATA/vault-off: present = sealing turned off by rollback()
 _ENTROPY = b"Reelwright vault 1"  # app-specific: another program of this user can't open our blobs by accident
 LABELS = {"anthropic_api_key": "Claude API key (Settings)", "lan_token": "OBS relay token (OBS page: make a new token)",
           "remote_devices": "Paired phones (Settings → Phone remote: pair again)", "gsi_token": "CS2 / Dota 2 game link (install its config again)",
-          "vts_token": "VTube Studio link (allow Reelwright in VTube Studio again)"}
+          "vts_token": "VTube Studio link (allow Reelwright in VTube Studio again)",
+          "media_keys": "Media search keys: GIPHY, Freesound, Pixabay, Pexels (Studio › Media: connect again)"}
 
 
 class Locked(ValueError):
@@ -192,9 +196,10 @@ def status() -> dict:
 
 def _reseal_all() -> bool:
     """Rewrite every secret file (sealed, or plain when off); False when one of them couldn't be rewritten."""
-    from . import accounts, config, log, platforms
+    from . import accounts, config, log, obs, platforms
     ok = True
-    for name, fn in (("settings", lambda: config.save({})), ("accounts", accounts.reseal), ("connections", platforms.reseal)):
+    for name, fn in (("settings", lambda: config.save({})), ("accounts", accounts.reseal), ("connections", platforms.reseal),
+                     ("obs", obs.reseal)):
         try:
             fn()
         except Exception as e:  # one damaged file must not stop the others, nor the app

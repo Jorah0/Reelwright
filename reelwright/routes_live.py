@@ -179,7 +179,7 @@ def review(limit: int = 20):
     clips = _review_clips()
     names = {p["id"]: p.get("name") for p in store.find("project")}
     out = []
-    for c in clips[:max(1, min(limit, 50))]:
+    for c in filter(None, map(lambda cid: store.get("clip", cid), clips[:max(1, min(limit, 50))])):
         try:
             text = pipeline.clip_text(c)[:300]
         except (OSError, ValueError, KeyError):

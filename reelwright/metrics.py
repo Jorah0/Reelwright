@@ -15,7 +15,7 @@ from datetime import date, datetime, timezone
 import httpx
 import numpy as np
 
-from . import platforms, youtube
+from . import config, platforms, youtube
 
 SNAPSHOTS = (("48h", 48), ("7d", 168))
 MIN_PEERS = 3
@@ -162,6 +162,8 @@ def instagram_stats(acc: dict, ids: list[str]) -> dict[str, dict]:
 
 def fetch(acc: dict, ids: list[str]) -> dict[str, dict]:
     """{video id: counts} for this account's posts ({} for a platform with nothing to ask)."""
+    if config.DEMO:
+        raise RuntimeError("Demo mode: nothing is fetched from any platform.")
     fn = {"youtube": youtube_stats, "tiktok": tiktok_stats, "instagram": instagram_stats}.get(acc["platform"])
     return fn(acc, ids) if fn and ids else {}
 
@@ -179,6 +181,8 @@ def _analytics(aid: str):
 
 def youtube_retention(aid: str, video_id: str, start: str, length: float) -> dict:
     """The video's audience-retention curve, summarised by retention()."""
+    if config.DEMO:
+        raise RuntimeError("Demo mode: nothing is fetched from any platform.")
     if YT_ANALYTICS in youtube.missing_scopes(aid):
         raise MissingScope(YT_ANALYTICS, "Learning where viewers stop watching needs one more YouTube permission "
                                          f"({YT_ANALYTICS}): Reconnect this channel on the Publish page and approve it.")

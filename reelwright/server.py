@@ -1,24 +1,32 @@
 """HTTP API + static UI. Bound to localhost only (it holds your API keys and social tokens)."""
+import asyncio
+import hashlib
 import json
 import math
 import os
 import re
+import secrets
 import shutil
+import sys
 import threading
+import time
+import urllib.parse
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
-from . import accounts, ai, assets, config, doctor, lan, learn, log, media, multicam, obs, pipeline, platforms, providers, schedule, storage, store, usage, youtube
+from . import accounts, ai, assets, config, doctor, lan, learn, log, media, multicam, obs, pipeline, platforms, providers, schedule, storage, store, usage, vault, youtube
 from .config import STATIC, YT_SECRET
 from . import remote  # phone remote: its own opt-in Wi-Fi listener; here only the PC's Settings → Phone remote endpoints
 
 VIDEO_EXT = media.VIDEO_EXT
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
-PORT = int(os.environ.get("REELWRIGHT_PORT", 8765))
+PORT = int(os.environ.get("REELWRIGHT_PORT", config.DEFAULT_PORT))  # desktop.main sets the port it picked
 
 app = FastAPI(title="Reelwright")
 
@@ -29,6 +37,43 @@ async def runtime_error(_: Request, e: RuntimeError):
 
 
 LOCAL_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+# Per-launch API token: any other local process (another Windows user, malware) can reach 127.0.0.1, so /api/* and /files/*
+# need it. The window / browser gets it once in the launch URL (?rw_token=, swapped for an HttpOnly SameSite=Strict cookie
+# and dropped from the URL); local tools read it from config.TOKEN_FILE (this Windows user's data folder) and send the header.
+TOKEN = secrets.token_urlsafe(32)
+TOKEN_HEADER = "X-Reelwright-Token"
+COOKIE = f"rw_{PORT}"  # cookies ignore ports: named per port so a demo app and the real one don't clobber each other
+PROTECTED = ("/api/", "/files/", "/assets/")  # /assets/: the creator's library (imports, kits, thumbs, fonts)
+_tickets: dict[str, float] = {}  # one-time launch codes (api/app/open): value -> expiry
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; "
+       "media-src 'self' data: blob: https:; font-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; "
+       "object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")  # https: = media providers' previews
+
+
+def _token_ok(got: str | None) -> bool:
+    return bool(got) and secrets.compare_digest(got.encode(), TOKEN.encode())
+
+
+def _ticket_ok(got: str) -> bool:
+    now = time.time()
+    for k, exp in list(_tickets.items()):
+        if exp < now:
+            _tickets.pop(k, None)
+    return _token_ok(got) or _tickets.pop(got, 0) > now
+
+
+def _publish_token() -> None:
+    try:
+        config.TOKEN_FILE.write_text(TOKEN, "utf-8")
+    except OSError:
+        log.error("app", "couldn't write the app token file (the MCP helper and update script can't reach the app)")
+
+
+def _secure(resp):
+    resp.headers.setdefault("Content-Security-Policy", CSP)
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
 
 
 @app.middleware("http")
@@ -37,26 +82,57 @@ async def no_stale_ui(request: Request, call_next):
     origin = request.headers.get("origin")
     if request.headers.get("host") not in LOCAL_HOSTS or (
             origin and request.method != "GET" and origin.split("://", 1)[-1] not in LOCAL_HOSTS):
-        return JSONResponse({"detail": "Forbidden"}, status_code=403)
+        return _secure(JSONResponse({"detail": "Forbidden"}, status_code=403))
+    path = request.url.path
+    launch = request.query_params.get("rw_token")
+    if launch is not None and request.method == "GET":  # the launch link: swap it for a cookie, drop it from the URL
+        ok = _ticket_ok(launch)
+        if not ok and path.startswith(PROTECTED):
+            return _secure(JSONResponse({"detail": "That link has expired: open Reelwright from its window."}, status_code=403))
+        rest = urllib.parse.urlencode([(k, v) for k, v in request.query_params.multi_items() if k != "rw_token"])
+        resp = Response(status_code=303, headers={"Location": "/" + path.lstrip("/\\") + (f"?{rest}" if rest else "")})  # never //host
+        if ok:  # a stale code on the UI: just the page without it (it shows the not-signed-in state), no cookie
+            resp.set_cookie(COOKIE, TOKEN, httponly=True, samesite="strict", path="/")
+        return _secure(resp)
+    sent = (request.headers.get(TOKEN_HEADER) or "").split(",")[:2]  # local tools may send two (config.app_token)
+    if path.startswith(PROTECTED) and not (any(map(_token_ok, sent)) or _token_ok(request.cookies.get(COOKIE))):
+        return _secure(JSONResponse({"detail": "Not signed in: open Reelwright from its window (or the link it opened)."},
+                                    status_code=403))
     scope = config._request.set({})  # settings are read once per request (config.load)
     try:
         resp = await call_next(request)
     finally:
         config._request.reset(scope)
-    if not request.url.path.startswith("/files/") or request.url.path.endswith(".json"):
+    if not path.startswith("/files/") or path.endswith(".json"):
         resp.headers["Cache-Control"] = "no-cache"  # revalidate UI assets (and transcript.json etc.: the ETag makes it a 304)
-    return resp
+    return _secure(resp)
 
 
 @app.on_event("startup")
 def _start():
     log.setup()
     log.event("app", "started")
-    pipeline.start()
-    storage.start()  # finish a storage-folder move the app was closed in
-    obs.start()
-    lan.apply()
-    remote.apply()  # the phone remote's listener, when turned on in Settings
+    _publish_token()  # before serving: desktop / MCP / update script authenticate with it
+    # Each step on its own: one that fails (a damaged job doc, an unplugged storage drive) must not keep the rest, e.g.
+    # OBS auto-linking or the phone remote, from starting.
+    for name, step in (("ports", _migrate_ports), ("pipeline", pipeline.start),
+                       ("storage", storage.start),  # finish a storage-folder move the app was closed in
+                       ("obs", obs.start), ("lan", lan.apply),
+                       ("remote", remote.apply)):  # the phone remote's listener, when turned on in Settings
+        try:
+            step()
+        except Exception:
+            log.error("app", f"start-up step {name} failed")
+
+
+@app.on_event("startup")
+async def _quiet_resets():  # async: runs in the loop uvicorn serves on
+    log.quiet_connection_resets(asyncio.get_running_loop())
+
+
+def _migrate_ports():
+    for m in config.migrate_ports():  # once: off the old 8766/8810 defaults (custom ports stay)
+        log.event("app", f"port moved: {m}")
 
 
 def _404(doc, what="Not found"):
@@ -103,6 +179,19 @@ def app_show():  # a second launch asks the running copy to come back instead of
     return {"ok": True}
 
 
+@app.post("/api/app/open")
+def app_open(body: dict):
+    """The desktop window opens a /files/ link (Watch render, cover) in the system browser, which has no session cookie:
+    it goes with a one-time code (valid 2 min) that the browser swaps for the cookie."""
+    path = str(body.get("path") or "")
+    if not path.startswith("/files/") or "\\" in path or any(ord(c) < 33 for c in path):
+        raise HTTPException(400, "Only Reelwright's own files can be opened this way.")
+    ticket = secrets.token_urlsafe(24)
+    _tickets[ticket] = time.time() + 120
+    webbrowser.open(f"http://127.0.0.1:{PORT}{path}{'&' if '?' in path else '?'}rw_token={ticket}")
+    return {"ok": True}
+
+
 @app.post("/api/app/quit")
 def app_quit():
     from . import desktop
@@ -123,6 +212,8 @@ def put_settings(patch: dict):
         patch.pop("anthropic_api_key")
     for k in ("training_python", "training_wsl", "training_env_dir"):  # which program training runs: only via the
         patch.pop(k, None)                                            # validated /api/training/env routes
+    for k in (*(s for s in config.SEALED if s != "anthropic_api_key"), *LISTENER_KEYS):  # secrets and listeners: only via
+        patch.pop(k, None)  # their own routes (pairing, token reset, /api/lan, /api/remote, /api/live: port checks + apply)
 
     if "ui_scale" in patch:  # per-component interface scale; a bad value must never make the UI unusable
         raw = patch["ui_scale"] if isinstance(patch["ui_scale"], dict) else {}
@@ -146,6 +237,8 @@ def put_settings(patch: dict):
 
 
 UI_SCALE_KEYS = ("app", "sidebar", "text", "preview", "timeline", "panels")
+LISTENER_KEYS = ("lan_port", "lan_receive", "remote_port", "remote_enabled", "remote_dev_sim", "gsi_port", "gsi_enabled",
+                 "vts_port", "vts_enabled", "lol_enabled")
 AI_PROVIDER_FIELDS = {"model": str, "base_url": str, "api_key": str, "num_ctx": int, "vision": bool}
 
 
@@ -213,18 +306,69 @@ def ollama_models():
 
 # ---------- projects ----------
 
-@app.post("/api/projects")
-def upload_project(file: UploadFile = File(...), autopilot: str = Form("{}"), video_type: str = Form("auto"),
-                   sub_genre: str = Form("")):
-    ext = Path(file.filename or "").suffix.lower()
+async def _receive(request: Request, name: str, h=None) -> Path:
+    """A browser upload: the request body IS the file (the page sends the File itself, its name and options in the
+    query), streamed straight into an .incoming-* file in the storage folder. No multi-GB spool in %TEMP% first, and the
+    move into the project is a rename on the same disk. Any failure (disk full, the browser gone) removes the partial
+    file. h: a hashlib object fed on the way in."""
+    ext = Path(name or "").suffix.lower()
     if ext not in VIDEO_EXT:
         raise HTTPException(400, f"Unsupported file type {ext or '(none)'}.")
-    p = pipeline.new_project(Path(file.filename).stem, json.loads(autopilot or "{}"), video_type=_video_type(video_type, sub_genre))
-    with open(pipeline.pdir(p["id"]) / f"source{ext}", "wb") as f:
-        shutil.copyfileobj(file.file, f, 8 * 1024 * 1024)
-    store.update("project", p["id"], {"source": f"source{ext}", "status": "queued", "stage": "Queued for analysis"})
-    pipeline.submit("analyze", project_id=p["id"])
-    return store.get("project", p["id"])
+    storage.check_writable()  # an unplugged storage drive: refused before a byte is written anywhere
+    tmp = storage.root() / f".incoming-{store.new_id()}{ext}"
+    try:
+        with open(tmp, "wb") as f:
+            async for chunk in request.stream():
+                if chunk:
+                    if h:
+                        h.update(chunk)
+                    await run_in_threadpool(f.write, chunk)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return tmp
+
+
+async def _with_upload(request: Request, name: str, fn, *args, h=None):
+    """Receive the body, then fn(received_path, *args) in the threadpool; the received file never outlives the call."""
+    tmp = await _receive(request, name, h)
+    try:
+        return await run_in_threadpool(_bad, fn, tmp, *args)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@app.post("/api/projects")
+async def upload_project(request: Request, name: str = "", autopilot: str = "{}", video_type: str = "auto", sub_genre: str = ""):
+    try:  # checked before a byte of the (multi-GB) body is read
+        ap = json.loads(autopilot or "{}")
+    except ValueError:
+        ap = None
+    if not isinstance(ap, dict):
+        raise HTTPException(400, "The Autopilot options aren't valid JSON settings.")
+    vt = _video_type(video_type, sub_genre)
+    return await _with_upload(request, name, lambda src: storage.adopt_upload(
+        pipeline.new_project(Path(name).stem, ap, video_type=vt), src))
+
+
+@app.post("/api/projects/paths")
+def import_project_paths(body: dict):
+    """The desktop app's "Add a video": files already on this PC, from the native picker. Each is copied into its own
+    project once by the ingest job (no upload through the browser). {added, skipped}."""
+    paths = body.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(400, "Send the video files to import as a list of paths.")
+    vt, added, skipped = _video_type(body.get("video_type"), body.get("sub_genre")), [], []
+    for raw in paths:
+        f = Path(str(raw))
+        if not (f.is_file() and f.suffix.lower() in VIDEO_EXT):
+            skipped.append({"path": str(raw), "reason": "Not a video file."})
+            continue
+        p = pipeline.new_project(f.stem, body.get("autopilot"), video_type=vt)
+        store.update("project", p["id"], {"stage": "Queued to copy in"})
+        pipeline.submit("ingest_file", project_id=p["id"], path=str(f), stable=True)
+        added.append({"id": p["id"], "name": p["name"]})
+    return {"added": added, "skipped": skipped}
 
 
 @app.post("/api/projects/url")
@@ -248,15 +392,10 @@ def _video_type(kind, sub=None) -> dict | None:
 @app.get("/api/projects")
 def list_projects():
     projects = store.find("project")
-    by_project: dict[str, list] = {}  # project id -> its clip ids, newest first (two fields, not 3,000 whole clips)
-    for cid, pid, expired in store.fields("clip", "project_id", "expired"):
-        if not expired:  # expired clips: history, behind "Show expired"
-            by_project.setdefault(pid, []).append(cid)
+    live = store.live_clips()  # project id -> (clips not expired, the newest one): from an index, no clip parsed
     dues = storage.due_map()
-    for p in projects:
-        mine = by_project.get(p["id"], [])
-        p["clip_count"] = len(mine)
-        p["first_clip"] = mine[0] if mine else None  # an imported short opens straight in the Studio
+    for p in projects:  # expired clips: history, behind "Show expired"
+        p["clip_count"], p["first_clip"] = live.get(p["id"], (0, None))  # an imported short opens straight in the Studio
         p.update(storage.project_view(p, dues))
     return projects
 
@@ -625,22 +764,24 @@ def _overlays(v, clip: dict) -> list | None:
             text = o.get("text")
             if not isinstance(text, str) or not text.strip() or len(text) > 80:
                 raise HTTPException(400, "Text overlays need 1 to 80 characters.")
-            o2["text"], default_d = text, 2.0
+            o2["text"], default_d, dft = text, 2.0, {}
             o2.update({f: _text_style(f, o.get(f), f"overlay {f}") for f in TEXT_FIELDS if o.get(f) is not None})
         else:
             a = store.get("asset", str(o.get("asset_id") or ""))
             if not a or a["kind"] != kind:
                 raise HTTPException(400, f"Overlay asset not found in the library (or not a {kind}).")
-            o2["asset_id"], default_d = a["id"], (a.get("duration") or 3.0)
+            dft = a.get("defaults") or {}  # the asset's own defaults (Studio › Media), then its (trimmed) length
+            o2["asset_id"], default_d = a["id"], dft.get("d") or assets.trimmed_length(a) or 3.0
         d = default_d if o.get("d") is None else _num(o["d"], "overlay d", 0, 1e9)
         if d <= 0:
             raise HTTPException(400, "Overlay duration must be positive.")
         anim = o.get("anim") or "none"
         if anim not in OVERLAY_ANIMS:
             raise HTTPException(400, f"anim must be one of {', '.join(OVERLAY_ANIMS)}.")
-        o2.update(d=round(min(d, length - t), 3), x=round(_num(o.get("x", 0.5), "overlay x", 0, 1), 4),
-                  y=round(_num(o.get("y", 0.5), "overlay y", 0, 1), 4), w=round(_num(o.get("w", 0.3), "overlay w", 0.02, 1), 4),
-                  anim=anim, volume=round(_num(o.get("volume", 1.0), "overlay volume", 0, 2), 3),
+        o2.update(d=round(min(d, length - t), 3), x=round(_num(o.get("x", dft.get("x", 0.5)), "overlay x", 0, 1), 4),
+                  y=round(_num(o.get("y", dft.get("y", 0.5)), "overlay y", 0, 1), 4),
+                  w=round(_num(o.get("w", dft.get("w", 0.3)), "overlay w", 0.02, 1), 4),
+                  anim=anim, volume=round(_num(o.get("volume", dft.get("volume", 1.0)), "overlay volume", 0, 2), 3),
                   layer=int(_num(o.get("layer", 0), "overlay layer", -50, 50)), cutaway=bool(o.get("cutaway")) and kind == "video")
         out.append(o2)
     return out
@@ -809,11 +950,7 @@ def clean_edit(edit: dict, clip: dict) -> dict:
         elif k == "switch_region":
             out[k] = str(v or "")[:24]
         elif k in EDIT_RANGES:
-            try:
-                lo, hi = EDIT_RANGES[k]
-                out[k] = min(max(float(v), lo), hi)
-            except (TypeError, ValueError):
-                raise HTTPException(400, f"{k} must be a number.")
+            out[k] = _num(v, k, *EDIT_RANGES[k])  # clamped; NaN/inf are a 400 (min/max would pass NaN through)
         elif k in EDIT_ENUMS:
             if v not in EDIT_ENUMS[k]:
                 raise HTTPException(400, f"{k} must be one of {', '.join(EDIT_ENUMS[k])}.")
@@ -1008,7 +1145,7 @@ def headline_write(cid: str):
     """3 headline options + a kicker from the clip's transcript, title and hook; without AI, the hook and title."""
     clip = _404(store.get("clip", cid))
     plain = list(dict.fromkeys(t for t in (media.headline_text(clip.get("hook")), media.headline_text(clip.get("title"))) if t))
-    segs = pipeline.load_json(clip["project_id"], "transcript.json", {"segments": []})["segments"]
+    segs = pipeline.transcript_segments(clip["project_id"], copy=True)
     try:
         return {**ai.headline_options(clip, segs), "ai": True}
     except RuntimeError as e:  # no key, offline, refused: the honest defaults still work
@@ -1162,11 +1299,14 @@ def _clip_item(c: dict, ups: list[dict], memo: dict | None = None) -> dict:
             "locked": bool(done), "edit_url": f"#/studio/{c['id']}"}
 
 
+CARD_FIELDS = ("project_id", "title", "export", "rev", "start", "end", "created", "keep", "expired", "parts", "edit.aspect")  # _clip_item's
+
+
 def pipeline_board(expired: bool = False):
     """Every project and clip on one board: each in exactly one stage, the furthest it has reached. Clips and long forms
     the space saver expired are left out unless ?expired=1; every card carries its Keep pin and due date."""
     stages = {k: [] for k, _ in STAGES}
-    clips, ups, lfs = store.find("clip"), store.find("upload"), store.find("longform")
+    clips, ups, lfs = store.slim("clip", *CARD_FIELDS), store.find("upload"), store.find("longform")  # no clip edit parsed
     dues, memo = storage.due_map(), {}
     by_clip: dict[str, list] = {}
     for u in ups:
@@ -1246,20 +1386,23 @@ def pipeline_delete(body: dict):
 def _plan_context(clip: dict, proj: dict, library: list[dict]) -> str:
     """Everything Claude needs to plan one clip, with times relative to the clip start (what overlays use)."""
     s0, s1 = clip["start"], clip["end"]
-    segs = pipeline.load_json(proj["id"], "transcript.json", {"segments": []})["segments"]
+    segs = pipeline.transcript_segments(proj["id"])  # read-only: lines of text
     sig = pipeline.load_json(proj["id"], "signals.json", {})
     lines = [f"[{max(g['start'] - s0, 0):.1f}-{g['end'] - s0:.1f}] {g['text'].strip()}" for g in segs if g["end"] > s0 and g["start"] < s1]
     loud = [f"{p['t'] - s0:.1f}s (energy {p['energy']})" for p in sig.get("loud", []) if s0 <= p["t"] <= s1]
     cuts = [f"{t - s0:.1f}s" for t in sig.get("scenes", []) if s0 < t < s1]
     edit = {k: v for k, v in clip["edit"].items() if k not in ("track", "words")}
-    lib = [f"{a['id']} | {a['kind']} | {a['name']} | {', '.join(a.get('tags') or [])} | {a.get('duration') or 0:.1f}s" for a in library]
+    kits = assets.kit_names()  # the creator's kits and favourites: what to reach for first
+    lib = [f"{a['id']} | {a['kind']} | {a['name']}{' ★' if a.get('fav') else ''} | {', '.join(a.get('tags') or [])} | "
+           f"{assets.trimmed_length(a):.1f}s | {', '.join(kits.get(a['id'], [])) or '-'}" for a in library if a.get("kind") != "font"]
     taste, guide = pipeline.taste_examples(), pipeline.guidance()
     return "\n".join([
         f"Clip: {clip.get('title')!r}, {s1 - s0:.1f}s long, hook: {clip.get('hook') or '-'}",
         "Transcript (seconds from the clip start):", *(lines or ["(no speech)"]),
         f"Loud moments: {', '.join(loud) or 'none'}", f"Scene cuts: {', '.join(cuts) or 'none'}",
         f"Current edit settings: {json.dumps(edit)}",
-        "Asset library (id | kind | name | tags | length) — built-in sound effects have ids starting sfx-:", *(lib or ["(empty)"]),
+        "Asset library (id | kind | name (★ = a favourite) | tags | length | kits) — built-in sound effects have ids starting sfx-; "
+        "prefer the creator's kits and favourites:", *(lib or ["(empty)"]),
         *([f"Creator's style guidance:\n{guide}"] if guide else []), *([f"Creator's taste:\n{taste}"] if taste else [])])
 
 
@@ -1331,7 +1474,7 @@ def list_assets():
 
 
 @app.post("/api/assets")
-def upload_asset(file: UploadFile = File(...), name: str = Form(""), tags: str = Form("")):
+def upload_asset(file: UploadFile = File(...), name: str = Form(""), tags: str = Form(""), loudnorm: bool = Form(False)):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in assets.KINDS:
         raise HTTPException(400, f"Unsupported file type {ext or '(none)'} — use {', '.join(sorted(assets.KINDS))}.")
@@ -1344,11 +1487,22 @@ def upload_asset(file: UploadFile = File(...), name: str = Form(""), tags: str =
                 if size > assets.MAX_BYTES:
                     raise HTTPException(413, "That file is over 200 MB.")
                 f.write(chunk)
-        return assets.add(tmp, file.filename, name, tags.split(","))
+        return assets.add(tmp, file.filename, name, tags.split(","), loudnorm=loudnorm)
     except ValueError as e:
         raise HTTPException(400, str(e))
     finally:
         tmp.unlink(missing_ok=True)
+
+
+@app.patch("/api/assets/{aid}")
+def patch_asset(aid: str, body: dict):
+    """Name, tags, favourite, trim {in, out} and per-asset defaults {volume, x, y, w, d}."""
+    try:
+        return assets.patch(aid, body)
+    except KeyError:
+        raise HTTPException(404, "No such asset.") from None
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
 
 
 @app.get("/api/fonts")
@@ -1382,7 +1536,7 @@ def music(cid: str, file: UploadFile = File(...)):
 def assist(cid: str, body: dict):
     clip = _editable(cid)
     p = store.get("project", clip["project_id"])
-    segs = pipeline.load_json(p["id"], "transcript.json", {"segments": []})["segments"]
+    segs = pipeline.transcript_segments(p["id"], copy=True)
     edit = {k: v for k, v in clip["edit"].items() if k not in ("track", "words", "overlays")}  # bulky lists it can't edit
     patch = ai.assist(body.get("instruction", ""), clip, edit, segs, p["meta"]["duration"])
     explanation = patch.pop("explanation", "")
@@ -1395,7 +1549,7 @@ def assist(cid: str, body: dict):
 @app.post("/api/clips/{cid}/metadata")
 def metadata(cid: str):
     clip = _404(store.get("clip", cid))
-    segs = pipeline.load_json(clip["project_id"], "transcript.json", {"segments": []})["segments"]
+    segs = pipeline.transcript_segments(clip["project_id"], copy=True)
     return ai.youtube_meta(clip, segs, clip["edit"]["aspect"] in ("9:16", "4:5"), pipeline.guidance())
 
 
@@ -1430,7 +1584,7 @@ def upload_clip(cid: str, body: dict):
 @app.get("/api/uploads")
 def uploads():
     ups = store.find("upload")
-    clips = {c["id"]: c for c in store.find("clip")}
+    clips = {cid: c for cid in {u.get("clip_id") for u in ups} if cid and (c := store.get("clip", cid))}  # only the posted ones
     for u in ups:
         u.setdefault("platform", "youtube")
         u["account"] = (pipeline._account_of(u) or {}).get("name")
@@ -1461,12 +1615,15 @@ def move_upload(uid: str, body: dict):
 
 @app.get("/api/schedule")
 def schedule_view():
-    clips = {c["id"]: c for c in store.find("clip")}
+    clips: dict = {}  # the clips of the posts shown, each read once (not the whole library)
     items = []
     for u in store.find("upload"):
         if u.get("status") in ("canceled",) or (u.get("status") == "done" and not (u.get("publish_at") and not pipeline._due({"upload_at": u["publish_at"]}))):
             continue  # already out (a YouTube post still waiting for its publish time stays visible and movable)
-        c = clips.get(u.get("clip_id")) or (store.get("longform", u["longform_id"]) or {} if u.get("longform_id") else {})
+        cid = u.get("clip_id")
+        if cid and cid not in clips:
+            clips[cid] = store.get("clip", cid)
+        c = clips.get(cid) or (store.get("longform", u["longform_id"]) or {} if u.get("longform_id") else {})
         exp = c.get("export") or {}
         acc = pipeline._account_of(u) or {}
         items.append({"id": u["id"], "platform": u.get("platform", "youtube"), "status": u["status"], "auto": bool(u.get("auto")),
@@ -1663,7 +1820,15 @@ def import_vods(sid: str, body: dict):
 @app.get("/api/connections")
 def connections():
     st = platforms.status()
-    st["tiktok"]["redirect_uri"] = platforms.tiktok_redirect_uri(PORT)
+    s = config.load()
+    st["tiktok"]["redirect_uri"] = platforms.tiktok_redirect_uri(PORT)  # the port this run is on: what sign-in sends
+    st["tiktok"]["port_warning"] = "" if PORT == config.DEFAULT_PORT else (
+        f"Reelwright is running on port {PORT} this time, not {config.DEFAULT_PORT} (another program has it). TikTok sign-in "
+        f"only works if {st['tiktok']['redirect_uri']} is registered in your TikTok app: close the other program and restart "
+        "Reelwright, or add this URI too.")
+    st["tiktok"]["port_notice"] = bool(s["notice_tiktok_redirect"] and st["tiktok"]["has_app"])
+    st["obs"] = [{"name": c.get("name") or "OBS", "status": c.get("status") if c.get("enabled") else "off"}
+                 for c in store.find("obs")]  # the sidebar status: no host, password or error text
     return st
 
 
@@ -1964,7 +2129,7 @@ def version_longform(lid: str):
 def auto_chapters(lid: str):
     """Chapters from what is said (Claude titles them when a key is set; offline: a boundary every ~3 minutes)."""
     d = _lf(lid)
-    words = [w for s in pipeline.load_json(d["project_id"], "transcript.json", {"segments": []})["segments"] for w in s.get("words", [])]
+    words = pipeline.transcript_words(d["project_id"])
     base = d.get("chapters") if len(d.get("chapters") or []) >= 3 else longform.auto_chapters(d["segments"], words)
     if ai.ready("other") and words:
         base = longform.titled_chapters(d["segments"], base, words) or base
@@ -1975,7 +2140,7 @@ def auto_chapters(lid: str):
 def longform_metadata(lid: str):
     """AI title, description (with the YouTube chapter block), tags and category for a regular YouTube video."""
     d = _lf(lid)
-    words = [w for s in pipeline.load_json(d["project_id"], "transcript.json", {"segments": []})["segments"] for w in s.get("words", [])]
+    words = pipeline.transcript_words(d["project_id"])
     text = " ".join(w["w"].strip() for w in longform.seq_words(words, d["segments"]))
     chapters = longform.chapters_text(d)
     md = ai.longform_meta(d["title"], chapters, text, pipeline.guidance())
@@ -2079,7 +2244,7 @@ def _obs_doc(body: dict, old: dict | None = None) -> dict:
         except (TypeError, ValueError, AssertionError):
             raise HTTPException(400, "Port must be 1-65535 (OBS default 4455).")
     if body.get("password") is not None and (body.get("password") or not old):  # blank on edit = keep the saved one
-        out["password"] = str(body["password"])
+        out["password"] = vault.keep(str(body["password"]), (old or {}).get("password"))  # sealed at rest (vault.py)
     for k in ("enabled", "import_replays", "import_recordings"):
         if k in body:
             out[k] = bool(body[k])
@@ -2110,6 +2275,8 @@ def add_obs(body: dict):
 def patch_obs(oid: str, body: dict):
     old = _404(store.get("obs", oid))
     upd = _obs_doc(body, old)
+    if upd.get("enabled") and not old.get("enabled"):
+        upd["status"] = "connecting"  # not "off" (left by the stopped watcher) until the next reconcile picks it up
     return obs.public(store.update("obs", oid, upd, fn=lambda c: c.update(rev=c.get("rev", 0) + 1)))
 
 
@@ -2160,11 +2327,21 @@ def lan_token():
     return obs.lan_status()
 
 
+def relay_file() -> Path:
+    """relay.py ships as a data file of the frozen package (the .exe holds compiled modules only), as training/worker.py does."""
+    base = Path(getattr(sys, "_MEIPASS", "")) / "reelwright" if getattr(sys, "frozen", False) else Path(__file__).parent
+    return base / "relay.py"
+
+
 @app.get("/api/obs/relay.py")
 def relay_script():
     from fastapi.responses import FileResponse
 
-    return FileResponse(Path(__file__).with_name("relay.py"), filename="reelwright_relay.py", media_type="text/x-python")
+    f = relay_file()
+    if not f.is_file():
+        raise HTTPException(404, "The relay script isn't in this Reelwright build: rebuild the app, or copy reelwright/relay.py "
+                                 "from the source folder.")
+    return FileResponse(f, filename="reelwright_relay.py", media_type="text/x-python")
 
 
 # ---------- storage folder, space saver, removed sources, imported shorts (storage.py) ----------
@@ -2246,15 +2423,20 @@ def redownload(pid: str):
 
 
 @app.post("/api/projects/{pid}/source")
-def reimport_source(pid: str, file: UploadFile = File(...)):
-    """Put a removed source back from a file (it must be the same video)."""
-    return _bad(storage.reimport, _404(store.get("project", pid)), file.file, file.filename or "")
+async def reimport_source(pid: str, request: Request, name: str = ""):
+    """Put a removed source back from a file (it must be the same video). Body: the file itself."""
+    p = _404(store.get("project", pid))
+    if not p.get("source_removed"):
+        raise HTTPException(400, "This project still has its source video.")
+    return await _with_upload(request, name, lambda src: storage.reimport(p, src, name))
 
 
 @app.post("/api/shorts")
-def import_short(file: UploadFile = File(...), video_type: str = Form("auto"), sub_genre: str = Form("")):
-    """One old short from the browser: its own project, analysed, one whole clip. {project} or {duplicate}."""
-    return _bad(storage.import_short_upload, file.file, file.filename or "", _video_type(video_type, sub_genre))
+async def import_short(request: Request, name: str = "", video_type: str = "auto", sub_genre: str = ""):
+    """One old short from the browser: its own project, analysed, one whole clip. {project} or {duplicate}.
+    Body: the file itself, hashed while it streams in."""
+    vt, h = _video_type(video_type, sub_genre), hashlib.sha256()
+    return await _with_upload(request, name, lambda src: storage.import_short_upload(src, name, h.hexdigest(), vt), h=h)
 
 
 @app.post("/api/shorts/paths")
@@ -2298,6 +2480,10 @@ app.include_router(routes_editor.router)   # /api/triage, NLE export (WP5)
 app.include_router(routes_models.router)   # /api/models/* (model marketplace)
 from .routes_training import router as _training_router  # noqa: E402  /api/training/* (Model Lab; static import: packaged)
 app.include_router(_training_router)
+from . import routes_presets  # noqa: E402  /api/presets*, /api/ui-layout (static import: packaged)
+app.include_router(routes_presets.router)
+from . import routes_media  # noqa: E402  /api/media/* (online media search, kits; static import: packaged)
+app.include_router(routes_media.router)
 app.mount("/files", _ProjectFiles(), name="files")
 app.mount("/assets", StaticFiles(directory=assets.ASSETS), name="assets")  # read-only files; no listing
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="ui")

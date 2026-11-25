@@ -1,0 +1,2 @@
+# Dev-only tools (never bundled in the .exe): the phone app end-to-end suite, scripts/mobile_test.py
+playwright>=1.45

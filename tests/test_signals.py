@@ -408,7 +408,7 @@ def test_tagger_download_is_pinned_by_sha256(monkeypatch, tmp_path):
         def __init__(self, body):
             self.body = body
 
-        def read(self):
+        def read(self, n=-1):  # fetch_model reads at most MODEL_MAX + 1
             return self.body
 
         def __enter__(self):

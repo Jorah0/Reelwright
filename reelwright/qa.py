@@ -36,7 +36,7 @@ def _last(pattern: str, text: str) -> float | None:
 def measure(path: Path, has_audio: bool) -> str:
     """ffmpeg's log of one decode with the detectors on (blackdetect, freezedetect, silencedetect, astats, ebur128)."""
     af = ["-af", "silencedetect=noise=-35dB:d=1.5,astats=metadata=0,ebur128=peak=true:framelog=verbose"] if has_audio else ["-an"]
-    r = subprocess.run([media.FFMPEG, "-hide_banner", "-nostats", "-i", str(path), "-vf",
+    r = subprocess.run([media.FFMPEG, "-hide_banner", "-nostats", *media.LOCAL_ONLY, "-i", str(path), "-vf",
                         "blackdetect=d=0.5:pix_th=0.10,freezedetect=n=-60dB:d=2", *af, "-f", "null", "-"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=media.NO_WINDOW, timeout=300)
     return r.stderr
@@ -150,4 +150,6 @@ def lint(clip: dict, export_path: Path, platform: str | None = None, account: di
     issues = signal_issues(measure(path, m["has_audio"]), m["duration"], m["has_audio"])
     issues += limits(m["duration"], path.stat().st_size, m["height"] > m["width"], account)
     issues += safe_zones(clip, m["width"], m["height"])
+    from . import assets
+    issues += assets.licence_issues(clip)  # licence summary, NC on a monetized channel, a missing credit
     return [i for i in issues if not platform or i["platform"] in (None, platform)]

@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
-from . import accounts
+from . import accounts, config
 from .config import YT_SECRET, YT_TOKEN
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload",     # upload videos, set thumbnails
@@ -37,6 +37,8 @@ def _creds(account_id: str | None = None):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
+    if config.DEMO:  # demo mode: no real sign-in is ever used, so nothing can reach YouTube
+        return None
     info = _token(account_id)
     if not info:
         return None

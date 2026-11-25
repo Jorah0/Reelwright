@@ -372,8 +372,8 @@ def test_lab_routes(isolated):
 
 def test_tiktok_view_counts_are_requested_only_when_turned_on(isolated, monkeypatch):
     platforms.tiktok_set_app("key", "secret")
-    assert "video.list" not in platforms.tiktok_auth_url(8765)  # an app without the Display API can still connect
+    assert "video.list" not in platforms.tiktok_auth_url(38765)  # an app without the Display API can still connect
     real = platforms.config.load()
     monkeypatch.setattr(platforms.config, "load", lambda: {**real, "tiktok_metrics": True})
-    assert "video.list" in platforms.tiktok_auth_url(8765)
+    assert "video.list" in platforms.tiktok_auth_url(38765)
     assert metrics.YT_ANALYTICS in youtube.SCOPES  # YouTube asks for retention with every (re)connect

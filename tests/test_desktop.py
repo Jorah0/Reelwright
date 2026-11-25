@@ -73,12 +73,12 @@ def test_boot_command_points_at_the_exe_when_packaged(monkeypatch, tmp_path):
 
 def test_app_routes(monkeypatch):
     from fastapi.testclient import TestClient
-    from reelwright.server import app
+    from reelwright.server import PORT, app
     reg = {}
     monkeypatch.setattr(desktop, "_run_key_get", lambda: reg.get("Reelwright"))
     monkeypatch.setattr(desktop, "_run_key_set", lambda v: reg.__setitem__("Reelwright", v) if v else reg.pop("Reelwright", None))
     monkeypatch.setattr(desktop, "boot_command", lambda: '"x.exe" --minimized')
-    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    c = TestClient(app, base_url=f"http://127.0.0.1:{PORT}")
     r = c.put("/api/app", json={"start_on_boot": True, "close_to_taskbar": False}).json()
     assert r["start_on_boot"] is True and r["close_to_taskbar"] is False and reg
     assert c.get("/api/app").json()["start_on_boot"] is True

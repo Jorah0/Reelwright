@@ -46,7 +46,7 @@ def _pcm(path, sr: int, start: float = 0.0, dur: float | None = None):
     """Mono float32 samples streamed out of ffmpeg in chunks (never the whole decoded file at once)."""
     cmd = [media.FFMPEG, "-v", "error", *(["-ss", f"{start:.3f}"] if start > 0 else []), "-i", str(path),
            *(["-t", f"{dur:.3f}"] if dur else []), "-vn", "-sn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=media.NO_WINDOW)
+    p = media.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
         while chunk := p.stdout.read(sr * 2 * 20):  # 20 s per read
             yield np.frombuffer(chunk[: len(chunk) // 2 * 2], "<i2").astype(np.float32) / 32768
@@ -414,7 +414,7 @@ def _loudness(path, start: float, lead: float, dur: float, step: float) -> np.nd
 
 def _motion(path, start: float, lead: float, dur: float, step: float) -> np.ndarray:
     n = int(round(dur / step))
-    raw = subprocess.run([media.FFMPEG, "-v", "error", *(["-ss", f"{start:.3f}"] if start > 0 else []), "-i", str(path),
+    raw = subprocess.run([media.FFMPEG, "-v", "error", *(["-ss", f"{start:.3f}"] if start > 0 else []), *media.LOCAL_ONLY, "-i", str(path),
                           "-t", f"{max(dur - lead, 0.1):.3f}", "-an", "-vf", f"fps={1 / step:g},scale=96:54,format=gray",
                           "-f", "rawvideo", "-"], capture_output=True, creationflags=media.NO_WINDOW).stdout
     f = np.frombuffer(raw[: len(raw) // 5184 * 5184], np.uint8).reshape(-1, 5184).astype(np.float32)

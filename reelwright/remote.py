@@ -2,7 +2,7 @@
 API for it. The main app stays bound to 127.0.0.1 (it holds API keys and social tokens); this is a separate listener.
 
 Security model (lan.py + relay.py's, plus body integrity and per-device secrets):
-- Off by default. Binds 0.0.0.0 on its own port (8810; never the main app's 8765-8799 fallback range or the LAN
+- Off by default. Binds 0.0.0.0 on its own port (38810; never the main app's 38765-38799 fallback range or the LAN
   receiver's) and drops every client that isn't on a private, link-local or loopback address (or 100.64/10, the range
   Tailscale-style VPNs hand out), before reading a byte.
 - Pairing: Settings → Phone remote shows a QR of http://<lan-ip>:<port>/#pair=<device id>.<secret>. The fragment never
@@ -14,11 +14,15 @@ Security model (lan.py + relay.py's, plus body integrity and per-device secrets)
   memory). It never returns settings, keys, tokens, addresses or file paths and has no file browsing: media is served
   only by doc id through URLs signed with the phone's secret that expire after 30 minutes (Range requests supported).
 - Rate-limited per address, request bodies capped at 64 KB, no CORS headers.
+- The phone simulator (Settings → Phone remote → Developer) pairs a "sim" device through a shortcut link that only exists
+  while that toggle is on, and a sim device is refused from any address but this PC's loopback. Its pages (sim.html,
+  sim.js) are served only then, to loopback only.
 """
 import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -39,7 +43,7 @@ from .config import STATIC
 from .relay import OBS, OBSError
 
 APP_DIR = STATIC / "remote"
-MAIN_PORTS = range(8765, 8800)  # desktop.pick_port's fallback range for the main app
+MAIN_PORTS = range(config.DEFAULT_PORT, config.DEFAULT_PORT + 35)  # desktop.pick_port's fallback range (config.app_ports)
 CLOCK_SKEW_S = 90               # signed requests are valid ±90 s (a phone whose clock is off adopts the PC's from the 401)
 PAIR_TTL_S = 15 * 60            # a pairing code nobody used within 15 minutes is dead
 MAX_CONNS, MAX_CONNS_PER_IP = 64, 16  # open connections: a LAN host can't take every thread
@@ -56,7 +60,8 @@ PENDING = ("waiting_render", "scheduled", "held", "queued", "uploading", "needs_
 JOB_LABEL = {"analyze": "Analysis", "import_url": "Import", "find": "AI clip search", "export": "Render", "scan_source": "Channel scan",
              "virality": "Virality analysis", "train": "Style training", "research": "Platform research", "results": "Post results",
              "ingest_file": "Import from OBS", "track": "Subject tracking", "longform_capture": "Long form", "longform_export": "Long-form render",
-             "angle": "Camera angle"}
+             "angle": "Camera angle", "hud_scan": "Screen events", "cleanup": "Space saver", "proxy": "Preview copy",
+             "upload": "Publish"}  # every pipeline.HANDLERS kind (tests/test_housekeeping.py)
 OBS_ACTIONS = ("start_record", "stop_record", "save_replay", "clip_that", "marker")
 
 _state: dict = {"http": None, "port": None, "error": ""}
@@ -87,10 +92,10 @@ def check_port(port) -> int:
         p = int(port)
     except (TypeError, ValueError):
         raise ValueError("The phone remote's port must be a number.") from None
-    taken = {8766, int(config.load()["lan_port"]), int(os.environ.get("REELWRIGHT_PORT", 8765))}
+    taken = {config.DEFAULT_LAN_PORT, int(config.load()["lan_port"]), int(os.environ.get("REELWRIGHT_PORT", config.DEFAULT_PORT))}
     if not 1024 <= p <= 65535 or p in MAIN_PORTS or p in taken:
         raise ValueError(f"Pick a port from 1024 to 65535 outside {MAIN_PORTS.start}-{MAIN_PORTS.stop - 1} (the app's own ports) "
-                         "and not the OBS receiver's, e.g. 8810.")
+                         f"and not the OBS receiver's, e.g. {config.DEFAULT_REMOTE_PORT}.")
     return p
 
 
@@ -109,6 +114,22 @@ def _limited(ip: str) -> bool:
             return True
         h.append(now)
     return False
+
+
+AI_PER_HOUR = 20  # paid AI calls (titles, clip search, re-analysis) one paired phone may start per hour
+_ai_calls: dict[str, deque] = {}
+
+
+def _ai_budget(dev: dict, limit: int = AI_PER_HOUR) -> None:
+    """A paired phone spends the creator's AI credit: a lost or misused one can't run up the bill (429 past the budget)."""
+    now = time.monotonic()
+    with _rl_lock:
+        h = _ai_calls.setdefault(str(dev.get("id")), deque())
+        while h and now - h[0] > 3600:
+            h.popleft()
+        if len(h) >= limit:
+            raise HTTPException(429, f"This phone has used its {limit} AI requests for this hour; try again later or use the PC.")
+        h.append(now)
 
 
 def _failed(ip: str) -> None:
@@ -135,11 +156,27 @@ def _edit_devices(fn) -> None:
         config.save({"remote_devices": fn([d for d in _devices() if _live(d, now)])})
 
 
-def add_device() -> dict:
-    """A new pending phone. Its secret is only the pairing code: pairing swaps it for a key derived with the phone."""
-    dev = {"id": secrets.token_hex(4), "secret": secrets.token_urlsafe(24), "name": "", "created": time.time(), "paired_at": None}
-    _edit_devices(lambda devs: devs + [dev])
+def add_device(sim: bool = False) -> dict:
+    """A new pending phone. Its secret is only the pairing code: pairing swaps it for a key derived with the phone.
+    sim: the phone simulator's device (one at a time: an earlier simulator device is revoked)."""
+    dev = {"id": secrets.token_hex(4), "secret": secrets.token_urlsafe(24), "name": "", "created": time.time(), "paired_at": None,
+           **({"sim": True} if sim else {})}
+    _edit_devices(lambda devs: [d for d in devs if not (sim and d.get("sim"))] + [dev])
     return dev
+
+
+def _loopback(ip: str) -> bool:
+    try:
+        a = ipaddress.ip_address(str(ip).split("%")[0])
+    except ValueError:
+        return False
+    return (getattr(a, "ipv4_mapped", None) or a).is_loopback
+
+
+def device_allowed(dev: dict, ip: str) -> bool:
+    """A phone works from any address the listener accepts; the simulator's device only from this PC, and only while the
+    developer toggle is on (turning it off also revokes it)."""
+    return not dev.get("sim") or (_loopback(ip) and bool(config.load()["remote_dev_sim"]))
 
 
 def derive_key(code: str, phone_nonce: str, pc_nonce: str) -> str:
@@ -306,11 +343,12 @@ def _post(dev: dict, u: dict, clip: dict | None = None) -> dict:
             "cover": _url(dev, "cover", clip["id"]) if clip and (clip.get("export") or {}).get("cover") else None}
 
 
-def _review_clips() -> list[dict]:
-    """New AI picks the creator hasn't judged: unrated, never posted, not montages."""
+def _review_clips() -> list[str]:
+    """Ids of new AI picks the creator hasn't judged (newest first): unrated, never posted, not montages. Ids, from a few
+    fields: callers read whole docs only for the cards they show."""
     posted = {u.get("clip_id") for u in store.find("upload", status="done")}
-    return [c for c in store.find("clip") if c.get("source") in ("ai", "auto") and not c.get("rating") and not c.get("parts")
-            and c["id"] not in posted]
+    return [cid for cid, source, rating, parts in store.fields("clip", "source", "rating", "parts")
+            if source in ("ai", "auto") and not rating and not parts and cid not in posted]
 
 
 def _pair(dev, data):
@@ -336,7 +374,7 @@ def _pair(dev, data):
 
 
 def _dashboard(dev, data):
-    jobs = [j for j in store.find("job") if j["status"] in ("queued", "running")][:12]
+    jobs = sorted(store.find("job", status="queued") + store.find("job", status="running"), key=lambda j: -j["created"])[:12]
     ups = store.find("upload")
     upcoming = sorted((u for u in ups if u.get("status") in PENDING), key=lambda u: u.get("publish_at") or u.get("upload_at") or "")[:10]
     posted = sorted((u for u in ups if u.get("status") == "done"), key=lambda u: u.get("uploaded_at") or "", reverse=True)[:10]
@@ -353,7 +391,7 @@ def _dashboard(dev, data):
             "jobs": [{"id": j["id"], "kind": JOB_LABEL.get(j["kind"], j["kind"]), "status": j["status"], "progress": j.get("progress") or 0,
                       "message": j.get("message") or "", "title": titles.get(j["id"])} for j in jobs],
             "upcoming": [_post(dev, u) for u in upcoming], "posted": [_post(dev, u) for u in posted], "disk": disk,
-            "review": len(_review_clips()), "projects": len(store.find("project")),
+            "review": len(_review_clips()), "projects": len(store.fields("project")),
             "obs": sum(c.get("status") == "connected" for c in store.find("obs"))}
 
 
@@ -369,11 +407,11 @@ def _review(dev, data):
     names = {p["id"]: p.get("name") for p in store.find("project")}
     segs: dict[str, list] = {}
     cards = []
-    for c in clips[:30]:
+    for c in filter(None, map(lambda cid: store.get("clip", cid), clips[:30])):
         pid = c["project_id"]
         if pid not in segs:
             try:
-                segs[pid] = (pipeline.load_json(pid, "transcript.json", {}) or {}).get("segments") or []
+                segs[pid] = pipeline.transcript_segments(pid)
             except ValueError:
                 segs[pid] = []
         text = " ".join(s.get("text", "") for s in segs[pid] if c["start"] <= s.get("start", -1) < c["end"])
@@ -408,9 +446,19 @@ def _render(dev, data, cid):
     return {"ok": True, "job": job.get("id")}
 
 
-def _publish(dev, data, cid):
-    from . import server
-    c = _404(store.get("clip", cid), "That clip no longer exists.")
+def _future(v) -> str:
+    t = _epoch(v) if isinstance(v, (str, int, float)) and not isinstance(v, bool) else None
+    if t is None or not math.isfinite(t) or t < time.time() - 60:
+        raise ValueError("Pick a time in the future.")
+    return datetime.fromtimestamp(t, timezone.utc).isoformat()
+
+
+def _default_description(c: dict) -> str:
+    return (c.get("hook") or "") + ("\n\n#Shorts" if (c.get("edit") or {}).get("aspect") in ("9:16", "4:5") else "")
+
+
+def _post_body(data: dict, title: str, description: str) -> dict:
+    """The desktop Publish dialog's body from the phone's choices (the server checks every account is approved)."""
     ids = data.get("accounts")
     if not isinstance(ids, list) or not ids or not all(isinstance(a, str) for a in ids):
         raise ValueError("Pick at least one account.")
@@ -418,21 +466,22 @@ def _publish(dev, data, cid):
         if (accounts.get(aid) or {}).get("platform") == "tiktok":
             raise ValueError("TikTok asks for its own posting choices (who can view it, comments, disclosures): publish to TikTok "
                              "from the Publish dialog on the PC.")
-    when = data.get("when") or None
-    if when is not None:
-        t = _epoch(when)
-        if t is None or t < time.time() - 60:
-            raise ValueError("Pick a time in the future.")
-        when = datetime.fromtimestamp(t, timezone.utc).isoformat()
-    vertical = (c.get("edit") or {}).get("aspect") in ("9:16", "4:5")
+    when = _future(data["when"]) if data.get("when") else None
     privacy = data.get("privacy") if data.get("privacy") in ("public", "unlisted", "private") else None
-    body = {"accounts": ids, "title": str(data.get("title") or c.get("title") or "").strip()[:100],
-            "description": (c.get("hook") or "") + ("\n\n#Shorts" if vertical else ""),
-            "caption": str(data.get("caption") or "").strip()[:2200] or None,
-            "tags": [str(h).lstrip("#") for h in (c.get("hashtags") or [])][:15], "privacy": privacy,
+    desc = data.get("description")
+    body = {"accounts": ids, "title": str(data.get("title") or title or "").strip()[:100],
+            "description": desc.strip()[:5000] if isinstance(desc, str) and desc.strip() else description,
+            "caption": str(data.get("caption") or "").strip()[:2200] or None, "privacy": privacy,
             "made_for_kids": bool(data.get("made_for_kids")), "publish_at": when, "upload_at": None}
     if not body["title"]:
         raise ValueError("Add a title.")
+    return body
+
+
+def _publish(dev, data, cid):
+    from . import server
+    c = _404(store.get("clip", cid), "That clip no longer exists.")
+    body = {**_post_body(data, c.get("title"), _default_description(c)), "tags": [str(h).lstrip("#") for h in (c.get("hashtags") or [])][:15]}
     ups = server.upload_clip(cid, body)  # every account checked (approved, or 400) before anything is queued
     return {"uploads": [{"id": u["id"], "platform": u["platform"], "account_id": u.get("account_id"), "status": u["status"]} for u in ups]}
 
@@ -458,10 +507,8 @@ def _project_card(dev, p: dict, n: int) -> dict:
 
 
 def _projects(dev, data):
-    counts: dict[str, int] = {}
-    for c in store.find("clip"):
-        counts[c["project_id"]] = counts.get(c["project_id"], 0) + 1
-    return {"projects": [_project_card(dev, p, counts.get(p["id"], 0)) for p in store.find("project")[:80]]}
+    counts = store.live_clips(expired=True)  # every clip, counted from an index
+    return {"projects": [_project_card(dev, p, counts.get(p["id"], (0,))[0]) for p in store.newest("project", 80)]}
 
 
 def _project(dev, data, pid):
@@ -473,6 +520,7 @@ def _project(dev, data, pid):
 
 def _find(dev, data, pid):
     from . import server
+    _ai_budget(dev)
     job = server.find(pid, {"query": str(data.get("query") or "").strip()[:300]})
     return {"ok": True, "job": job.get("id")}
 
@@ -496,7 +544,7 @@ def _import(dev, data):
 
 def _board(dev, data):
     from . import server
-    clips = {c["id"]: c for c in store.find("clip")}
+    clips = {c["id"]: c for c in store.slim("clip", "export.cover")}  # _thumb reads only the cover
     out = []
     for st in server.pipeline_board()["stages"]:
         items = [{"type": it["type"], "id": it["id"], "project_id": it["project_id"], "title": it.get("title"), "duration": it.get("duration"),
@@ -515,7 +563,7 @@ def _obs_list(dev, data):
 
 def _clip_that(conn: dict) -> dict:
     """Save the replay buffer and import it. When the connection's watcher is live and imports replays, it does the import."""
-    with OBS(obs.url(conn), conn.get("password", ""), events=False) as o:
+    with OBS(obs.url(conn), obs.password(conn), events=False) as o:
         try:
             before = o.request("GetLastReplayBufferReplay").get("savedReplayPath")
         except OBSError:
@@ -547,7 +595,7 @@ def _obs_action(dev, data, oid, what):
         return _clip_that(conn)
     if what == "marker":  # a chapter in the recording (OBS 30.2+, Hybrid MP4); OBS has no stream-marker request
         try:
-            with OBS(obs.url(conn), conn.get("password", ""), events=False) as o:
+            with OBS(obs.url(conn), obs.password(conn), events=False) as o:
                 o.request("CreateRecordChapter", {"chapterName": f"Reelwright {time.strftime('%H:%M:%S')}"})
         except OBSError as e:
             raise RuntimeError(f"OBS couldn't add a marker ({e}). Markers need OBS 30.2 or newer, recording in Hybrid MP4.") from None
@@ -559,10 +607,10 @@ def _obs_action(dev, data, oid, what):
 def _activity(dev, data):
     """What happened lately, newest first: renders, analyses and imports, posts (with links) and failures."""
     names = {p["id"]: p.get("name") for p in store.find("project")}
-    titles = {c["id"]: c.get("title") for c in store.find("clip")}
+    titles = dict(store.fields("clip", "title"))
     up_done = {}
     ev = []
-    for j in store.find("job")[:300]:
+    for j in store.newest("job", 300):
         if j["status"] not in ("done", "failed") or not j.get("finished"):
             continue
         if j["kind"] == "upload":
@@ -585,6 +633,189 @@ def _activity(dev, data):
     return {"events": ev, "now": time.time()}
 
 
+# ---------- the full mobile app: editing, publish, schedule, long form, analysis ----------
+# Every action goes through the desktop's own server functions (patch_clip's validation and the posted-clip lock,
+# presets.edit_for, upload_clip's approval and QA gates, pipeline.reschedule), so the phone can't do what the PC refuses.
+
+PHONE_EDIT = {"layout", "captions", "caption_style", "headline", "streamer_card", "cuts"}  # what the phone may change
+PHONE_SUB = {"headline": {"on", "text", "theme"}, "streamer_card": {"on"}}
+MEDIA_KINDS = ("sound", "sticker")
+
+
+def _secs(v, name: str) -> float:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise ValueError(f"{name} must be a number of seconds.")
+    return float(v)
+
+
+def _editor(dev, data, cid):
+    from . import media, routes_presets, server
+    c = _404(store.get("clip", cid), "That clip no longer exists.")
+    meta = (store.get("project", c["project_id"]) or {}).get("meta") or {}
+    e = c.get("edit") or {}
+    hl, card = e.get("headline") or {}, e.get("streamer_card") or {}
+    job = next((j for j in store.find("job", clip_id=cid, kind="export") if j["status"] in ("queued", "running")), None)
+    rendered = pipeline.clip_export_current(c)
+    return {"id": cid, "title": c.get("title") or "Clip", "start": c["start"], "end": c["end"], "montage": bool(c.get("parts")),
+            "source_duration": meta.get("duration"), "fps": float(meta.get("fps") or 30) or 30.0,
+            "locked": server.posted(cid) or bool(c.get("expired")), "rev": c.get("rev"),
+            "edit": {"layout": e.get("layout"), "captions": bool(e.get("captions")), "caption_style": e.get("caption_style"),
+                     "headline": {k: hl.get(k) for k in ("on", "text", "theme")}, "streamer_card": {"on": bool(card.get("on"))},
+                     "cuts": e.get("cuts") or [],
+                     "overlays": [{k: o.get(k) for k in ("id", "kind", "asset_id", "t", "d", "text")} for o in e.get("overlays") or []]},
+            "options": {"layouts": list(media.LAYOUTS), "caption_styles": list(server.EDIT_ENUMS["caption_style"]),
+                        "themes": list(server.HEADLINE_ENUMS["theme"])},
+            "presets": [{"id": p["id"], "name": _safe(p.get("name"), 60), "fav": bool(p.get("fav"))}
+                        for p in routes_presets.list_presets(c["project_id"])["presets"]][:60],
+            "assets": [{"id": a["id"], "kind": a["kind"], "name": _safe(a.get("name"), 60), "duration": a.get("duration")}
+                       for a in store.find("asset") if a.get("kind") in MEDIA_KINDS][:200],
+            "kits": None,  # hook: the media library's kits (routes_media.py) once that API lands; the assets above work today
+            "rendered": rendered, "video": _url(dev, "video", cid) if rendered else None, "poster": _thumb(dev, c, c["project_id"]),
+            "render": {"status": (c.get("export") or {}).get("status"), "busy": bool(job), "progress": (job or {}).get("progress")}}
+
+
+def _edit(dev, data, cid):
+    from . import server
+    server._editable(cid)  # 409 once posted (or expired), before anything else
+    if not data or data.keys() - {"start", "end", "edit"}:
+        raise ValueError("Send start, end and/or edit.")
+    body = {k: _secs(data[k], k) for k in ("start", "end") if k in data}
+    if "start" in body and "end" in body and body["end"] - body["start"] < 0.5:
+        raise ValueError("The clip must end at least 0.5 s after it starts.")
+    if "edit" in data:
+        ed = data["edit"]
+        if not isinstance(ed, dict) or not ed or ed.keys() - PHONE_EDIT or any(
+                isinstance(ed.get(k), dict) and ed[k].keys() - sub for k, sub in PHONE_SUB.items()):
+            raise ValueError("From the phone you can change the layout, captions, headline (text, theme, on/off), streamer card "
+                             "and cuts; the rest is on the PC.")
+        body["edit"] = ed
+    c = server.patch_clip(cid, body)  # clean_edit validates every value, like any desktop edit
+    return {"ok": True, "rev": c["rev"], "start": c["start"], "end": c["end"]}
+
+
+def _preset(dev, data, cid):
+    from . import routes_presets, server
+    c = server._editable(cid)
+    if c.get("parts"):
+        raise ValueError("Montages take their parts' edits: apply the preset to those clips.")
+    pr = _404(store.get("preset", str(data.get("preset_id") or "")[:40]), "That preset no longer exists.")
+    one = {**pr, "parts": {k: v for k, v in pr["parts"].items() if k in routes_presets.PARTS}}  # clip parts only: never app settings
+    if one["parts"]:
+        server.patch_clip(cid, {"edit": routes_presets.edit_for(one, c)})
+    return {"ok": True}
+
+
+def _media_add(dev, data, cid):
+    """A library sound or sticker at the playhead (t, clip seconds), or {remove: overlay id}."""
+    from . import server
+    c = server._editable(cid)
+    ovs = list((c.get("edit") or {}).get("overlays") or [])
+    if "remove" in data:
+        keep = [o for o in ovs if o.get("id") != str(data["remove"])]
+        if len(keep) == len(ovs):
+            raise HTTPException(404, "That sound or sticker is no longer on the clip.")
+        ovs = keep
+    else:
+        a = store.get("asset", str(data.get("asset_id") or "")[:40])
+        if not a or a.get("kind") not in MEDIA_KINDS:
+            raise ValueError("Pick a sound or a sticker from your library.")
+        ovs.append({"kind": a["kind"], "asset_id": a["id"], "t": _secs(data.get("t", 0), "t")})
+    server.patch_clip(cid, {"edit": {"overlays": ovs}})
+    return {"ok": True}
+
+
+def _meta(dev, data, cid):
+    """AI title/description/tags through the desktop's route, with what Claude charged for it."""
+    from . import ai, server
+    _ai_budget(dev)
+    before = {r["id"] for r in store.find("usage")}
+    md = server.metadata(cid)
+    costs = [r.get("cost") for r in store.find("usage") if r["id"] not in before]  # ponytail: a concurrent AI call counts too
+    return {"title": _safe(md.get("title"), 100), "description": _safe(md.get("description"), 5000),
+            "tags": [_safe(t, 60) for t in md.get("tags") or []][:30], "provider": ai.route("meta"),
+            "cost": round(sum(x or 0 for x in costs), 6) if costs else None}
+
+
+def _publish_info(dev, data, cid):
+    from . import ai, platforms, server
+    c = _404(store.get("clip", cid), "That clip no longer exists.")
+    desc = _default_description(c)
+    tv = platforms.template_vars(c, store.get("project", c["project_id"]), [str(h).lstrip("#") for h in c.get("hashtags") or []])
+    default_tpl = config.load()["description_template"]
+    accs, best = [], {}
+    for a in accounts.all_accounts():
+        tpl = a["description_template"] if a.get("description_template") is not None else default_tpl
+        accs.append({"id": a["id"], "platform": a["platform"], "name": a.get("name") or a.get("handle") or a["platform"].title(),
+                     "approved": bool(a.get("approved")), "template": _safe(platforms.render_template(tpl, {**tv, "description": desc}), 5000)})
+    for plat in {a["platform"] for a in accs if a["approved"]}:
+        try:
+            best[plat] = (server.suggest_time({"platform": plat, "n": 1}).get("times") or [None])[0]
+        except Exception:  # a best-time guess must never stop the dialog
+            best[plat] = None
+    return {"title": c.get("title") or "", "description": desc, "accounts": accs, "best": best, "locked": server.posted(cid),
+            "ai": {"provider": ai.route("meta"), "ready": ai.ready("meta")}}
+
+
+def _schedule(dev, data):
+    from . import server
+    v = server.schedule_view()
+    clips = {r[0] for r in store.fields("clip")}  # ids only: is the cover's clip still there
+    keys = ("id", "platform", "status", "auto", "account_id", "account", "when", "title", "clip_id", "longform_id", "project_id")
+    items = [{**{k: i.get(k) for k in keys}, "error": _safe(i.get("error"), 200),
+              "cover": _url(dev, "cover", i["clip_id"]) if i.get("cover") and i.get("clip_id") in clips else None} for i in v["items"]]
+    return {"items": items, "paused": v["paused"],
+            "accounts": [{"id": a["id"], "platform": a["platform"], "name": a.get("name") or a.get("handle") or a["platform"].title()}
+                         for a in v["accounts"]]}
+
+
+def _move(dev, data, uid):
+    """Move a post (time and/or account) by the Schedule tab's rules: pipeline.reschedule, plus never into the past."""
+    when = "keep"
+    if "when" in data:
+        when = None if data["when"] is None else _future(data["when"])
+    aid = data.get("account_id")
+    if aid is not None and not isinstance(aid, str):
+        raise ValueError("account_id must be an account id.")
+    if when == "keep" and not aid:
+        raise ValueError("Pick a new time or account.")
+    u = pipeline.reschedule(uid, when, None, aid or None)
+    return {"ok": True, "when": u.get("publish_at") or u.get("upload_at"), "account_id": u.get("account_id"), "status": u.get("status")}
+
+
+def _longforms(dev, data):
+    from . import longform
+    jobs = {j.get("longform_id") for j in store.find("job", kind="longform_export") if j["status"] in ("queued", "running")}
+    return {"items": [{"id": d["id"], "project_id": d["project_id"], "title": d.get("title") or "Long form", "status": d.get("status"),
+                       "duration": longform.length(d) if d.get("segments") else 0, "rendered": longform.export_current(d),
+                       "busy": d["id"] in jobs, "locked": longform.posted(d["id"]), "error": _safe(d.get("error"), 200)}
+                      for d in store.find("longform")[:60]]}
+
+
+def _lf_render(dev, data, lid):
+    from . import server
+    job = server.export_longform(lid)  # refuses a posted, expired or empty long form, like the desktop
+    return {"ok": True, "job": job.get("id")}
+
+
+def _lf_publish(dev, data, lid):
+    from . import server
+    d = _404(store.get("longform", lid), "That long form no longer exists.")
+    ups = server.upload_longform(lid, _post_body(data, d.get("title"), ""))  # approval per account, like a clip
+    return {"uploads": [{"id": u["id"], "platform": u["platform"], "account_id": u.get("account_id"), "status": u["status"]} for u in ups]}
+
+
+def _analyze(dev, data, pid):
+    from . import server
+    if config.DEMO:
+        raise ValueError("Demo mode: analysis is off (the sample projects are already analysed).")
+    _ai_budget(dev)
+    p = _404(store.get("project", pid), "That project no longer exists.")
+    if p.get("status") in ("importing", "queued", "analyzing"):
+        raise ValueError("This video is already being imported or analysed.")
+    server.reanalyze(pid)
+    return {"ok": True}
+
+
 API = [  # (method, path after /remote/api/, handler(dev, body, *groups))
     ("POST", r"pair", _pair), ("GET", r"dashboard", _dashboard), ("POST", r"autopilot", _autopilot), ("GET", r"review", _review),
     ("GET", r"clips/(\w{1,40})", _clip), ("POST", r"clips/(\w{1,40})/rate", _rate), ("POST", r"clips/(\w{1,40})/render", _render),
@@ -592,6 +823,11 @@ API = [  # (method, path after /remote/api/, handler(dev, body, *groups))
     ("GET", r"projects", _projects), ("GET", r"projects/(\w{1,40})", _project), ("POST", r"projects/(\w{1,40})/find", _find),
     ("POST", r"import", _import), ("GET", r"board", _board), ("GET", r"obs", _obs_list),
     ("POST", r"obs/(\w{1,40})/(\w{1,20})", _obs_action), ("GET", r"activity", _activity),
+    ("GET", r"clips/(\w{1,40})/editor", _editor), ("POST", r"clips/(\w{1,40})/edit", _edit), ("POST", r"clips/(\w{1,40})/preset", _preset),
+    ("POST", r"clips/(\w{1,40})/media", _media_add), ("POST", r"clips/(\w{1,40})/meta", _meta),
+    ("GET", r"clips/(\w{1,40})/publish", _publish_info), ("GET", r"schedule", _schedule), ("POST", r"uploads/(\w{1,40})/move", _move),
+    ("GET", r"longform", _longforms), ("POST", r"longform/(\w{1,40})/render", _lf_render),
+    ("POST", r"longform/(\w{1,40})/publish", _lf_publish), ("POST", r"projects/(\w{1,40})/analyze", _analyze),
 ]
 
 
@@ -615,6 +851,7 @@ MEDIA_TYPES = {".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktim
                ".jpeg": "image/jpeg", ".png": "image/png"}
 CSP = ("default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
        "connect-src 'self'; manifest-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+SIM_FILES = ("sim.html", "sim.js")  # the phone simulator's frame: only while the developer toggle is on, only to loopback
 
 
 class Server(ThreadingHTTPServer):
@@ -676,6 +913,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._route("POST")
 
+    def _not_allowed(self):  # every other verb: a plain 405 (unread body: the connection closes)
+        self.close_connection = True
+        self._json(405, {"detail": "Method not allowed."})
+
+    do_PUT = do_PATCH = do_DELETE = do_OPTIONS = _not_allowed
+
     def _route(self, method: str):
         if _state["http"] is not self.server:  # turned off or moved to another port: kept-alive connections end too
             self.close_connection = True
@@ -707,6 +950,9 @@ class Handler(BaseHTTPRequestHandler):
             _failed(self.client_address[0])
             return self._json(401, {"detail": "This phone isn't paired, or its clock is off.", "time": int(time.time())})
         dev, nonce = ok
+        if not device_allowed(dev, self.client_address[0]):  # the simulator's device, from anywhere but this PC
+            _failed(self.client_address[0])
+            return self._json(401, {"detail": "This phone isn't paired, or its clock is off.", "time": int(time.time())})
         _seen(dev["id"], self.client_address[0])
         for m, rx, fn in API:
             g = re.fullmatch(rx, name)
@@ -728,9 +974,12 @@ class Handler(BaseHTTPRequestHandler):
     def _static(self, path: str):
         name = "index.html" if path in ("/", "/share") else path[1:]
         f = APP_DIR / name
-        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,60}", name) or f.suffix not in TYPES or not f.is_file():
+        sim = bool(config.load()["remote_dev_sim"]) and _loopback(self.client_address[0])  # the simulator, on this PC only
+        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,60}", name) or f.suffix not in TYPES or not f.is_file() or (name in SIM_FILES and not sim):
             return self._json(404, {"detail": "Not found."})
-        self._out(200, f.read_bytes(), TYPES[f.suffix], {"Cache-Control": "no-cache", "Content-Security-Policy": CSP, "X-Frame-Options": "DENY"})
+        frame = {"Content-Security-Policy": CSP.replace("frame-ancestors 'none'", "frame-ancestors 'self'"), "X-Frame-Options": "SAMEORIGIN"} \
+            if sim else {"Content-Security-Policy": CSP, "X-Frame-Options": "DENY"}  # sim.html frames the real app (same origin only)
+        self._out(200, f.read_bytes(), TYPES[f.suffix], {"Cache-Control": "no-cache", **frame})
 
     def _media(self, path: str):
         m = re.fullmatch(r"/remote/media/(video|cover|poster)/(\w{1,40})", path)
@@ -741,7 +990,7 @@ class Handler(BaseHTTPRequestHandler):
             exp = int(one("e"))
         except ValueError:
             exp = 0
-        genuine = bool(m and dev and dev.get("paired_at") and hmac.compare_digest(one("s").encode(), _media_sig(dev, m[1], m[2], exp).encode()))
+        genuine = bool(m and dev and dev.get("paired_at") and device_allowed(dev, self.client_address[0]) and hmac.compare_digest(one("s").encode(), _media_sig(dev, m[1], m[2], exp).encode()))
         if not genuine or exp < time.time():
             if not genuine:  # a real link that merely expired (a page left open) is no attack: don't count it
                 _failed(self.client_address[0])
@@ -797,7 +1046,8 @@ def apply() -> dict:
             srv.server_close()
         if want and not _state["http"]:
             try:
-                srv = Server(("0.0.0.0", check_port(want)), Handler)
+                host = "127.0.0.1" if config.DEMO else "0.0.0.0"  # the demo sandbox is for this PC's simulator only
+                srv = Server((host, check_port(want)), Handler)
             except (OSError, ValueError) as e:
                 _state["error"] = f"The phone remote can't listen on port {want}: {e}"
                 return local_status()
@@ -815,10 +1065,11 @@ def local_status() -> dict:
     now = time.time()
     devs = [{"id": d["id"], "name": d.get("name") or "", "paired": bool(d.get("paired_at")), "paired_at": d.get("paired_at"),
              "last_seen": (seen.get(d["id"]) or {}).get("at"), "last_ip": (seen.get(d["id"]) or {}).get("ip"),
-             "expires": None if d.get("paired_at") else float(d.get("created") or 0) + PAIR_TTL_S}
+             "expires": None if d.get("paired_at") else float(d.get("created") or 0) + PAIR_TTL_S, "sim": bool(d.get("sim"))}
             for d in _devices() if _live(d, now)]
     return {"enabled": s["remote_enabled"], "running": bool(_state["http"]), "port": s["remote_port"], "error": _state["error"],
-            "ips": lan.local_ips(), "hostname": socket.gethostname(), "devices": devs}
+            "ips": lan.local_ips(), "hostname": socket.gethostname(), "devices": devs, "dev_sim": bool(s["remote_dev_sim"]), "demo": config.DEMO,
+            "rescan_notice": bool(s["notice_remote_rescan"])}  # the port moved (config.migrate_ports): pair phones again
 
 
 def qr_svg(text: str) -> str:
@@ -865,8 +1116,60 @@ def put_remote(body: dict):
             patch["remote_port"] = check_port(body["port"])
         except ValueError as e:
             raise HTTPException(400, str(e)) from None
+    if "dev_sim" in body:
+        if not isinstance(body["dev_sim"], bool):
+            raise HTTPException(400, "dev_sim must be true or false.")
+        patch["remote_dev_sim"] = body["dev_sim"]
     config.save(patch)
+    if patch.get("remote_dev_sim") is False:  # off: the simulator's device goes too
+        _edit_devices(lambda devs: [d for d in devs if not d.get("sim")])
     return apply()
+
+
+def sim_link() -> dict:
+    """The phone simulator's link: http://127.0.0.1:<port>/sim.html#pair=<sim device>.<code>. Loopback only; only while the
+    developer toggle is on and the listener runs (the simulator drives the real phone app through the real signed API)."""
+    if not config.load()["remote_dev_sim"]:
+        raise ValueError("Turn on Settings → Phone remote → Developer: phone simulator first.")
+    if not _state["http"]:
+        raise ValueError("Turn on the phone remote first: the simulator loads the real phone app from it.")
+    dev = add_device(sim=True)
+    return {"device_id": dev["id"], "url": f"http://127.0.0.1:{_state['port']}/sim.html#pair={dev['id']}.{dev['secret']}"}
+
+
+def _sim_window(url: str) -> bool:
+    """A second desktop window at phone size, when the desktop app (pywebview) is running; else the caller opens a tab."""
+    desk = sys.modules.get("reelwright.desktop")
+    if not getattr(desk, "WINDOW", None):
+        return False
+    try:
+        import webview
+        webview.create_window("Reelwright: phone simulator", url, width=980, height=980, min_size=(420, 600))
+        return True
+    except Exception:
+        log.error("remote", "simulator window failed")
+        return False
+
+
+@router.post("/api/remote/simulator")
+def post_simulator(body: dict | None = None):
+    try:
+        link = sim_link()
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    return {**link, "window": _sim_window(link["url"])}
+
+
+@router.post("/api/remote/demo")
+def post_demo(body: dict | None = None):
+    """One click: a separate demo sandbox (demo.py: its own temporary library and ports, nothing ever posted) in its own
+    console window (close it to stop), opening its phone simulator in the browser."""
+    if config.FROZEN:  # ponytail: the packaged .exe has no `demo` entry; add one to desktop.main when the exe needs it
+        raise HTTPException(400, "The demo sandbox runs from the source folder: python -m reelwright demo --open")
+    import subprocess
+    subprocess.Popen([sys.executable.replace("pythonw.exe", "python.exe"), "-m", "reelwright", "demo", "--open", "--small"], cwd=str(config.ROOT),
+                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0), start_new_session=sys.platform != "win32")
+    return {"ok": True}
 
 
 @router.post("/api/remote/pair")

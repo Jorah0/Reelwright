@@ -103,9 +103,9 @@ def test_migration_seals_every_secret_keeps_them_working_and_backs_up_first(file
     conn = json.loads((files / "connections.json").read_text("utf-8"))
     assert "access_token" not in conn["tiktok"] and conn["tiktok"]["client_key"] == "ck"  # stale legacy sign-in dropped
     sealed_once = {p.name: p.read_text("utf-8") for p in files.glob("*.json") if p.name != "vault.json"}
-    vault.migrate()  # idempotent: nothing left to seal, so nothing is rewritten and the backups stay the originals
+    vault.migrate()  # idempotent: nothing left to seal, so nothing is rewritten; this second clean start drops the backups
     assert {p.name: p.read_text("utf-8") for p in files.glob("*.json") if p.name != "vault.json"} == sealed_once
-    assert (files / "settings.json.pre-vault.bak").read_text("utf-8") == before["settings.json"]
+    assert not list(files.glob("*.pre-vault.bak"))
 
 
 @WIN
@@ -547,3 +547,12 @@ def test_a_qa_error_for_one_chosen_account_refuses_the_whole_publish(post):
         server.upload_clip(c["id"], {"accounts": [tt["id"], ig["id"]], "title": "t"})
     assert ex.value.status_code == 400 and "at least 3 s" in ex.value.detail
     assert len(store.find("upload")) == before  # not even the TikTok post went into the queue
+
+
+@WIN
+def test_plain_text_backups_live_only_until_the_next_clean_start(files):
+    _old_version_files(files)
+    vault.migrate()  # the sealing start keeps the way back
+    assert list(files.glob("*.pre-vault.bak"))
+    vault.migrate()  # the next start reopened everything sealed: the plain-text copies go
+    assert not list(files.glob("*.pre-vault.bak"))

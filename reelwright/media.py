@@ -1,4 +1,5 @@
 """FFmpeg/OpenCV media engine: probing, analysis signals, reframing, captions, rendering."""
+import atexit
 import functools
 import math
 import os
@@ -7,6 +8,7 @@ import re
 import shutil
 import subprocess
 import time
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +26,36 @@ def _tool(name: str) -> str:
 FFMPEG = _tool("ffmpeg")
 FFPROBE = _tool("ffprobe")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+LOCAL_ONLY = ["-protocol_whitelist", "file,pipe"]  # a file is probed by content: a disguised playlist can't fetch URLs
+
+
+def local_inputs(args: list) -> list:
+    """ffmpeg args with LOCAL_ONLY before every -i (not lavfi sources, not where it's already there); ffprobe's one input
+    gets it up front."""
+    if args and args[0] == FFPROBE:
+        return args if LOCAL_ONLY[0] in args else [args[0], *LOCAL_ONLY, *args[1:]]
+    out = []
+    for i, a in enumerate(args):
+        if a == "-i" and args[i - 2:i] != ["-f", "lavfi"] and args[i - 2:i] != LOCAL_ONLY:
+            out += LOCAL_ONLY
+        out.append(a)
+    return out
+
+
+_live = weakref.WeakSet()  # ffmpeg pipes still running: killed at exit (the job object covers this on Windows)
+
+
+def popen(args: list, **kw) -> subprocess.Popen:
+    p = subprocess.Popen(local_inputs(args), creationflags=NO_WINDOW, **kw)
+    _live.add(p)
+    return p
+
+
+@atexit.register
+def kill_children() -> None:
+    for p in list(_live):
+        if p.poll() is None:
+            p.kill()
 
 OUTPUT_SIZES = {"9:16": (1080, 1920), "1:1": (1080, 1080), "4:5": (1080, 1350), "16:9": (1920, 1080)}
 
@@ -75,7 +107,8 @@ BLEEP_MODES = ("off", "beep", "mute")
 
 
 def _run(args, **kw):
-    r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW, **kw)
+    r = subprocess.run(local_inputs(args), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       creationflags=NO_WINDOW, **kw)
     if r.returncode != 0:
         raise RuntimeError(f"{Path(args[0]).stem} failed: {r.stderr.strip()[-1500:]}")
     return r
@@ -148,9 +181,8 @@ def audio_signals(src: Path, silences_out: list | None = None) -> tuple[list[flo
     win = 400  # 0.1 s
     sd = ["-af", "silencedetect=noise=-35dB:d=0.7"] if silences_out is not None else []
     errf = tempfile.TemporaryFile()  # silencedetect's lines; a file so ffmpeg never blocks on a full stderr pipe
-    proc = subprocess.Popen([FFMPEG, "-hide_banner", "-nostats", "-v", "info" if sd else "error", "-i", str(src), "-vn", *sd,
-                             "-ac", "1", "-ar", "4000", "-f", "s16le", "-"], stdout=subprocess.PIPE, stderr=errf,
-                            creationflags=NO_WINDOW)
+    proc = popen([FFMPEG, "-hide_banner", "-nostats", "-v", "info" if sd else "error", "-i", str(src), "-vn", *sd,
+                  "-ac", "1", "-ar", "4000", "-f", "s16le", "-"], stdout=subprocess.PIPE, stderr=errf)
     peaks, rms = [], []
     try:
         while buf := proc.stdout.read(win * 2 * 600):  # 60 s; only the very last block can be short
@@ -199,14 +231,14 @@ def scene_times(showinfo_log: str) -> list[float]:
 
 def scenes(src: Path, threshold: float = SCENE_THRESHOLD) -> list[float]:
     """Hard-cut times. (Analysis normally gets these from vision.analyze's shared decode; this is the fallback.)"""
-    r = subprocess.run([FFMPEG, "-hide_banner", "-i", str(src), "-an", "-vf",  # CPU decode: see vision.analyze
+    r = subprocess.run([FFMPEG, "-hide_banner", *LOCAL_ONLY, "-i", str(src), "-an", "-vf",  # CPU decode: see vision.analyze
                         f"scale=320:-2,select='gt(scene,{threshold})',showinfo", "-f", "null", "-"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     return scene_times(r.stderr)
 
 
 def silences(src: Path, noise_db: int = -35, min_dur: float = 0.7) -> list[list[float]]:
-    r = subprocess.run([FFMPEG, "-hide_banner", "-i", str(src), "-vn", "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
+    r = subprocess.run([FFMPEG, "-hide_banner", *LOCAL_ONLY, "-i", str(src), "-vn", "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
                         "-f", "null", "-"], capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     return _silence_pairs(r.stderr)
 
@@ -215,6 +247,9 @@ def _silence_pairs(log: str) -> list[list[float]]:
     starts = [float(s) for s in re.findall(r"silence_start: ([\d.]+)", log)]
     ends = [float(s) for s in re.findall(r"silence_end: ([\d.]+)", log)]
     return [[round(s, 2), round(e, 2)] for s, e in zip(starts, ends)]
+
+
+MODEL_MAX = 200 << 20  # the largest model fetched is ~27 MB; a download past this is refused, not read into memory
 
 
 def fetch_model(name: str, url: str, sha256: str | None = None) -> Path:
@@ -229,7 +264,9 @@ def fetch_model(name: str, url: str, sha256: str | None = None) -> Path:
         model.parent.mkdir(parents=True, exist_ok=True)
         part = model.with_suffix(".part")
         with urllib.request.urlopen(url, timeout=20) as r:
-            body = r.read()
+            body = r.read(MODEL_MAX + 1)
+        if len(body) > MODEL_MAX:
+            raise RuntimeError(f"Download of {name} is too big (over {MODEL_MAX >> 20} MB); not using it.")
         if sha256 and hashlib.sha256(body).hexdigest() != sha256:
             raise RuntimeError(f"Download of {name} failed its SHA-256 check (expected {sha256[:12]}…); not using it.")
         part.write_bytes(body)
@@ -244,7 +281,7 @@ class DecodeError(RuntimeError):
 def pcm(src, start: float = 0.0, dur: float | None = None, sr: int = 16000) -> np.ndarray:
     """Mono float32 samples of [start, start+dur) at sr — one window, so a long file is never decoded whole.
     A partly corrupt stretch returns what could be read; nothing readable at all raises DecodeError."""
-    r = subprocess.run([FFMPEG, "-v", "error", *(["-ss", f"{start:.3f}"] if start > 0 else []), "-i", str(src),
+    r = subprocess.run([FFMPEG, "-v", "error", *(["-ss", f"{start:.3f}"] if start > 0 else []), *LOCAL_ONLY, "-i", str(src),
                         *(["-t", f"{dur:.3f}"] if dur else []), "-vn", "-sn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-"],
                        capture_output=True, creationflags=NO_WINDOW)
     if r.returncode and not r.stdout:
@@ -252,12 +289,17 @@ def pcm(src, start: float = 0.0, dur: float | None = None, sr: int = 16000) -> n
     return np.frombuffer(r.stdout[: len(r.stdout) // 2 * 2], "<i2").astype(np.float32) / 32768.0
 
 
+# pinned to an opencv_zoo commit (main on 2026-11-25) and its SHA-256: a moved branch can't swap the model under us
+YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/48b10fa505aeb51fbd127fc60a5c660040e823b7/models/face_detection_yunet/"
+             "face_detection_yunet_2023mar.onnx")
+YUNET_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+
+
 def face_detector(w: int, h: int):
     """YuNet DNN face detector for w×h frames (model ~230 KB, fetched once into the data folder)."""
     import cv2
 
-    model = fetch_model("face_detection_yunet_2023mar.onnx", "https://github.com/opencv/opencv_zoo/raw/main/models/"
-                        "face_detection_yunet/face_detection_yunet_2023mar.onnx")
+    model = fetch_model("face_detection_yunet_2023mar.onnx", YUNET_URL, sha256=YUNET_SHA256)
     try:
         return cv2.FaceDetectorYN.create(str(model), "", (w, h), 0.7)
     except cv2.error:
@@ -1745,22 +1787,30 @@ def _encode(args: list, out: Path, cwd: Path, out_dur: float, progress, extra: l
         raise RuntimeError("No usable H.264 encoder in this ffmpeg build (tried NVIDIA NVENC, Intel Quick Sync, AMD AMF, "
                            "libx264, OpenH264). Update the graphics driver, or use an ffmpeg build with libx264 or OpenH264.")
     err = ""
-    for enc in chain:
-        log = cwd / f"ffmpeg_{out.stem}.log"
-        with open(log, "w", encoding="utf-8") as lf:
-            p = subprocess.Popen(args + enc + tail, cwd=cwd, stdout=subprocess.PIPE, stderr=lf, text=True, creationflags=NO_WINDOW)
-            for line in p.stdout:
-                if line.startswith("out_time_us=") and progress and out_dur > 0:
-                    try:
-                        progress(min(int(line.split("=")[1]) / 1e6 / out_dur, 1.0))
-                    except ValueError:
-                        pass
-            p.wait()
-        err = log.read_text("utf-8", "replace")
-        log.unlink(missing_ok=True)
-        if p.returncode == 0:
-            os.replace(tmp, out)
-            return
+    try:
+        for enc in chain:
+            log = cwd / f"ffmpeg_{out.stem}.log"
+            with open(log, "w", encoding="utf-8") as lf:
+                p = popen(args + enc + tail, cwd=cwd, stdout=subprocess.PIPE, stderr=lf, text=True)
+                try:
+                    for line in p.stdout:
+                        if line.startswith("out_time_us=") and progress and out_dur > 0:
+                            try:
+                                progress(min(int(line.split("=")[1]) / 1e6 / out_dur, 1.0))
+                            except ValueError:
+                                pass
+                    p.wait()
+                finally:
+                    if p.poll() is None:  # interrupted mid-render: ffmpeg must not keep writing tmp
+                        p.kill()
+                        p.wait()
+            err = log.read_text("utf-8", "replace")
+            log.unlink(missing_ok=True)
+            if p.returncode == 0:
+                os.replace(tmp, out)
+                return
+    finally:
+        tmp.unlink(missing_ok=True)  # a failed or interrupted attempt; gone already after a successful os.replace
     raise RuntimeError(f"Render failed: {err.strip()[-1500:]}")
 
 
@@ -1819,6 +1869,8 @@ def render(src: Path, out: Path, start: float, end: float, edit: dict, meta: dic
         span = f"{b - a + 0.1:.3f}"
         loop = {"image": ["-loop", "1", "-framerate", "30", "-t", span], "gif": ["-ignore_loop", "0", "-t", span],
                 "video": ["-t", span]}.get(o["kind"], [])
+        if o.get("trim_in") and o["kind"] in ("gif", "video", "sound"):  # the asset's trim: start from its in point
+            loop = ["-ss", f"{float(o['trim_in']):.3f}", *loop]
         placed.append({**o, "a": a, "b": b, "input": 1 + bool(music) + len(placed),
                        "audio": o["kind"] == "video" and probe(Path(o["path"]))["has_audio"]})
         extra += loop + ["-i", str(Path(o["path"]).resolve())]

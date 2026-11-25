@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from . import log, usage
+from . import config, log, usage
 
 NAMES = ("anthropic", "ollama", "openai")
 LABELS = {"anthropic": "Claude", "ollama": "Ollama", "openai": "OpenAI-compatible"}
@@ -116,6 +116,8 @@ def _openai(cfg: dict, system: str, parts: list, schema, history: list) -> tuple
 
 def ask(name: str, cfg: dict, system: str, user, schema: type[BaseModel]) -> BaseModel:
     """One structured call to a non-Anthropic provider. Bad JSON gets one retry with the validation error."""
+    if config.DEMO:  # belt and braces (ai._ask refuses first): demo mode never reaches any AI provider
+        raise RuntimeError("Demo mode: AI features are off (nothing is sent to any AI provider).")
     if not cfg.get("model"):
         raise RuntimeError(f"Pick a model for {LABELS.get(name, name)} in Settings → AI.")
     call = {"ollama": _ollama, "openai": _openai}[name]

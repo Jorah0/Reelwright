@@ -115,6 +115,8 @@ PUBLISH_TRIES = 3  # Instagram media_publish attempts whose answer got lost (eac
 def _net(call):
     """One request, retried with backoff when no answer came back or the platform said 429/5xx; any other answer is
     returned as it is. Only for steps that can't create a post twice (a lost init leaves an orphan that never posts)."""
+    if config.DEMO:  # belt and braces: demo mode never reaches a platform
+        raise RuntimeError("Demo mode: nothing is sent to any platform.")
     for i in range(NET_TRIES):
         try:
             r = call()
@@ -142,12 +144,13 @@ def vod_link(url: str, t: float) -> str:
 
 def template_vars(item: dict, proj: dict | None, tags: list[str]) -> dict:
     """What a description template can use for this clip (or long form) of this project."""
-    from . import storage
+    from . import assets, storage
     src, t = storage.source_url(proj or {}) or "", int(float(item.get("start") or 0))
     return {"title": item.get("title") or "", "hook": item.get("hook") or "", "source_url": vod_link(src, t),
             "vod_time": (f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60}:{t % 60:02d}") if src else "",
             "channel": ((proj or {}).get("source_info") or {}).get("channel") or "",
-            "hashtags": " ".join(f"#{str(x).replace(' ', '')}" for x in tags[:5])}
+            "hashtags": " ".join(f"#{str(x).replace(' ', '')}" for x in tags[:5]),
+            "attributions": assets.attributions(item)}  # credits for CC BY media the clip uses ("" = none)
 
 
 def render_template(tpl: str, v: dict) -> str:
@@ -164,6 +167,8 @@ def render_template(tpl: str, v: dict) -> str:
     out = "\n".join(lines).strip()
     if "{description}" not in (tpl or ""):
         out = "\n\n".join(x for x in (str(v.get("description") or "").strip(), out) if x)
+    if v.get("attributions") and "{attributions}" not in (tpl or ""):  # licence credits are never left out by a template
+        out = "\n\n".join(x for x in (out, str(v["attributions"])) if x)
     return out
 
 
@@ -295,6 +300,8 @@ def _tt(r: httpx.Response, what: str) -> dict:
 
 def tiktok_creator(account_id: str | None = None) -> dict:
     """What TikTok allows this creator right now (shown in the publish dialog, as TikTok's guidelines require)."""
+    if config.DEMO:
+        raise RuntimeError("Demo mode: nothing is sent to any platform.")
     h = {"Authorization": f"Bearer {_tiktok_access(account_id)}", "Content-Type": "application/json; charset=UTF-8"}
     return _tt(httpx.post(f"{TT_API}/v2/post/publish/creator_info/query/", headers=h, timeout=30), "TikTok creator info")["data"]
 
@@ -646,7 +653,9 @@ PLATFORMS = ("youtube", "tiktok", "instagram")
 
 
 def account_connected(acc: dict) -> bool:
-    """Has a usable sign-in (YouTube: a valid or refreshable token)."""
+    """Has a usable sign-in (YouTube: a valid or refreshable token). Demo mode: only its sandbox accounts, never a real token."""
+    if config.DEMO:
+        return bool(acc.get("sandbox"))
     if acc["platform"] == "youtube":
         try:
             return youtube._creds(acc["id"]) is not None
@@ -676,6 +685,8 @@ def publish(platform: str, path: Path, u: dict, progress=None, cover: Path | Non
     """Post to the account named by u["account_id"] (pipeline._upload checks it is approved before calling this).
     u["resume"] = what an earlier attempt of this post saved through on_resume: continued or checked, never posted twice.
     u["ai_content"] = label it as AI-generated where the platform has a field for it (YouTube, TikTok; not Instagram)."""
+    if config.DEMO:  # a pretend post: nothing leaves this PC
+        return {"demo": True, "url": f"https://demo.invalid/{platform}/{u.get('id') or 'post'}", "note": "Demo mode: nothing was posted."}
     caption, aid, resume, ai = u.get("caption") or u["title"], u.get("account_id"), u.get("resume") or {}, bool(u.get("ai_content"))
     if platform == "youtube":
         res = youtube.upload(path, u["title"], u["description"], u["tags"], u["category_id"], u["privacy"],

@@ -178,7 +178,7 @@ def auto_chapters(segments, words: list[dict], every: float = 180.0) -> list[dic
 def _moments(pid: str, target: float, job_id: str | None = None) -> list[dict]:
     """Long candidate moments from the existing analysis: Claude with the video-type playbook, else the offline picks."""
     proj = store.get("project", pid)
-    segs = pipeline.load_json(pid, "transcript.json", {"segments": []})["segments"]
+    segs = pipeline.transcript_segments(pid, copy=True)
     signals = pipeline.load_json(pid, "signals.json", {}) or {}
     dur = proj["meta"]["duration"]
     lo, hi = 30.0, 180.0  # long moments: a highlight reel, not shorts
@@ -204,7 +204,7 @@ def capture_job(job):
         return
     pid, st = d["project_id"], d.get("settings") or {}
     proj = store.get("project", pid)
-    words = [w for s in pipeline.load_json(pid, "transcript.json", {"segments": []})["segments"] for w in s.get("words", [])]
+    words = pipeline.transcript_words(pid)
     dur = proj["meta"]["duration"]
     if d["mode"] == "highlights":
         segs, chapters = pick_highlights(_moments(pid, float(st.get("target") or DEFAULT_TARGET), job.get("id")),
@@ -334,7 +334,7 @@ def timeline(d: dict):
         return (lambda t: t / speed), length(d) / speed
     pid = d["project_id"]
     sil = pipeline.load_json(pid, "signals.json", {}).get("silences", []) if e["remove_silence"] else []
-    words = [w for seg in pipeline.load_json(pid, "transcript.json", {"segments": []})["segments"] for w in seg.get("words", [])]
+    words = pipeline.transcript_words(pid)
     parts, seq0, out0 = [], 0.0, 0.0
     for g in gs:
         keeps = _cut_keeps(g, e, words, sil)
@@ -376,7 +376,7 @@ def _render_part(d: dict, proj: dict, g: list[tuple[float, float]], e: dict, wor
     for o in ovs:
         a = store.get("asset", o.get("asset_id") or "") if o["kind"] not in ("text", "emoji") else None
         if a and assets.path(a).exists():
-            placed.append({**o, "path": str(assets.path(a))})
+            placed.append(assets.placed(o, a))  # the file, and its trim
     if e.get("switches"):  # cuts between camera angles are in sequence time too
         e = {**e, "switches": _part_switches(e["switches"], g, seq0)}
     size = media.output_size(e["aspect"], proj["meta"]["width"], proj["meta"]["height"])
@@ -421,11 +421,14 @@ def _join(parts: list[Path], out: Path, e: dict, music: Path | None, has_audio: 
     tmp = out.with_name(out.stem + ".rendering.mp4")
     args += ["-c:v", "copy", *(["-c:a", "aac", "-b:a", "160k", "-ar", "48000"] if has_audio or music else []),
              "-movflags", "+faststart", str(tmp.resolve())]
-    r = subprocess.run(args, cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                       creationflags=media.NO_WINDOW)
-    if r.returncode != 0:
-        raise RuntimeError(f"Joining the long-form parts failed: {r.stderr.strip()[-1500:]}")
-    os.replace(tmp, out)
+    try:
+        r = subprocess.run(media.local_inputs(args), cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           creationflags=media.NO_WINDOW)
+        if r.returncode != 0:
+            raise RuntimeError(f"Joining the long-form parts failed: {r.stderr.strip()[-1500:]}")
+        os.replace(tmp, out)
+    finally:
+        tmp.unlink(missing_ok=True)  # a failed join's half-written file (gone already after the replace)
 
 
 def render(d: dict, prog=lambda f: None) -> tuple[str, float]:
@@ -435,7 +438,7 @@ def render(d: dict, prog=lambda f: None) -> tuple[str, float]:
     if not d["segments"]:
         raise RuntimeError("This long-form edit has no segments.")
     e = assets.resolve_fonts({**media.DEFAULT_EDIT, **d["edit"]})
-    words = [w for seg in pipeline.load_json(pid, "transcript.json", {"segments": []})["segments"] for w in seg.get("words", [])]
+    words = pipeline.transcript_words(pid)
     gs = groups(d["segments"])
     weights = [sum(b - a for a, b in g) for g in gs]
     total_w = sum(weights) or 1.0
@@ -550,7 +553,7 @@ def delete(lid: str, remote: set[str] = frozenset()) -> dict:
 def plan_context(d: dict, proj: dict, library: list[dict]) -> str:
     """What ai.plan needs to plan a long form, with times in sequence seconds (what its overlays use)."""
     pid = proj["id"]
-    words = [w for s in pipeline.load_json(pid, "transcript.json", {"segments": []})["segments"] for w in s.get("words", [])]
+    words = pipeline.transcript_words(pid)
     seq = seq_words(words, d["segments"])
     lines, cur = [], []
     for w in seq:  # ~12-word lines

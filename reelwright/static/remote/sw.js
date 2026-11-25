@@ -1,7 +1,7 @@
 /* Offline shell for the phone remote. Browsers only run service workers in a secure context (https or localhost), so on
    a plain http:// Wi-Fi address app.js never registers this and the app simply loads from the PC each time.
    Only the app's own files are cached; the signed API and media are always fetched live, never stored. */
-const SHELL = "rw-remote-v1";
+const SHELL = "rw-remote-v2";
 const FILES = ["/", "/app.js", "/hmac.js", "/styles.css", "/manifest.webmanifest", "/icon-192.png", "/icon-180.png"];
 
 self.addEventListener("install", (e) => e.waitUntil(caches.open(SHELL).then((c) => c.addAll(FILES)).then(() => self.skipWaiting())));

@@ -9,13 +9,22 @@ const view = $("#view");
 
 async function api(path, opts = {}) {
   const init = { method: opts.method || (opts.body ? "POST" : "GET"), headers: {} };
-  if (opts.body instanceof FormData) init.body = opts.body;
+  if (opts.body instanceof FormData || opts.body instanceof Blob) init.body = opts.body; // a Blob/File: sent as the raw body
   else if (opts.body !== undefined) { init.body = JSON.stringify(opts.body); init.headers["Content-Type"] = "application/json"; }
   const r = await fetch(path, init);
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw Object.assign(new Error(typeof data.detail === "string" ? data.detail : `Request failed (${r.status})`), { status: r.status });
   return data;
 }
+
+// Desktop window: a new-tab link opens in the system browser, which lacks this window's session cookie (server.py), so a
+// /files/ link (Watch render, cover) is opened by the app with a one-time code instead.
+document.addEventListener("click", (e) => {
+  const a = e.target.closest?.('a[target="_blank"][href^="/files/"]');
+  if (!a || !S.app?.desktop) return; // a browser tab shares the cookie: the link works as it is
+  e.preventDefault();
+  api("/api/app/open", { body: { path: a.getAttribute("href") } }).catch(fail);
+});
 
 // A project's transcript.json (10-20 MB on a long VOD), parsed once per file version: the server answers an unchanged file
 // with a 304 and the same ETag (mtime + size), so opening the Editor / Studio / Long form again skips the big JSON parse.
@@ -57,7 +66,7 @@ const num = (n) => (n == null ? "—" : Number(n) >= 1e6 ? (n / 1e6).toFixed(1) 
 const PROJECT_STATUS = { importing: ["run", "Importing"], queued: ["info", "Queued"], analyzing: ["run", "Analyzing"], ready: ["ok", "Ready"], failed: ["err", "Failed"] };
 const UPLOAD_STATUS = { held: ["warn", "Held (Autopilot paused)"], waiting_render: ["info", "Rendering first"], scheduled: ["warn", "Waiting to post"], queued: ["info", "Queued"], uploading: ["run", "Uploading"], done: ["ok", "Posted"], failed: ["err", "Failed"], canceled: ["", "Canceled"], needs_auth: ["warn", "Needs connection"] };
 const JOB_STATUS = { queued: ["info", "Queued"], running: ["run", "Running"], done: ["ok", "Done"], failed: ["err", "Failed"], canceled: ["", "Canceled"] };
-const JOB_LABEL = { analyze: "Analyze video", import_url: "Import video", find: "AI clip search", export: "Render clip", upload: "Publish", scan_source: "Scan channel", virality: "Virality analysis", train: "Train style profile", research: "Live platform research", results: "Fetch post results", ingest_file: "Import from OBS", track: "Track subject" };
+const JOB_LABEL = { analyze: "Analyze video", import_url: "Import video", find: "AI clip search", export: "Render clip", upload: "Publish", scan_source: "Scan channel", virality: "Virality analysis", train: "Train style profile", research: "Live platform research", results: "Fetch post results", ingest_file: "Import from OBS", track: "Track subject", cleanup: "Space saver clean-up", proxy: "Preview copy", angle: "Camera angle", hud_scan: "Find screen events", longform_capture: "Capture long form", longform_export: "Render long form" }; // every pipeline.HANDLERS kind (tests/test_housekeeping.py)
 const PLATFORM = { youtube: "YouTube", tiktok: "TikTok", instagram: "Instagram" };
 const platTag = (p) => `<span class="plat ${p}">${PLATFORM[p] || esc(p)}</span>`;
 const SIZES = { "9:16": [1080, 1920], "1:1": [1080, 1080], "4:5": [1080, 1350], "16:9": [1920, 1080] };
@@ -70,6 +79,7 @@ const lsGet = (k) => { try { return localStorage[k]; } catch { return undefined;
 const lsSet = (k, v) => { try { localStorage[k] = v; } catch { /* private mode: just don't remember */ } };
 
 const S = { settings: null, conn: null, timers: [], nav: 0, ui: { app: 1, sidebar: 1, text: 1, preview: 1, timeline: 1, panels: 1 } };
+api("/api/app").then((a) => (S.app = S.app || a)).catch(() => {}); // desktop or browser: known before any /files/ link is clicked
 
 // Pointer position in an element's own CSS pixels (correct even when an ancestor is scaled with CSS zoom).
 const localXY = (ev, el) => { const r = el.getBoundingClientRect(), k = r.width / (el.offsetWidth || r.width || 1) || 1; return [(ev.clientX - r.left) / k, (ev.clientY - r.top) / k]; };
@@ -570,14 +580,29 @@ function scrubber(getVideo) {
   return (t, fast = false) => { want = { t, fast }; if (!raf) raf = requestAnimationFrame(go); };
 }
 // Timeline hover tooltip: time + the project's sprite thumbnail (sprite.jpg = sprite_count tiles of 160x90, evenly spaced).
-function tlTip(tip, x, t, pid, proj) {
+// at() → [x, t] is measured in the next animation frame: one layout read and one update per frame however fast the mouse
+// moves, and the thumbnail is rebuilt only when its sprite tile changes (the time label is just text).
+const TIP = { raf: 0, next: null };
+function tlTip(tip, at, pid, proj) {
   if (!tip) return;
-  const n = proj?.sprite_count, d = proj?.meta?.duration;
-  const k = S.ui.timeline;
-  tip.hidden = false;
-  tip.style.left = x + "px";
-  tip.innerHTML = `${n && d ? `<div class="tl-thumb" style="background-image:url('/files/${esc(pid)}/sprite.jpg');width:${160 * k}px;height:${90 * k}px;background-size:${n * 160 * k}px ${90 * k}px;background-position:-${Math.max(0, Math.min(n - 1, Math.floor((t / d) * n))) * 160 * k}px 0"></div>` : ""}<span>${fmt(t)}</span>`;
+  TIP.next = { tip, at, pid, proj };
+  if (TIP.raf) return;
+  TIP.raf = requestAnimationFrame(() => {
+    TIP.raf = 0;
+    if (!TIP.next) return; // hidden meanwhile (the mouse left)
+    const { tip, at, pid, proj } = TIP.next, [x, t] = at();
+    const n = proj?.sprite_count, d = proj?.meta?.duration, k = S.ui.timeline;
+    const tile = n && d ? Math.max(0, Math.min(n - 1, Math.floor((t / d) * n))) : -1, key = `${pid}|${tile}|${n}|${k}`;
+    tip.hidden = false;
+    tip.style.left = x + "px";
+    if (tip.dataset.k !== key || !tip.lastElementChild) {
+      tip.dataset.k = key;
+      tip.innerHTML = `${tile >= 0 ? `<div class="tl-thumb" style="background-image:url('/files/${esc(pid)}/sprite.jpg');width:${160 * k}px;height:${90 * k}px;background-size:${n * 160 * k}px ${90 * k}px;background-position:-${tile * 160 * k}px 0"></div>` : ""}<span></span>`;
+    }
+    tip.lastElementChild.textContent = fmt(t);
+  });
 }
+function tlTipHide(tip) { TIP.next = null; if (tip) tip.hidden = true; }
 
 function modal(html, onMount, wide = false) {
   const root = $("#modal-root");
@@ -628,15 +653,22 @@ async function sideStatus() {
     const b = $("#jobs-badge"); b.hidden = !running; b.textContent = running;
     activity(jobs, train);
     const row = (ok, label, text, href) => `<div class="row"><span class="pill ${ok ? "ok" : "warn"}">${label}</span><span>${ok ? esc(text) : `<a href="${href}">connect</a>`}</span></div>`;
-    $("#side-status").innerHTML = `<button class="btn sm ${settings.autopilot_paused ? "danger" : ""}" id="ap-pause" style="width:100%;margin-bottom:8px"
+    const side = `<button class="btn sm ${settings.autopilot_paused ? "danger" : ""}" id="ap-pause" style="width:100%;margin-bottom:8px"
         title="${settings.autopilot_paused ? "Autopilot is paused everywhere: nothing new is scheduled and its queued posts are held. Click to resume." : "Pause Autopilot everywhere: stops new scheduling and holds its queued posts (nothing is deleted)."}">
         ${settings.autopilot_paused ? "▶ Resume Autopilot" : "⏸ Pause Autopilot"}</button>`
       + row(settings.anthropic_key_set, "Claude AI", "connected", "#/settings")
       + row(conn.youtube.connected, "YouTube", conn.youtube.channel?.title || "connected", "#/publish")
       + row(conn.tiktok.connected, "TikTok", conn.tiktok.name || "connected", "#/publish")
-      + row(conn.instagram.connected, "Instagram", conn.instagram.name || "connected", "#/publish");
+      + row(conn.instagram.connected, "Instagram", conn.instagram.name || "connected", "#/publish")
+      + (conn.obs || []).map((o) => { const [cls, txt] = OBS_LINK[o.status] || OBS_LINK.connecting; // OBS auto-link state
+        return `<div class="row"><span class="pill ${cls === "ok" ? "ok" : "warn"}">${esc(o.name)}</span><span><a href="#/obs">${esc(txt)}</a></span></div>`; }).join("");
+    if (side !== S.sideHtml) { S.sideHtml = side; $("#side-status").innerHTML = side; } // every 5 s: rebuilt only on a change
   } catch { /* server restarting */ }
 }
+
+// OBS link states (obs.py _watch): shared by the OBS page and the sidebar status
+const OBS_LINK = { connected: ["ok", "Connected"], connecting: ["run", "Connecting…"], waiting: ["run", "Waiting for OBS to open…"],
+  auth: ["err", "Wrong password"], offline: ["err", "Offline"], off: ["", "Paused"] };
 
 // ---------- status indicator (top of the sidebar): busy + what, or Ready; click = running/queued tasks ----------
 const ACT_CANCEL = new Set(["export", "find", "virality", "research", "results", "track"]); // mirrors server.CANCELABLE
@@ -728,6 +760,7 @@ function apForm(ap, withToggle = true) {
     <label class="field">Method<select id="ap-mode">
       <option value="publish_at" ${ap.mode === "publish_at" ? "selected" : ""}>Upload now; YouTube publishes on schedule (TikTok/IG post at the time)</option>
       <option value="upload_at" ${ap.mode === "upload_at" ? "selected" : ""}>Hold locally; post everywhere at each scheduled time</option></select></label>
+    <label class="field">Preset <span class="dim" style="font-weight:400">(its parts go on every Autopilot clip, after the options here)</span><select id="ap-preset" data-v="${esc(ap.preset_id || "")}">${apPresetOpts(ap.preset_id)}</select></label>
     <label class="switch"><input type="checkbox" id="ap-cap" ${ap.captions ? "checked" : ""}> Burn in animated captions</label>
     <label class="switch"><input type="checkbox" id="ap-jc" ${ap.jump_cuts ? "checked" : ""}> AI jump cuts (remove silences)</label>
   </div>`;
@@ -737,6 +770,7 @@ function apRead(root) {
     enabled: $("#ap-enabled", root)?.checked ?? true, top_n: +$("#ap-top", root).value || 3, interval_hours: +$("#ap-int", root).value || 24,
     first_publish: $("#ap-first", root).value, aspect: $("#ap-aspect", root).value, privacy: $("#ap-priv", root).value,
     mode: $("#ap-mode", root).value, captions: $("#ap-cap", root).checked, jump_cuts: $("#ap-jc", root).checked, timing: $("#ap-timing", root).value,
+    preset_id: $("#ap-preset", root)?.value || "",
     platforms: $$(".ap-plat", root).filter((c) => c.checked).map((c) => c.value),
   };
   const accs = $$(".ap-acc", root);
@@ -797,9 +831,9 @@ const vtBody = (key) => { const [video_type, sub_genre = ""] = key.split(":"); r
 const vtTip = (vt) => !vt ? "Detected during analysis" : vt.source === "user" ? "Set by you" : `Detected (${vt.source === "ai" ? "AI" : "offline guess"}, ${Math.round((vt.confidence || 0) * 100)}% sure)${vt.reasons?.length ? ": " + vt.reasons.join("; ") : ""}`;
 
 // ---------- storage & space saver (storage.py): Keep pins, due dates, removed sources, imported shorts ----------
-Object.assign(JOB_LABEL, { cleanup: "Space saver clean-up" });
 const VIDEO_RE = /\.(mp4|mov|mkv|webm|avi|m4v|mts|ts|flv|wmv)$/i; // mirrors media.VIDEO_EXT
 const gb = (n) => `${((+n || 0) / 1e9).toFixed(1)} GB`;
+const trainBytes = (u) => (u?.training ? u.training.jobs + u.training.exports + u.training.datasets : 0);
 function dueText(d, src = false) {
   if (!d?.at) return "";
   const days = Math.ceil((new Date(d.at) - Date.now()) / 864e5), arch = d.action === "archive";
@@ -837,9 +871,9 @@ async function sourceAction(target, done) { // [data-redl] / [data-reimp] anywhe
   if (!ri) return false;
   const inp = Object.assign(document.createElement("input"), { type: "file", accept: "video/*,.mkv" });
   inp.onchange = async () => {
-    const fd = new FormData(); fd.append("file", inp.files[0]);
+    const f = inp.files[0];
     ri.disabled = true; ri.innerHTML = `<span class="spin"></span> Uploading…`;
-    try { await api(`/api/projects/${ri.dataset.reimp}/source`, { body: fd }); toast("Source restored.", "ok"); done?.(); }
+    try { await api(`/api/projects/${ri.dataset.reimp}/source?${new URLSearchParams({ name: f.name })}`, { body: f }); toast("Source restored.", "ok"); done?.(); }
     catch (e) { fail(e); ri.disabled = false; ri.textContent = "Re-import file"; }
   };
   inp.click();
@@ -876,8 +910,7 @@ function openShortImport(vt, done) {
       const files = [...list].filter((f) => VIDEO_RE.test(f.name)), res = { added: [], duplicates: [], skipped: [] };
       for (const [i, f] of files.entries()) {
         out.innerHTML = `<div>Importing ${i + 1} of ${files.length} — ${esc(f.name)}</div>${bar(i / files.length)}`;
-        const fd = new FormData(); fd.append("file", f); Object.entries(vt).forEach(([k, v]) => fd.append(k, v));
-        try { const r = await api("/api/shorts", { body: fd }); r.duplicate ? res.duplicates.push({ name: f.name }) : res.added.push(r.project); }
+        try { const r = await api(`/api/shorts?${new URLSearchParams({ name: f.name, ...vt })}`, { body: f }); r.duplicate ? res.duplicates.push({ name: f.name }) : res.added.push(r.project); }
         catch (e) { res.skipped.push({ path: f.name, reason: e.message }); }
       }
       report(res);
@@ -948,7 +981,7 @@ function storageCards() { // Settings › Storage + Space saver, inserted above 
       <div class="row wrap"><div class="grow"><div class="mono" style="word-break:break-all">${esc(st.path)}</div><div class="dim" style="font-size:12px">${st.custom ? "Your chosen folder" : "The default folder"}</div></div>
         <button class="btn sm" id="st-change" ${m.active ? "disabled" : ""}>Change folder…</button></div>
       ${st.missing ? `<div style="color:var(--err);font-size:12.5px">This folder isn't available (is the drive connected?). Renders, imports and uploads wait until it's back; nothing was moved or deleted. Reconnect it, or pick another folder (projects stored here stay here).</div>`
-        : `<div style="font-size:13px">Free: <b>${gb(st.free)}</b>${u ? ` · Reelwright uses <b>${gb(u.total)}</b> — sources ${gb(u.sources)}, renders ${gb(u.renders)}, other ${gb(u.other)}${u.chatlogs ? `; live chat logs ${gb(u.chatlogs)} (app data)` : ""}` : ""}</div>`}
+        : `<div style="font-size:13px">Free: <b>${gb(st.free)}</b>${u ? ` · Reelwright uses <b>${gb(u.total)}</b> — sources ${gb(u.sources)}, renders ${gb(u.renders)}, other ${gb(u.other)}${u.chatlogs ? `; live chat logs ${gb(u.chatlogs)} (app data)` : ""}${trainBytes(u) ? `; Model Lab training files ${gb(trainBytes(u))} (app data: jobs ${gb(u.training.jobs)}, exports ${gb(u.training.exports)}, datasets ${gb(u.training.datasets)})` : ""}` : ""}</div>`}
       ${m.active ? `<div style="font-size:12.5px">${esc(m.message || "Moving…")} → <span class="mono">${esc(m.to)}</span></div>${bar(m.progress)}
           <div class="dim" style="font-size:12px">Renders, imports and uploads wait until the move finishes. Closing Reelwright is safe: the move continues next time.</div>`
         : m.error ? `<div style="color:var(--err);font-size:12.5px">The move stopped: ${esc(m.error)} ${m.phase === "cleanup"
@@ -979,11 +1012,12 @@ function storageCards() { // Settings › Storage + Space saver, inserted above 
     } catch (err) { fail(err); }
   };
   const SCOPES = [["sources", "Downloaded long videos (links and channel imports)"], ["unfinished", "Unfinished clips' renders (rendered, never uploaded)"],
-    ["uploaded", "Uploaded clips' renders"], ["longform", "Long-form exports"], ["local_sources", "Originals from OBS, the network receiver, files you added and imported shorts"]];
+    ["uploaded", "Uploaded clips' renders"], ["longform", "Long-form exports"], ["local_sources", "Originals from OBS, the network receiver, files you added and imported shorts"],
+    ["training", "Training files (delete mode only): finished Model Lab jobs (checkpoints, GGUF exports) and datasets no job uses — never a candidate or release, the active model, the one Roll back returns to, or a paused job"]];
   const ARCH = [["archive_uploaded_dir", "Uploaded clips go to"], ["archive_unfinished_dir", "Unfinished clips go to"], ["archive_other_dir", "Sources & long forms go to (blank = the uploaded-clips folder)"]];
   const drawSaver = () => {
     const s = S.settings, mode = s.retention_mode || "off";
-    const sc0 = { sources: true, unfinished: true, uploaded: true, longform: true, local_sources: false, ...(s.retention_scope || {}) };
+    const sc0 = { sources: true, unfinished: true, uploaded: true, longform: true, local_sources: false, training: false, ...(s.retention_scope || {}) };
     sv.innerHTML = `<h2 style="margin:0">Space saver</h2>
       <p class="muted" style="margin:0;font-size:12.5px">After the days below, Reelwright deletes past-due videos and renders, or moves them to archive folders. Clips, transcripts, posts and what Reelwright learned always stay. Never touched: anything pinned with 📌 Keep (a clip, long form or whole project) and anything waiting to render or post.</p>
       <div class="row wrap" style="gap:14px">${[["off", "Off — keep everything"], ["delete", "Delete"], ["archive", "Archive to folders"]].map(([v, l]) => `<label class="row" style="gap:6px"><input type="radio" name="rt-mode" value="${v}" ${mode === v ? "checked" : ""}> ${l}</label>`).join("")}
@@ -1036,7 +1070,17 @@ function Library() {
       <div class="row" style="margin-bottom:12px"><h2 class="grow" style="margin:0">Projects</h2></div>
       <div id="projects" class="grid"></div></div>`;
     const drop = $("#drop"), file = $("#file");
-    $("#browse").onclick = () => file.click();
+    $("#browse").onclick = async () => { // the desktop app copies the picked files in on this PC (no upload through the page)
+      const app = S.app || (S.app = await api("/api/app").catch(() => ({})));
+      if (!app.desktop) return file.click();
+      try {
+        const paths = await pickPath("files"); if (!paths.length) return;
+        const r = await api("/api/projects/paths", { body: { paths, autopilot: apRead($("#ap")), ...vtBody($("#vtype").value) } });
+        if (r.added.length) { toast(`${r.added.length === 1 ? r.added[0].name : r.added.length + " videos"} added — analyzing after the copy.`, "ok"); localStorage.lastProject = r.added.at(-1).id; }
+        if (r.skipped.length) fail(new Error(`Skipped: ${r.skipped.map((s) => s.path).join(", ")} (not a video file)`));
+        this.refresh();
+      } catch (e) { fail(e); }
+    };
     $("#shorts").onclick = () => openShortImport(vtBody($("#vtype").value), () => this.refresh());
     file.onchange = () => [...file.files].forEach(upload);
     ["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
@@ -1060,12 +1104,10 @@ function Library() {
     const row = document.createElement("div");
     row.innerHTML = `<div class="row" style="font-size:12px"><span class="grow" style="text-align:left">${esc(f.name)}</span><span class="pct">0%</span></div>${bar(0)}`;
     $("#upl").append(row);
-    const fd = new FormData();
-    fd.append("file", f);
-    fd.append("autopilot", JSON.stringify(apRead($("#ap"))));
-    Object.entries(vtBody($("#vtype").value)).forEach(([k, v]) => fd.append(k, v));
+    // the File itself is the body (options in the query): the server streams it straight into the project folder
+    const q = new URLSearchParams({ name: f.name, autopilot: JSON.stringify(apRead($("#ap"))), ...vtBody($("#vtype").value) });
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", "/api/projects");
+    xhr.open("POST", `/api/projects?${q}`);
     xhr.upload.onprogress = (e) => { const p = e.loaded / e.total; $(".pct", row).textContent = `${Math.round(p * 100)}%`; $(".bar div", row).style.width = `${p * 100}%`; };
     xhr.onload = () => {
       row.remove();
@@ -1075,7 +1117,7 @@ function Library() {
       this.refresh();
     };
     xhr.onerror = () => { row.remove(); fail(new Error("Upload failed")); };
-    xhr.send(fd);
+    xhr.send(f);
   };
 
   this.refresh = async () => {
@@ -1148,6 +1190,9 @@ function visualStrip(v) {
   return c;
 }
 
+const EDITOR_TOOLS = [{ id: "timing", icon: "⏱", label: "Timing & cuts" }, { id: "frame", icon: "⬚", label: "Frame & layout" }, { id: "captions", icon: "✎", label: "Captions & text" },
+  { id: "textstyle", icon: "Aa", label: "Text style, headline & card" }, { id: "look", icon: "◐", label: "Look" }, { id: "audio", icon: "♫", label: "Audio, music & bleep" },
+  { id: "motion", icon: "≋", label: "Motion" }, { id: "ai", icon: "✧", label: "Ask AI" }]; // render & publish stay pinned below
 function Editor(pid) {
   const E = { pid, proj: null, clips: [], segs: [], words: [], signals: {}, sel: null, tab: "clips", zoom: 1, inMark: null, outMark: null, loop: false, pending: {}, sig: "", picked: new Set(),
     hist: RWUndo.History(100, 1000) }; // undo/redo of the selected clip's edits (selecting another clip starts over)
@@ -1163,7 +1208,7 @@ function Editor(pid) {
   };
 
   this.mount = async () => {
-    E.proj = await loadProj();
+    [E.proj] = await Promise.all([loadProj(), uilReady]);
     HL.vt = vtOf(E.proj); loadHeadline().then(() => !E.dead && applyPreview());
     localStorage.lastProject = pid;
     $("#nav-editor").hidden = false;
@@ -1176,7 +1221,7 @@ function Editor(pid) {
     keyHandler = onKey;
     document.addEventListener("keydown", keyHandler);
   };
-  this.destroy = () => { E.dead = true; listeners?.abort(); ro?.disconnect(); cancelAnimationFrame(raf); document.removeEventListener("keydown", keyHandler); video?.pause(); };
+  this.destroy = () => { E.dead = true; listeners?.abort(); ro?.disconnect(); cancelAnimationFrame(raf); document.removeEventListener("keydown", keyHandler); video?.pause(); E.tp?.destroy(); };
 
   async function loadAnalysis() {
     const [tr, sig] = await Promise.all([
@@ -1265,6 +1310,8 @@ function Editor(pid) {
     bindTimeline();
     view.onclick = onClick;
     $(".tabs").onclick = (e) => { const t = e.target.closest("[data-tab]"); if (t) { E.tab = t.dataset.tab; markTab(); renderTab(); } };
+    E.tp?.destroy();
+    E.tp = toolPanel("editor", $(".editor"), EDITOR_TOOLS, { beforeJump: () => { if (E.tab !== "edit") { E.tab = "edit"; markTab(); renderTab(); } } });
     updateOverlay();
     renderTab();
     sizeTimeline();
@@ -1480,9 +1527,9 @@ function Editor(pid) {
     inner.addEventListener("mousemove", (ev) => {
       const t = tAt(ev), c = selClip();
       inner.style.cursor = c && !c.parts && (Math.abs(t - c.start) * pps < 8 || Math.abs(t - c.end) * pps < 8) ? "ew-resize" : localXY(ev, inner)[1] >= CLIP_Y - 2 ? "pointer" : "text";
-      tlTip($("#tl-tip"), localXY(ev, $(".timeline"))[0], t, pid, E.proj);
+      tlTip($("#tl-tip"), () => [localXY(ev, $(".timeline"))[0], t], pid, E.proj);
     });
-    inner.addEventListener("mouseleave", () => { $("#tl-tip").hidden = true; });
+    inner.addEventListener("mouseleave", () => tlTipHide($("#tl-tip")));
     $("#tls").addEventListener("wheel", (ev) => { if (ev.ctrlKey) { ev.preventDefault(); zoomTo(E.zoom * (ev.deltaY < 0 ? 1.25 : 0.8), ev.clientX); } }, { passive: false });
   }
   function zoomTo(z, clientX) { // keeps the time under the cursor (or the centre) in place
@@ -1528,6 +1575,12 @@ function Editor(pid) {
     patchClip(c.id, body, 0, false);
     if (!c.parts && ("start" in body || "end" in body)) seek(c.start);
     if (E.tab === "edit" || E.tab === "clips") renderTab();
+  }
+  const editorPatch = async (body) => { const c = selClip(); if (!c || clipLocked(c)) throw new Error("Posted — make a new version to edit it."); patchClip(c.id, body); };
+  async function reloadClips() { // a preset applied to several clips changed them on the server
+    const p = await loadProj();
+    if (E.dead) return;
+    E.proj = p; E.clips = p.clips; E.hist.clear(); renderTab(); applyPreview(); draw();
   }
   const replaceClip = (fresh) => { const c = E.clips.find((k) => k.id === fresh.id); if (c) Object.assign(c, fresh); applyPreview(); draw(); };
 
@@ -1587,6 +1640,7 @@ function Editor(pid) {
             renderTab(); draw(); applyPreview();
           }
           break;
+        case "pick-preset": openPresetQuick(selClip, null, null, (id) => bulkPreset(id, { clip_ids: [...E.picked] }, reloadClips)); break;
         case "montage": {
           const ids = E.clips.filter((k) => E.picked.has(k.id)).sort((x, y) => x.start - y.start).map((k) => k.id);
           const m = await api(`/api/projects/${pid}/montage`, { body: { clip_ids: ids, title: `Best of ${E.proj.name}`.slice(0, 90) } });
@@ -1635,8 +1689,9 @@ function Editor(pid) {
   const markTab = () => $$(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === E.tab));
 
   function onKey(e) {
-    if (e.target.closest?.("input, textarea, select") || !video || $("#modal-root").innerHTML) return;
+    if (e.target.closest?.("input, textarea, select") || $("#modal-root").innerHTML || $(".tp-modal-back") || E.tp?.key(e) || !video) return;
     const c = selClip();
+    if ((e.key === "p" || e.key === "P") && !e.ctrlKey && !e.metaKey && !e.altKey && c && !c.parts) { e.preventDefault(); return openPresetQuick(selClip, editorPatch, () => renderTab()); }
     const z = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase();
     if (z === "z" || z === "y") { e.preventDefault(); undoRedo(z === "y" || e.shiftKey); }
     else if (e.code === "Space") { e.preventDefault(); E.loop = false; video.paused ? video.play() : video.pause(); }
@@ -1667,7 +1722,7 @@ function Editor(pid) {
         <select id="qlen" title="Clip length for new picks: aims for the first number, never longer than the second" ${ready ? "" : "disabled"}>${FIND_LENGTHS.map(([v, l]) => `<option value="${v}" ${v === (lsGet("findLen") || "") ? "selected" : ""}>${l}</option>`).join("")}</select>
         <button class="btn primary" data-act="find" ${ready ? "" : "disabled"}>Find</button></div>
       ${!S.settings?.anthropic_key_set ? `<div class="card" style="padding:10px 12px;margin-bottom:12px;font-size:12.5px">Clips below come from the offline heuristic. <a href="#/settings">Add a Claude API key</a> for AI-ranked clips, semantic search, the edit assistant, virality scoring and auto-written titles.</div>` : ""}
-      <div class="row" style="margin-bottom:10px;font-size:12px" ${E.picked.size ? "" : "hidden"} id="pickbar"><span class="grow">${E.picked.size} selected</span><button class="btn sm primary" data-act="montage" ${E.picked.size > 1 ? "" : "disabled"}>▤ Make montage</button><button class="btn sm" data-act="longform" title="Long form from the ticked clips, in the order ticked">▬ Long form</button></div>
+      <div class="row" style="margin-bottom:10px;font-size:12px" ${E.picked.size ? "" : "hidden"} id="pickbar"><span class="grow">${E.picked.size} selected</span><button class="btn sm primary" data-act="montage" ${E.picked.size > 1 ? "" : "disabled"}>▤ Make montage</button><button class="btn sm" data-act="longform" title="Long form from the ticked clips, in the order ticked">▬ Long form</button><button class="btn sm" data-act="pick-preset" title="Apply a preset to the ticked clips (posted ones are skipped)">★ Preset</button></div>
       ${sorted.length ? sorted.map((c) => `
         <div class="clip ${c.id === E.sel ? "sel" : ""}" data-act="select" data-id="${c.id}">
           <div class="row"><input type="checkbox" class="pick" data-id="${c.id}" title="Select for a montage" ${E.picked.has(c.id) ? "checked" : ""} ${c.parts ? "disabled" : ""}>
@@ -1751,9 +1806,10 @@ function Editor(pid) {
       <div class="sec">
         <input type="text" id="ctitle" value="${esc(c.title)}" style="font-weight:600">
         ${c.hook ? `<div class="row" style="font-size:12px"><span class="muted grow">Hook: “${esc(c.hook)}”</span><button class="btn xs" data-act="hook" title="Use the AI hook as an on-screen title">Use as title</button></div>` : ""}
+        <div class="preset-bar" id="ed-pre"></div>
         <div class="row"><a class="btn sm primary" href="#/studio/${c.id}" title="Tracking, effects, captions and AI for this clip on one page">✎ Edit clip in Studio</a><button class="btn xs" data-act="viral-clip">✦ Score virality</button>${c.viral ? `<button class="btn xs" data-act="report" data-id="${c.viral.report_id}"><span class="vbadge">✦ ${+c.viral.score}</span> view report</button>` : ""}</div>
       </div>
-      <div class="sec"><h3>Timing</h3>
+      <div class="sec" data-tool="timing"><h3>Timing</h3>
         <div class="time-in">
           ${["start", "end"].map((k) => `<label class="field">${k === "start" ? "Start" : "End"}<input type="text" class="mono" data-time="${k}" value="${fmt(c[k], 2)}">
             <div class="nudge"><button class="btn xs" data-act="nudge" data-v="${k},-1">-1s</button><button class="btn xs" data-act="nudge" data-v="${k},-0.1">-.1</button><button class="btn xs" data-act="nudge" data-v="${k},0.1">+.1</button><button class="btn xs" data-act="nudge" data-v="${k},1">+1s</button><button class="btn xs" data-act="toplay" data-v="${k}" title="Set to playhead">⇤▶</button></div></label>`).join("")}
@@ -1762,7 +1818,7 @@ function Editor(pid) {
         <label class="switch"><input type="checkbox" data-k="remove_fillers" ${e.remove_fillers ? "checked" : ""}> Cut filler words (“um”, “uh”)</label>
         <div class="muted" style="font-size:12px">Length ${(c.end - c.start).toFixed(1)}s · output ≈ ${((c.end - c.start) / e.speed).toFixed(1)}s${e.remove_silence ? " before jump cuts" : ""}</div>
       </div>
-      <div class="sec"><h3>Frame &amp; layout</h3>
+      <div class="sec" data-tool="frame"><h3>Frame &amp; layout</h3>
         ${seg("aspect", e.aspect, [["9:16", "9:16"], ["1:1", "1:1"], ["4:5", "4:5"], ["16:9", "16:9"], ["source", "Original"]])}
         ${reframed ? `${seg("layout", e.layout, LAYOUTS)}
           ${isMulti(e) && !legacySplit(e) ? `<div class="row wrap"><button class="btn sm" data-act="detect-regions">◎ Detect regions</button><a class="btn sm" href="#/studio/${c.id}">Arrange regions in Studio</a></div>` : ""}
@@ -1771,7 +1827,7 @@ function Editor(pid) {
           : e.layout === "single" ? `<div class="row wrap">${seg("fit", e.fit, [["crop", "Crop to fill"], ["blur", "Fit + blur"]])}<button class="btn sm" data-act="reframe" ${e.fit === "blur" ? "disabled" : ""}>◎ Auto-reframe on face</button></div>` : ""}` : ""}
         ${!reframed || e.fit !== "blur" || e.layout !== "single" ? slider("crop_x", "Framing ↔", 0, 1, 0.01, e.crop_x) + slider("crop_y", "Framing ↕", 0, 1, 0.01, e.crop_y) + slider("zoom", "Zoom", 1, 2.5, 0.05, e.zoom, "×") : ""}
       </div>
-      <div class="sec"><h3>Captions &amp; text</h3>
+      <div class="sec" data-tool="captions"><h3>Captions &amp; text</h3>
         <label class="switch"><input type="checkbox" data-k="captions" ${e.captions ? "checked" : ""}> Animated captions (word-by-word highlight)</label>
         ${seg("caption_style", e.caption_style, [["bold", "Bold"], ["clean", "Clean"], ["boxed", "Boxed"], ["neon", "Neon"]])}
         ${seg("caption_pos", e.caption_pos, [["low", "Low"], ["middle", e.layout === "split" ? "At seam" : "Middle"], ["high", "High"]])}
@@ -1781,19 +1837,19 @@ function Editor(pid) {
         <div class="two"><label class="field">Sticker / handle<input type="text" data-k="sticker_text" value="${esc(e.sticker_text)}" placeholder="@yourchannel"></label>
           <label class="field">Sticker spot<select data-k="sticker_pos">${["top-left", "top-center", "top-right", "bottom-left", "bottom-right"].map((p) => `<option ${p === e.sticker_pos ? "selected" : ""}>${p}</option>`).join("")}</select></label></div>
       </div>
-      <div class="sec"><h3>Text style</h3>
+      <div class="sec" data-tool="textstyle"><h3>Text style</h3>
         <div class="seg">${[["caption", "Captions"], ["title", "Title card"], ["sticker", "Sticker"], ["headline", "Headline"]].map(([v, l]) => `<button class="${(E.tsk || "caption") === v ? "on" : ""}" data-act="tsk" data-v="${v}">${l}</button>`).join("")}</div>
         ${E.tsk === "headline" ? `<div id="ed-hl" class="stack" style="gap:8px"></div><a class="btn xs ghost" href="#/studio/${c.id}">Theme gallery, timing &amp; more in Studio</a>
           <h3 style="margin-top:6px">Streamer card</h3><div id="ed-sc" class="stack" style="gap:8px"></div>` : ""}
         <div id="ed-ts" class="stack" style="gap:8px"></div>
       </div>
-      <div class="sec"><h3>Look</h3>
+      <div class="sec" data-tool="look"><h3>Look</h3>
         <div class="presets">${Object.keys(PRESETS).map((p) => `<button class="btn xs" data-act="preset" data-v="${p}">${p[0].toUpperCase() + p.slice(1)}</button>`).join("")}</div>
         ${slider("brightness", "Brightness", -0.3, 0.3, 0.01, e.brightness)}${slider("contrast", "Contrast", 0.6, 1.6, 0.01, e.contrast)}
         ${slider("saturation", "Saturation", 0, 2, 0.01, e.saturation)}${slider("gamma", "Gamma", 0.6, 1.6, 0.01, e.gamma)}
         <label class="switch"><input type="checkbox" data-k="sharpen" ${e.sharpen ? "checked" : ""}> Sharpen</label>
       </div>
-      <div class="sec"><h3>Audio</h3>
+      <div class="sec" data-tool="audio"><h3>Audio</h3>
         ${slider("volume", "Voice volume", 0, 3, 0.05, e.volume, "×")}
         <label class="switch"><input type="checkbox" data-k="loudnorm" ${e.loudnorm ? "checked" : ""}> Normalize loudness (−14 LUFS)</label>
         <label class="switch"><input type="checkbox" data-k="denoise" ${e.denoise ? "checked" : ""}> Reduce background noise</label>
@@ -1803,14 +1859,15 @@ function Editor(pid) {
         ${e.music ? `<label class="switch"><input type="checkbox" data-k="music_duck" ${e.music_duck !== false ? "checked" : ""}> Duck the music under the voice</label>` : ""}
         <div class="row wrap"><span class="muted" style="font-size:12.5px">Bleep swearing</span>${seg("bleep", e.bleep || "off", [["off", "Off"], ["beep", "Beep"], ["mute", "Mute"]])}</div>
       </div>
-      <div class="sec"><h3>Motion</h3>
+      <div class="sec" data-tool="motion"><h3>Motion</h3>
         ${slider("speed", "Speed", 0.5, 2, 0.05, e.speed, "×")}${slider("fade_in", "Fade in", 0, 3, 0.1, e.fade_in, "s")}${slider("fade_out", "Fade out", 0, 3, 0.1, e.fade_out, "s")}
       </div>
-      <div class="sec"><h3>Ask AI</h3>
+      <div class="sec" data-tool="ai"><h3>Ask AI</h3>
         <div class="ask"><textarea id="askq" placeholder="“Make it vertical and punchier, cut the first sentence, warmer colors”"></textarea>
           <div class="row"><span class="hint grow">Claude edits timing, framing, look, audio and text for you. <span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></span><button class="btn sm primary" data-act="ask">Apply</button></div></div>
       </div>
       <div class="actions" id="actions"></div>`;
+    presetBar($("#ed-pre", el), { clip: selClip, patchFn: editorPatch, after: (bulk) => (bulk ? reloadClips() : renderTab()), projectId: pid });
     el.oninput = (ev) => {
       const t = ev.target;
       if (t.type === "range") { t.nextElementSibling.textContent = (+t.value).toFixed(+t.step < 0.1 ? 2 : 1) + (t.nextElementSibling.textContent.match(/[×s]$/)?.[0] || ""); patchClip(c.id, { edit: { [t.dataset.k]: +t.value } }, 450); }
@@ -1882,9 +1939,11 @@ function openPublish(c, onDone, lf = null) { // lf: a long-form doc → a regula
   const all = Object.keys(PLATFORM).flatMap((p) => conn[p]?.accounts || []), ok = all.filter((a) => a.approved);
   const firstOf = Object.fromEntries(Object.keys(PLATFORM).map((p) => [p, ok.find((a) => a.platform === p && a.connected && !tooLong(a) && (!lf || p === "youtube"))?.id]));
   const waiting = all.length - ok.length;
+  const pd = c.publish_defaults || {}, pdAcc = (pd.accounts || []).filter((id) => ok.some((a) => a.id === id && !tooLong(a))); // a preset's publish defaults
+  const ticked = (a) => (pdAcc.length ? pdAcc.includes(a.id) : firstOf[a.platform] === a.id);
   modal(`<h2>${lf ? "Publish long form" : "Publish"}</h2>
     <div class="stack">
-      <div class="plats">${ok.length ? ok.map((a) => `<label title="${esc(tooLong(a)) || (a.connected ? "" : "Signed out: reconnect it on the Publish page, or it waits")}" ${tooLong(a) ? 'style="opacity:.45"' : ""}><input type="checkbox" class="pp" value="${esc(a.id)}" data-plat="${a.platform}" ${firstOf[a.platform] === a.id ? "checked" : ""} ${tooLong(a) ? "disabled" : ""}> ${platTag(a.platform)} ${esc(a.name || a.handle || PLATFORM[a.platform])} ${a.connected ? '<span style="color:var(--ok)">●</span>' : '<span class="dim">○</span>'}</label>`).join("")
+      <div class="plats">${ok.length ? ok.map((a) => `<label title="${esc(tooLong(a)) || (a.connected ? "" : "Signed out: reconnect it on the Publish page, or it waits")}" ${tooLong(a) ? 'style="opacity:.45"' : ""}><input type="checkbox" class="pp" value="${esc(a.id)}" data-plat="${a.platform}" ${ticked(a) ? "checked" : ""} ${tooLong(a) ? "disabled" : ""}> ${platTag(a.platform)} ${esc(a.name || a.handle || PLATFORM[a.platform])} ${a.connected ? '<span style="color:var(--ok)">●</span>' : '<span class="dim">○</span>'}</label>`).join("")
         : `<span class="dim" style="font-size:12.5px">No account is approved for uploads yet: link one and turn on “Approved for uploads” on the <a href="#/publish">Publish page</a>.</span>`}</div>
       ${waiting ? `<p class="dim" style="font-size:11.5px;margin:-4px 0 0">${waiting} linked account${waiting === 1 ? " isn't" : "s aren't"} listed: not approved for uploads yet (Publish page).</p>` : ""}
       <div class="row"><label class="field grow">Title (YouTube)<input type="text" id="pt" maxlength="100" value="${esc(c.title)}"></label>
@@ -1892,16 +1951,16 @@ function openPublish(c, onDone, lf = null) { // lf: a long-form doc → a regula
       <label class="field">Description (YouTube)<textarea id="pd" rows="4">${esc(c.hook || "")}${vertical ? "\n\n#Shorts" : ""}</textarea></label>
       <label class="field">Caption (TikTok &amp; Instagram)<textarea id="pc" rows="2">${esc(c.title)} ${esc(tags.slice(0, 5).map((t) => "#" + t.replace(/\s+/g, "")).join(" "))}</textarea></label>
       <label class="field">Tags (comma separated)<input type="text" id="ptags" value="${esc(tags.join(", "))}"></label>
-      <div class="row wrap"><label class="field grow">Category (YouTube)<select id="pcat">${Object.entries(CATEGORIES).map(([k, v]) => `<option value="${k}" ${k === "22" ? "selected" : ""}>${v}</option>`).join("")}</select></label>
-        <label class="field grow">Visibility<select id="ppriv">${["public", "unlisted", "private"].map((p) => `<option ${p === (S.settings?.default_privacy || "private") ? "selected" : ""}>${p}</option>`).join("")}</select></label></div>
+      <div class="row wrap"><label class="field grow">Category (YouTube)<select id="pcat">${Object.entries(CATEGORIES).map(([k, v]) => `<option value="${k}" ${k === (pd.category_id || "22") ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+        <label class="field grow">Visibility<select id="ppriv">${["public", "unlisted", "private"].map((p) => `<option ${p === (pd.privacy || S.settings?.default_privacy || "private") ? "selected" : ""}>${p}</option>`).join("")}</select></label></div>
       <div><h3 style="margin-bottom:8px">When</h3><div class="seg" id="pwhen">
         <button class="on" data-v="now">Post now</button><button data-v="publish_at">Schedule</button><button data-v="upload_at">Hold &amp; post later</button></div></div>
       <div class="row" id="ptime-l" hidden><label class="field grow">Date &amp; time<input type="datetime-local" id="ptime" value="${tomorrowAt9()}"></label>
         <button class="btn" id="pbest" style="align-self:flex-end" title="Best upcoming time for the first selected platform (your results → live research → defaults)">★ Best time</button></div>
       <p class="muted" id="pwhen-help" style="font-size:12px;margin:0"></p>
-      <label class="switch"><input type="checkbox" id="pkids"> Made for kids (YouTube)</label>
-      <label class="switch" title="YouTube: altered or synthetic content label. TikTok: AI-generated content label. Instagram's API has no such label: add it in the Instagram app if it applies."><input type="checkbox" id="paic" ${c.ai_media?.length || S.settings?.ai_disclosure === "always" ? "checked" : ""}> Contains AI-generated or altered realistic content <span class="dim">(YouTube &amp; TikTok label; not available for Instagram)</span></label>
-      <label class="switch"><input type="checkbox" id="ptpl" checked> Add each account's description template <span class="dim" id="ptpl-ex"></span></label>
+      <label class="switch"><input type="checkbox" id="pkids" ${pd.made_for_kids ? "checked" : ""}> Made for kids (YouTube)</label>
+      <label class="switch" title="YouTube: altered or synthetic content label. TikTok: AI-generated content label. Instagram's API has no such label: add it in the Instagram app if it applies."><input type="checkbox" id="paic" ${c.ai_media?.length || pd.ai_content || S.settings?.ai_disclosure === "always" ? "checked" : ""}> Contains AI-generated or altered realistic content <span class="dim">(YouTube &amp; TikTok label; not available for Instagram)</span></label>
+      <label class="switch"><input type="checkbox" id="ptpl" ${pd.template === false ? "" : "checked"}> Add each account's description template <span class="dim" id="ptpl-ex"></span></label>
       <div id="ptt" class="card stack" hidden style="padding:12px"></div>
       ${qaIssues.length ? `${qaList(qaIssues)}${qaWarn.length ? `<p class="dim" style="font-size:11.5px;margin:0">The check found something worth a look; you can still post it.</p>` : ""}` : ""}
     </div>
@@ -2178,6 +2237,194 @@ function pickAngleFile(pid, done) {
 const nleLinks = (base) => `<span class="nle-dl" title="Download the edit as a timeline for another editor: source file, in/out points, cuts, markers">Timeline:
   ${[["fcpxml", "FCPXML"], ["edl", "EDL"], ["srt", "SRT"]].map(([f, l]) => `<a class="btn xs ghost" href="${base}/nle/${f}" download>${l}</a>`).join("")}</span>`;
 
+// ---------- tool panels (static/panel.js): remembered per editor in localStorage, and in the store so a reinstall keeps them ----------
+const UIL = { saved: null };
+const uilReady = api("/api/ui-layout").then((d) => (UIL.saved = d || {})).catch(() => (UIL.saved = {}));
+const uilPersist = (ed, st) => api("/api/ui-layout", { method: "PUT", body: { [ed]: st } }).then((d) => (UIL.saved = d)).catch(() => {});
+const toolPanel = (ed, root, tools, extra = {}) => RWPanel.attach({ editor: ed, root, panel: $(".panel", root), body: $(".tab-body", root), tools,
+  saved: UIL.saved?.[ed], persist: uilPersist, ...extra });
+
+// ---------- presets: named bundles of the parts of a clip's look and settings (routes_presets.py) ----------
+const PRESET_PARTS = [["layout", "Layout & regions", "▦"], ["sections", "Section layouts", "▤"], ["frame", "Aspect & fit", "⬚"], ["captions", "Captions", "✎"],
+  ["headline", "Headline + theme", "▬"], ["card", "Streamer card", "◉"], ["title", "Title & sticker", "T"], ["look", "Colour, speed & fades", "◐"],
+  ["effects", "Effects & keyframes", "✦"], ["overlays", "Overlays, memes & SFX", "☺"], ["audio", "Music, volume, ducking, loudness", "♫"], ["bleep", "Bleep", "⊘"],
+  ["cuts", "Cut options (jump cuts, fillers)", "✂"], ["tracking", "Tracking & follow", "◎"], ["publish", "Publish defaults", "⇪"],
+  ["app", "App settings: clip lengths, count, AI for finding", "☰"]];
+const partName = (k) => (PRESET_PARTS.find(([p]) => p === k) || [, k])[1];
+const PR = { list: [], default: null };
+let prP = null;
+const loadPresets = (force = false) => { if (force) prP = null; return (prP ||= api("/api/presets").then((d) => Object.assign(PR, { list: d.presets, default: d.default })).catch(() => PR)); };
+const prDot = (p) => `<i class="preset-dot" style="background:${hexOr(p.color, "#5d6178")}"></i>`;
+const onOff = (v) => (v ? "on" : "off");
+function presetSummary(part, v, e = {}) { // a part's values in a few words: v = a preset's part, else read from the edit e
+  const g = (k) => (v ? v[k] : e[k]), n = (x, d = 2) => (+x || 0).toFixed(d), cnt = (k, w) => `${(g(k) || []).length} ${w}${(g(k) || []).length === 1 ? "" : "s"}`;
+  switch (part) {
+    case "layout": return `${(LAYOUTS.find(([k]) => k === g("layout")) || [, g("layout") || "Single"])[1]}${g("regions")?.length ? ` · ${g("regions").length} regions` : ""}`;
+    case "sections": return cnt("layout_segments", "section");
+    case "frame": return `${g("aspect") || "—"} · ${g("fit") === "blur" ? "fit + blur" : "crop"}${+g("zoom") > 1 ? ` · ${n(g("zoom"))}×` : ""}`;
+    case "captions": return `${onOff(g("captions"))} · ${g("caption_style") || "bold"} · ${g("caption_pos") || "low"} · ${g("caption_anim") || "highlight"}${g("caption_emphasis") ? " · emphasis" : ""}${g("caption_font") ? ` · ${g("caption_font")}` : ""}${g("caption_color") ? ` · ${g("caption_color")}` : ""}`;
+    case "headline": { const h = g("headline"); return h?.on ? `on · ${h.theme || "auto"} theme · ${h.position || "top"}` : "off"; }
+    case "card": { const s = g("streamer_card"); return s?.on ? `${s.style || "card"} · ${s.name || (s.handle ? "@" + s.handle : "name from the source")}` : "off"; }
+    case "title": return `${g("title_text") ? `“${String(g("title_text")).slice(0, 24)}”` : "no title"} · ${g("sticker_text") ? `sticker ${String(g("sticker_text")).slice(0, 18)} (${g("sticker_pos")})` : "no sticker"}`;
+    case "look": return `brightness ${n(g("brightness"))} · contrast ${n(g("contrast"))} · saturation ${n(g("saturation"))} · speed ${n(g("speed"))}×`;
+    case "effects": return cnt("effects", "effect");
+    case "overlays": return cnt("overlays", "item");
+    case "audio": return `voice ${n(g("volume"))}× · ${g("music") ? `music at ${n(g("music_volume"))}${g("music_duck") !== false ? ", ducked" : ""}` : "no music"} · loudness ${onOff(g("loudnorm"))}`;
+    case "bleep": return g("bleep") || "off";
+    case "cuts": return `jump cuts ${onOff(g("remove_silence"))} · fillers ${onOff(g("remove_fillers"))}`;
+    case "tracking": return `follow ${onOff(g("follow"))}${g("framing") ? ` · headroom ${n(g("framing").offset_y || 0)}` : ""}`;
+    case "publish": return v ? `${v.privacy || "visibility as set"}${v.accounts?.length ? ` · ${v.accounts.length} account${v.accounts.length === 1 ? "" : "s"}` : ""}${v.ai_content ? " · AI label" : ""}${v.template === false ? " · no template" : ""}` : "";
+    case "app": return v ? `clips ${v.clip_min}–${v.clip_max} s (target ${+v.clip_target || "auto"}) · ${v.clip_count} per scan${v.ai_routes?.find ? ` · find with ${v.ai_routes.find}` : ""}` : "";
+  }
+  return "";
+}
+const presetPreview = (p) => `<ul class="list" style="margin:4px 0 0;font-size:12px">${Object.entries(p.parts).map(([k, v]) => `<li><b>${esc(partName(k))}</b> <span class="dim">${esc(presetSummary(k, v))}</span></li>`).join("")}</ul>`;
+
+// Save parts of this clip (the server's copy: flush pending edits first) as a preset.
+function openSavePreset(clip, done) {
+  const e = { ...clip.edit }, s = S.settings || {}, pd = clip.publish_defaults || {};
+  const approved = Object.keys(PLATFORM).flatMap((p) => S.conn?.[p]?.accounts || []).filter((a) => a.approved);
+  const has = (k) => (k === "sections" ? (e.layout_segments || []).length : ["effects", "overlays"].includes(k) ? (e[k] || []).length : true);
+  const app = s.clip_min != null ? { clip_min: s.clip_min, clip_target: s.clip_target, clip_max: s.clip_max, clip_count: s.clip_count, ai_routes: s.ai_routes } : null;
+  const sum = (k) => (k === "publish" ? "visibility, accounts, AI label, template (below)" : k === "app" ? presetSummary("app", app) : presetSummary(k, null, e)) || "";
+  modal(`<h2>Save as preset</h2><p class="muted" style="margin-top:-4px;font-size:12.5px">Tick what this preset keeps. Applying it later changes only those parts of a clip.</p>
+    <div class="row wrap" style="align-items:flex-end"><label class="field grow">Name<input type="text" id="pr-name" maxlength="60" value="${esc(`${clip.title || "My"} look`.slice(0, 60))}"></label>
+      <label class="field">Colour<input type="color" id="pr-color" value="#ff6a3d"></label><label class="field">Icon<input type="text" id="pr-icon" maxlength="4" style="width:64px" placeholder="🔥"></label></div>
+    <div class="row" style="margin:10px 0 6px;font-size:12px"><span class="muted grow">Parts</span><button class="btn xs ghost" data-pr="all">All</button><button class="btn xs ghost" data-pr="none">None</button></div>
+    <div class="preset-parts">${PRESET_PARTS.map(([k, l, i]) => `<label class="preset-part"${has(k) ? "" : ' style="opacity:.5" title="This clip has none"'}><input type="checkbox" data-part="${k}" ${["layout", "frame", "captions"].includes(k) ? "checked" : ""} ${has(k) ? "" : "disabled"}>
+      <span>${i} <b>${esc(l)}</b><small>${esc(sum(k))}</small></span></label>`).join("")}</div>
+    <div id="pr-pub" class="card stack" hidden style="padding:10px;margin-top:8px;gap:8px"><b style="font-size:12.5px">Publish defaults</b>
+      <label class="field">Visibility<select id="pr-priv">${["public", "unlisted", "private"].map((v) => `<option ${v === (pd.privacy || s.default_privacy || "private") ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+      ${approved.length ? `<div class="plats">${approved.map((a) => `<label><input type="checkbox" class="pr-acc" value="${esc(a.id)}" ${pd.accounts?.includes(a.id) ? "checked" : ""}> ${platTag(a.platform)} ${esc(a.name || a.handle || "")}</label>`).join("")}</div>`
+        : `<span class="dim" style="font-size:12px">No account is approved for uploads yet (Publish page).</span>`}
+      <label class="switch"><input type="checkbox" id="pr-ai" ${pd.ai_content ? "checked" : ""}> Label as AI-generated or altered content</label>
+      <label class="switch"><input type="checkbox" id="pr-tpl" ${pd.template !== false ? "checked" : ""}> Add each account's description template</label></div>
+    <label class="switch" style="margin-top:10px"><input type="checkbox" id="pr-def"> Use for new clips <span class="dim">(manual, AI and Autopilot)</span></label>
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="pr-go">Save preset</button></div>`, (m, close) => {
+    const pub = () => { $("#pr-pub", m).hidden = !$('[data-part="publish"]', m).checked; };
+    m.addEventListener("change", pub);
+    m.addEventListener("click", (ev) => { const b = ev.target.closest("[data-pr]"); if (b) { $$("[data-part]:not(:disabled)", m).forEach((x) => (x.checked = b.dataset.pr === "all")); pub(); } });
+    $("#pr-name", m).focus(); $("#pr-name", m).select();
+    $("#pr-go", m).onclick = async () => {
+      const parts = $$("[data-part]", m).filter((x) => x.checked).map((x) => x.dataset.part);
+      const body = { name: $("#pr-name", m).value.trim(), clip_id: clip.id, parts, color: $("#pr-color", m).value, icon: $("#pr-icon", m).value.trim(),
+        publish: { privacy: $("#pr-priv", m).value, accounts: $$(".pr-acc", m).filter((x) => x.checked).map((x) => x.value), ai_content: $("#pr-ai", m).checked, template: $("#pr-tpl", m).checked } };
+      if (!body.name) return toast("Name the preset.", "err");
+      if (!parts.length) return toast("Tick at least one part to keep.", "err");
+      try {
+        const p = await api("/api/presets", { body });
+        if ($("#pr-def", m).checked) await api("/api/presets/default", { method: "PUT", body: { preset_id: p.id } });
+        close(); await loadPresets(true);
+        toast(`Saved “${p.name}”: ${Object.keys(p.parts).map(partName).join(", ")}.`, "ok");
+        done?.(p);
+      } catch (err) { fail(err); }
+    };
+  }, true);
+}
+
+// Apply a preset to one clip through the editor's own PATCH (patchFn): undo records it and a posted clip refuses it.
+async function applyPreset(id, clip, patchFn) {
+  const p = PR.list.find((x) => x.id === id), r = await api(`/api/presets/${encodeURIComponent(id)}/edit?clip_id=${encodeURIComponent(clip.id)}`);
+  if (Object.keys(r.edit).length) await patchFn({ edit: r.edit });
+  const extra = ["publish", "app"].filter((k) => r[k]);
+  if (extra.length) {
+    await api(`/api/presets/${encodeURIComponent(id)}/apply`, { body: { clip_ids: [clip.id], parts: extra } });
+    if (r.publish) clip.publish_defaults = r.publish;
+    if (r.app) S.settings = await api("/api/settings");
+  }
+  toast(`Preset “${p?.name || "preset"}” applied${extra.includes("app") ? " (app settings too)" : ""}. Ctrl+Z undoes the edit.`, "ok");
+}
+async function bulkPreset(id, target, done) { // target {clip_ids} | {project_id}: posted and expired clips and montages are skipped
+  const p = PR.list.find((x) => x.id === id);
+  const n = target.clip_ids ? `${target.clip_ids.length} selected clip${target.clip_ids.length === 1 ? "" : "s"}` : "every clip in this project";
+  if (!(await confirmBox(`Apply “${p?.name || "preset"}” to ${n}?`, `Only its parts change (${Object.keys(p?.parts || {}).map(partName).join(", ")}). Posted, expired clips and montages are skipped. This can't be undone with Ctrl+Z.`, "Apply"))) return;
+  const r = await api(`/api/presets/${encodeURIComponent(id)}/apply`, { body: target });
+  toast(`Applied to ${r.updated} clip${r.updated === 1 ? "" : "s"}${r.skipped.length ? ` · ${r.skipped.length} skipped (posted, expired or montages)` : ""}.`, "ok");
+  done?.();
+}
+// The picker beside an editor's title: apply to this clip, to the whole project, save, manage. clip() = the current clip.
+function presetBar(el, { clip, patchFn, after, projectId }) {
+  const draw = () => {
+    el.innerHTML = `<select class="preset-pick" aria-label="Apply a preset (P)" title="Apply a preset to this clip (P)"><option value="">★ Presets…</option>
+      ${PR.list.map((p) => `<option value="${esc(p.id)}">${p.fav ? "★ " : ""}${p.icon ? esc(p.icon) + " " : ""}${esc(p.name)}${p.id === PR.default ? " · new clips" : ""}</option>`).join("")}
+      ${projectId && PR.list.length ? `<optgroup label="Apply to every clip in this project">${PR.list.map((p) => `<option value="all:${esc(p.id)}">${esc(p.name)} → whole project</option>`).join("")}</optgroup>` : ""}
+      <option value="__manage">Manage presets…</option></select><button class="btn sm" data-preset-save title="Keep parts of this clip's look and settings as a preset">＋ Save as preset</button>`;
+  };
+  draw(); loadPresets().then(draw);
+  el.onchange = async (ev) => {
+    const v = ev.target.value; ev.target.value = ""; ev.stopPropagation();
+    if (!v) return;
+    if (v === "__manage") { location.hash = "#/settings"; setTimeout(() => $("#presets-card")?.scrollIntoView({ block: "start" }), 400); return; }
+    try {
+      if (v.startsWith("all:")) await bulkPreset(v.slice(4), { project_id: projectId }, () => after?.(true));
+      else { await applyPreset(v, clip(), patchFn); after?.(false); }
+    } catch (err) { fail(err); }
+  };
+  el.onclick = (ev) => { if (ev.target.closest("[data-preset-save]")) { ev.stopPropagation(); return el.onsave ? el.onsave() : openSavePreset(clip(), () => draw()); } };
+  return { draw };
+}
+// P: a quick list of the first nine presets; a digit or a click applies one.
+function openPresetQuick(clip, patchFn, after, onPick) { // onPick(id): instead of applying to clip() (e.g. to the ticked clips)
+  loadPresets().then(() => {
+    if (!PR.list.length) return toast("No presets yet: “＋ Save as preset” keeps parts of this clip's look.");
+    modal(`<h2>Apply a preset</h2><div class="stack preset-quick" style="gap:4px">${PR.list.slice(0, 9).map((p, i) => `<button class="btn" data-qp="${esc(p.id)}"><span class="kbd">${i + 1}</span>${prDot(p)}${p.icon ? esc(p.icon) : ""}
+        <b class="grow">${esc(p.name)}</b><span class="dim" style="font-size:11.5px;font-weight:400">${esc(Object.keys(p.parts).map(partName).join(", ").slice(0, 70))}</span></button>`).join("")}</div>
+      <p class="dim" style="font-size:12px">Press 1–9 or click. Only the preset's parts change; Ctrl+Z undoes it.</p><div class="foot"><button class="btn" data-close>Cancel</button></div>`, (m, close) => {
+      const go = async (id) => { close(); try { if (onPick) await onPick(id); else { await applyPreset(id, clip(), patchFn); after?.(); } } catch (e) { fail(e); } };
+      m.addEventListener("click", (ev) => { const b = ev.target.closest("[data-qp]"); if (b) go(b.dataset.qp); });
+      m.addEventListener("keydown", (ev) => { const p = /^[1-9]$/.test(ev.key) && PR.list[+ev.key - 1]; if (p) { ev.preventDefault(); go(p.id); } else if (ev.key === "Escape") close(); });
+      $("button", m)?.focus();
+    });
+  });
+}
+const apPresetOpts = (sel) => `<option value="">None: Autopilot's own look</option>${PR.list.map((p) => `<option value="${esc(p.id)}" ${p.id === sel ? "selected" : ""}>${esc(p.name)}</option>`).join("")}`;
+loadPresets().then(() => $$("#ap-preset").forEach((x) => (x.innerHTML = apPresetOpts(x.value || x.dataset.v)))); // Autopilot forms drawn before the list came
+// Settings › Presets: rename, duplicate, delete, reorder, favourite, default for new clips, export / import, preview.
+function presetsCard() { return `<div class="card stack" style="margin-top:20px" id="presets-card"><span class="dim">Loading presets…</span></div>`; }
+async function drawPresetsCard() {
+  const el = $("#presets-card");
+  if (!el) return;
+  await loadPresets(true);
+  el.innerHTML = `<div class="row wrap"><h2 class="grow" style="margin:0">Presets</h2><label class="btn sm" title="A .rwpreset.json file exported from Reelwright">Import…<input type="file" id="pr-imp" accept=".json,application/json" hidden></label></div>
+    <p class="muted" style="font-size:12.5px;margin:-4px 0 0">Saved from a clip with “＋ Save as preset” in the Studio or the Editor. Press <span class="kbd">P</span> there to apply one.</p>
+    ${PR.list.length ? `<div class="stack" style="gap:6px">${PR.list.map((p, i) => `<div class="preset-row" data-pid="${esc(p.id)}">
+      <button class="btn xs ghost" data-pa="fav" title="${p.fav ? "Unfavourite" : "Favourite (listed first)"}" aria-pressed="${!!p.fav}">${p.fav ? "★" : "☆"}</button>${prDot(p)}${p.icon ? esc(p.icon) : ""}
+      <input type="text" value="${esc(p.name)}" maxlength="60" data-pa="name" aria-label="Preset name" style="flex:1;min-width:140px">
+      <label class="switch" title="New clips (manual, AI and Autopilot) start with this preset"><input type="radio" name="pr-default" data-pa="default" ${p.id === PR.default ? "checked" : ""}> New clips</label>
+      <button class="btn xs ghost" data-pa="up" ${i ? "" : "disabled"} aria-label="Move up">↑</button><button class="btn xs ghost" data-pa="down" ${i < PR.list.length - 1 ? "" : "disabled"} aria-label="Move down">↓</button>
+      <button class="btn xs" data-pa="dup">Duplicate</button><a class="btn xs" href="/api/presets/${encodeURIComponent(p.id)}/export" download>Export</a><button class="btn xs danger" data-pa="del">Delete</button>
+      <details style="flex-basis:100%"><summary class="dim" style="font-size:12px;cursor:pointer">${Object.keys(p.parts).length} part${Object.keys(p.parts).length === 1 ? "" : "s"}: ${esc(Object.keys(p.parts).map(partName).join(", "))}</summary>${presetPreview(p)}</details></div>`).join("")}</div>
+      ${PR.default ? `<button class="btn xs ghost" data-pa="nodefault" style="align-self:flex-start">New clips: stop using a preset</button>` : ""}`
+      : `<div class="dim" style="font-size:12.5px">No presets yet.</div>`}`;
+  const one = (t) => t.closest("[data-pid]")?.dataset.pid;
+  const run = async (f) => { try { await f(); } catch (err) { fail(err); } drawPresetsCard(); };
+  el.onchange = (ev) => {
+    const t = ev.target, id = one(t);
+    if (t.id === "pr-imp" && t.files[0]) return run(async () => {
+      const f = t.files[0];
+      if (f.size > 512000) throw new Error("That file is too big to be a preset.");
+      let data; try { data = JSON.parse(await f.text()); } catch { throw new Error("That file isn't a Reelwright preset (not JSON)."); }
+      const p = await api("/api/presets/import", { body: data }); toast(`Imported “${p.name}”.`, "ok");
+    });
+    if (t.dataset.pa === "name" && id) return run(() => api(`/api/presets/${id}`, { method: "PATCH", body: { name: t.value } }));
+    if (t.dataset.pa === "default" && id) return run(() => api("/api/presets/default", { method: "PUT", body: { preset_id: id } }));
+  };
+  el.onclick = (ev) => {
+    const b = ev.target.closest("button[data-pa]"), id = b && one(b);
+    if (!b) return;
+    const a = b.dataset.pa, ids = PR.list.map((p) => p.id), i = ids.indexOf(id);
+    if (a === "fav") run(() => api(`/api/presets/${id}`, { method: "PATCH", body: { fav: !PR.list[i].fav } }));
+    else if (a === "dup") run(() => api(`/api/presets/${id}/duplicate`, { method: "POST" }));
+    else if (a === "up" || a === "down") { const j = i + (a === "up" ? -1 : 1); [ids[i], ids[j]] = [ids[j], ids[i]]; run(() => api("/api/presets/order", { method: "PUT", body: { ids } })); }
+    else if (a === "nodefault") run(() => api("/api/presets/default", { method: "PUT", body: { preset_id: null } }));
+    else if (a === "del") confirmBox(`Delete “${PR.list[i].name}”?`, "Clips that used it keep their look.").then((ok) => ok && run(() => api(`/api/presets/${id}`, { method: "DELETE" })));
+  };
+}
+
+const STUDIO_TOOLS = [{ id: "layout", icon: "▦", label: "Layout" }, { id: "angles", icon: "◫", label: "Camera angles" }, { id: "framing", icon: "⬚", label: "Framing" },
+  { id: "tracking", icon: "◎", label: "Tracking" }, { id: "cuts", icon: "✂", label: "Cuts" }, { id: "captions", icon: "✎", label: "Captions" },
+  { id: "headline", icon: "▬", label: "Headline" }, { id: "card", icon: "◉", label: "Streamer card" }, { id: "effects", icon: "✦", label: "Effects & overlays" },
+  { id: "library", icon: "☺", label: "Media library (memes, SFX, music)" }, { id: "media", icon: "⌕", label: "Online media & kits" }, { id: "ai", icon: "✧", label: "AI director" }]; // render, QA & publish stay pinned below
 function Studio(cid) {
   const T = { proj: null, clip: null, tx: [], words: [], points: [], manual: [], job: null, mode: localStorage.studioMode || "source", drag: null, tdrag: null, range: [0, 1], wi: -1, tmode: "auto", target: null, pick: null, box: null,
     ovs: [], osel: null, assets: null, akind: "", aq: "", plan: null, picked: new Set(), sounds: new Map(), prevRel: null, rz: null, odrag: null, win: null,
@@ -2211,8 +2458,8 @@ function Studio(cid) {
     localStorage.lastClip = cid; $("#nav-studio").hidden = false;
     T.srv = structuredClone(T.clip); // the clip as the server has it: what undo goes back to
     $("#nav-editor").hidden = false;
-    const [tr, track, assets] = await Promise.all([
-      transcriptOf(T.proj.id),
+    const [tr, , , track, assets] = await Promise.all([
+      transcriptOf(T.proj.id), uilReady, loadPresets(),
       api(`/api/clips/${cid}/track`).catch(() => null), // backend may not have tracking yet: fall back to the clip's stored track
       api("/api/assets").catch(() => null),
     ]);
@@ -2228,7 +2475,7 @@ function Studio(cid) {
     layout();
   };
   this.destroy = () => {
-    T.dead = true; cancelAnimationFrame(raf); document.removeEventListener("keydown", keyHandler); video?.pause();
+    T.dead = true; cancelAnimationFrame(raf); T.pokeAC?.abort(); document.removeEventListener("keydown", keyHandler); video?.pause(); T.tp?.destroy();
     if (wordTimer) { clearTimeout(wordTimer); saveWords(); } // don't lose a caption edit still waiting on its debounce
     if (T.ovTimer) { clearTimeout(T.ovTimer); patch({ edit: { overlays: T.ovs } }).catch(fail); }
     if (T.frTimer) { clearTimeout(T.frTimer); saveFraming(); }
@@ -2296,8 +2543,18 @@ function Studio(cid) {
     const body = redo ? T.hist.redo(cid) : T.hist.undo(cid);
     if (!body) return toast(redo ? "Nothing to redo." : "Nothing to undo.");
     try { await patch(body, false); } catch (e) { T.hist.clear(); return fail(e); }
+    refreshAll();
+  }
+  function refreshAll() { // after an edit that changed many keys at once (undo/redo, a preset)
     T.ovs = structuredClone(c().edit.overlays || []); T.osel = null; T.csel = null; T.fx = structuredClone(c().edit.effects || []); T.sel = new Set(); loadKeeps();
-    setTrack(c().edit.track || {}); loadWords(); renderPanel(); buildFx();
+    T.regs = null; T.rsel = null; T.tlSig = null;
+    setTrack(c().edit.track || {}); loadWords(); renderPanel(); buildFx(); hint();
+  }
+  const presetPatch = async (body) => { await flushPending(); return patch(body); }; // a preset is one undo step
+  async function reloadClip() { // a preset applied to the whole project changed this clip on the server
+    const p = await projectOfClip(cid), k = p?.clips.find((x) => x.id === cid);
+    if (!k || T.dead) return;
+    T.proj = p; T.clip = k; T.srv = structuredClone(k); T.hist.clear(); refreshAll();
   }
 
   // ----- layout -----
@@ -2309,6 +2566,7 @@ function Studio(cid) {
         <div class="title" id="st-name" title="${esc(c().title)}">${esc(c().title)}</div>
         <span class="muted mono" id="st-span"></span>${keepBtn("clip", cid, c().keep)}${dueChip(c().due)}
         <div class="grow"></div>
+        <div class="preset-bar" id="st-pre"></div>
         <div class="seg" id="st-mode">${[["source", "Source view"], ["output", "Output view"]].map(([v, l]) => `<button data-act="mode" data-v="${v}" class="${T.mode === v ? "on" : ""}">${l}</button>`).join("")}</div>
         <button class="btn sm" data-act="safe" id="st-safe-btn" title="Output view: shade where each app's own buttons and captions cover the frame">Safe zones: ${SAFE_NAMES[T.safe] || "off"}</button>
       </div>
@@ -2356,8 +2614,14 @@ function Studio(cid) {
     bindBoxes(ov, () => (!multiOn() || T.tmode === "target" ? null : T.mode === "source" ? regs() : layE().layout === "free" ? freeOuts() : null),
       (i, b) => (T.mode === "source" ? Object.assign(regs()[i], b) : (regs()[i].out = b)));
     view.onclick = onClick; view.oninput = onInput; view.onchange = onChange;
+    T.pb = presetBar($("#st-pre"), { clip: c, patchFn: presetPatch, after: (bulk) => (bulk ? reloadClip() : refreshAll()), projectId: pid() });
+    $("#st-pre").onsave = async () => { try { await flushPending(); } catch (e) { return fail(e); } openSavePreset(c(), () => T.pb.draw()); };
+    T.tp?.destroy();
+    T.tp = toolPanel("studio", $(".studio"), STUDIO_TOOLS);
     keyHandler = (e) => {
-      if (e.target.closest?.("input, textarea, select") || $("#modal-root").innerHTML || $("#tl-menu")) return;
+      if (e.target.closest?.("input, textarea, select") || $("#modal-root").innerHTML || $("#tl-menu") || $(".tp-modal-back")) return;
+      if (T.tp?.key(e)) return;
+      if (e.key.toLowerCase() === "p" && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); return openPresetQuick(c, presetPatch, refreshAll); }
       if (tlKey(e)) { e.preventDefault(); return; }
       const z = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase();
       if (z === "z" || z === "y") { e.preventDefault(); undoRedo(z === "y" || e.shiftKey); }
@@ -2375,8 +2639,17 @@ function Studio(cid) {
     document.addEventListener("keydown", keyHandler);
     renderPanel(); buildFx(); setMode(T.mode); applyLock(); applyTrackPrefs();
     cancelAnimationFrame(raf);
-    const loop = () => { frame(); raf = requestAnimationFrame(loop); }; // ponytail: redraws every frame; cheap at this size
-    loop();
+    // frame() (DOM reads, style writes, the timeline signature) runs every frame only while something can change: playing,
+    // or within 0.5 s of any input / resize / video event. Paused and idle it still ticks 4x a second, so a late async load
+    // (sprite, waveform, words) still shows up. ponytail: a heartbeat, not a dirty flag in every one of the state setters.
+    T.pokeAC?.abort(); T.pokeAC = new AbortController();
+    let hot = 0, last = 0;
+    const poke = () => { hot = performance.now() + 500; }, sig = { signal: T.pokeAC.signal };
+    ["pointerdown", "pointermove", "pointerup", "keydown", "keyup", "wheel", "input", "change", "resize"]
+      .forEach((ev) => window.addEventListener(ev, poke, { capture: true, passive: true, ...sig }));
+    ["play", "pause", "seeking", "seeked", "timeupdate", "loadeddata", "ratechange"].forEach((ev) => video.addEventListener(ev, poke, sig));
+    const loop = (now) => { if (!video.paused || now < hot || now - last > 250) { last = now; frame(); } raf = requestAnimationFrame(loop); };
+    poke(); loop(performance.now());
   }
 
   function setMode(m) {
@@ -2590,7 +2863,7 @@ function Studio(cid) {
     (e.cuts || []).forEach(([a, b], i) => out.push({ key: `cuts:${i}`, track: "cuts", t: a - st, d: b - a, label: "✂ cut", i }));
     T.autoCuts.forEach(([a, b], i) => out.push({ key: `cuts:a${i}`, track: "cuts", t: a - st, d: b - a, label: "auto", ro: true }));
     const [OW, OH] = outSize();
-    chunkWords(T.words, OH > OW).forEach((ch, i) => out.push({ key: `captions:${i}`, track: "captions", t: ch[0].s - st, d: Math.max(ch.at(-1).e - ch[0].s, 0.05), label: ch.map((w) => w.w).join(" "), ro: true, seek: true }));
+    chunkWords(T.words, OH > OW).forEach((ch, i) => out.push({ key: `captions:${i}`, track: "captions", t: ch[0].s - st, d: Math.max(ch.at(-1).e - ch[0].s, 0.05), label: ch.map((w) => w.w).join(" "), ws: ch, ro: true, seek: true }));
     const hs = hlSpec(e), sp = +e.speed || 1, card = e.streamer_card; // headline track: read-only views of the Headline / card sections
     if (hs) out.push({ key: "titles:hl", track: "titles", t: 0, d: hs.show === "whole" ? L : Math.min(L, +hs.seconds * sp), label: `Headline: ${hs.text || ""}`, ro: true, jump: "#st-hl-ed" });
     if (card && card.on) out.push({ key: "titles:card", track: "titles", t: 0, d: card.show === "whole" || !card.seconds ? L : Math.min(L, +card.seconds * sp), label: `Streamer card: ${card.name || card.handle || ""}`, ro: true, jump: "#st-hl-ed" });
@@ -2655,7 +2928,12 @@ function Studio(cid) {
         if (hov) { g.strokeStyle = "#ffffffcc"; g.lineWidth = 1.5; g.beginPath(); g.roundRect(X + 0.75, Y + 0.75, w - 1.5, h - 1.5, 3); g.stroke(); g.lineWidth = 1; }
         if (it.ro && it.track === "cuts") { g.strokeStyle = "#ff5a6a"; g.setLineDash([3, 3]); g.strokeRect(X + 0.5, Y + 0.5, w - 1, h - 1); g.setLineDash([]); }
         g.globalAlpha = TP.hidden[r.id] ? 0.5 : 1; // labels stay readable on read-only / hidden rows
-        if (w > 18 && h > 9) { const s2 = fitText(g, it.label, w - 8); if (s2) { g.fillStyle = sel ? "#1b0b04" : "#f4f5fa"; g.fillText(s2, X + 4, Y + h / 2 + 1); } }
+        if (it.ws && h > 7) { // captions: the actual words - on their spoken time when there's room, else shrunk / cut / first letter
+          const parts = TLM.captionText(it.ws, X, X + w, tx, (s, z) => { g.font = `600 ${z}px Inter, sans-serif`; return g.measureText(s).width; }, fs, Math.max(7, fs * 0.7));
+          g.save(); g.beginPath(); g.rect(X, Y, w, h); g.clip(); g.fillStyle = sel ? "#1b0b04" : "#f4f5fa";
+          for (const p of parts) { g.font = `600 ${p.size}px Inter, sans-serif`; g.fillText(p.text, p.x, Y + h / 2 + 1); }
+          g.restore(); g.font = `600 ${fs}px Inter, sans-serif`;
+        } else if (w > 18 && h > 9) { const s2 = fitText(g, it.label, w - 8); if (s2) { g.fillStyle = sel ? "#1b0b04" : "#f4f5fa"; g.fillText(s2, X + 4, Y + h / 2 + 1); } }
         if (it.f?.keys) for (const kf of it.f.keys) { const KX = tx(k.start + it.t + kf[0]); g.fillStyle = "#fff"; g.beginPath(); g.moveTo(KX, Y + h - 6); g.lineTo(KX + 3, Y + h - 3); g.lineTo(KX, Y + h); g.lineTo(KX - 3, Y + h - 3); g.fill(); }
         if (!it.ro && !tlLocked(it.track) && w > 10) { g.fillStyle = "#0006"; g.fillRect(X + w - 3, Y + 3, 2, h - 6); }
         g.globalAlpha = 1;
@@ -2833,8 +3111,8 @@ function Studio(cid) {
     };
     tl.addEventListener("pointerup", up); tl.addEventListener("pointercancel", up);
     tl.addEventListener("dblclick", (ev) => { const [x, y] = localXY(ev, tl), h = hitItem(x, y); if (h.it?.o) { T.osel = h.it.o.id; renderOvInspector(); $("#st-ovi")?.scrollIntoView({ block: "center", behavior: "smooth" }); } });
-    tl.addEventListener("mousemove", (ev) => tlTip($("#st-tip"), localXY(ev, $("#st-tl"))[0], tAt(localXY(ev, tl)[0]), pid(), T.proj));
-    tl.addEventListener("mouseleave", () => { $("#st-tip").hidden = true; T.hover = null; });
+    tl.addEventListener("mousemove", (ev) => tlTip($("#st-tip"), () => [localXY(ev, $("#st-tl"))[0], tAt(localXY(ev, tl)[0])], pid(), T.proj));
+    tl.addEventListener("mouseleave", () => { tlTipHide($("#st-tip")); T.hover = null; });
     const wheel = (ev) => {
       const [a, b] = T.range, span = b - a, el = ev.currentTarget;
       if (ev.ctrlKey || ev.metaKey) { ev.preventDefault(); const tc = tAt(localXY(ev, el)[0]), ns = span * (ev.deltaY < 0 ? 0.8 : 1.25); setView(tc - ((tc - a) / span) * ns, ns); }
@@ -3129,7 +3407,8 @@ function Studio(cid) {
       ["Home / End", "Clip start / end"], ["S", "Split at the playhead (selected items, else the video)"], ["Delete", "Delete the selection (a video piece is ripple-deleted; a cut is restored)"],
       ["Shift+Delete", "Ripple-delete the In–Out range"], ["I / O / X", "Mark in / mark out / clear marks"], ["M", "Add a marker"], ["N", "Snapping on / off (hold Alt while dragging to skip it)"],
       ["Ctrl+C / Ctrl+V / Ctrl+D", "Copy / paste at the playhead / duplicate"], ["Ctrl+A", "Select every editable item"], ["Esc", "Clear the selection"],
-      ["= / -  ·  Ctrl+wheel", "Zoom the timeline (down to single frames)"], ["\\", "Fit the clip"], ["Shift+wheel", "Scroll sideways"], ["0–6", "Cut to a camera angle"], ["Ctrl+Z / Ctrl+Y", "Undo / redo"], ["?", "This list"]];
+      ["= / -  ·  Ctrl+wheel", "Zoom the timeline (down to single frames)"], ["\\", "Fit the clip"], ["Shift+wheel", "Scroll sideways"], ["0–6", "Cut to a camera angle"], ["Ctrl+Z / Ctrl+Y", "Undo / redo"], ["P", "Apply a preset (then 1–9)"],
+      ["Ctrl+\\", "Collapse / expand the tool panel (its icons jump to a tool)"], ["?", "This list"]];
     modal(`<h2>Timeline shortcuts</h2><table class="tl-help"><tbody>${K.map(([k2, v]) => `<tr><td><span class="kbd">${esc(k2)}</span></td><td>${esc(v)}</td></tr>`).join("")}</tbody></table>
       <p class="muted" style="font-size:12px">Drag items to move them, their edges to trim them; drag on an empty part of a row to select several. Right-click a row (or its ⋯) for its menu.
       Hide and mute only change this preview: the render always includes every layer, so delete an item to drop it from the video.</p><div class="foot"><button class="btn" data-close>Close</button></div>`);
@@ -3493,20 +3772,20 @@ function Studio(cid) {
       <div class="sec"><input type="text" id="st-title" value="${esc(k.title)}" style="font-weight:600">
         <div class="muted" style="font-size:12px">Output ${esc(e.aspect === "source" ? "original frame" : e.aspect)}${e.fit === "blur" && e.layout === "single" && e.aspect !== "source" ? " · fit + blur (preview shows the crop)" : ""}</div></div>
       <div class="sec tl-sel" id="st-sel" aria-live="polite"></div>
-      <div class="sec" id="st-layout"></div>
-      <div class="sec" id="st-angles"></div>
-      <div class="sec"><h3>Framing</h3>
+      <div class="sec" id="st-layout" data-tool="layout"></div>
+      <div class="sec" id="st-angles" data-tool="angles"></div>
+      <div class="sec" data-tool="framing"><h3>Framing</h3>
         <label class="slider"><span>Headroom</span><input type="range" data-fr="offset_y" min="-0.4" max="0.4" step="0.01" value="${+(e.framing?.offset_y || 0)}"><output>${(+(e.framing?.offset_y || 0)).toFixed(2)}</output></label>
         <label class="slider"><span>Zoom</span><input type="range" data-fr="zoom" min="1" max="4" step="0.05" value="${baseZ()}"><output>${baseZ().toFixed(2)}×</output></label>
         <div class="muted" style="font-size:12px">Drag a corner of the frame (Source view) to zoom at that moment.</div></div>
-      <div class="sec" id="st-track"></div>
-      <div class="sec"><h3>Cuts</h3>
+      <div class="sec" id="st-track" data-tool="tracking"></div>
+      <div class="sec" data-tool="cuts"><h3>Cuts</h3>
         <label class="switch"><input type="checkbox" data-k="remove_silence" ${e.remove_silence ? "checked" : ""}> AI jump cuts — remove silences &amp; dead air</label>
         <label class="switch"><input type="checkbox" data-k="remove_fillers" ${e.remove_fillers ? "checked" : ""}> Cut filler words (“um”, “uh”)</label>
         <div class="muted" style="font-size:12px">Cut by text: click a word, Shift-click another, then press Delete or Cut. Click a struck-out word to restore it.</div>
         <div class="st-words st-cutw" id="st-cutw"></div>
         <div class="row"><span class="muted grow" style="font-size:12px" id="st-cutn"></span><button class="btn xs" data-act="cut">✂ Cut</button><button class="btn xs ghost" data-act="cut-clear">Restore all</button></div></div>
-      <div class="sec"><h3>Captions</h3>
+      <div class="sec" data-tool="captions"><h3>Captions</h3>
         <label class="switch"><input type="checkbox" data-k="captions" ${e.captions ? "checked" : ""}> Animated captions</label>
         ${segBtns("caption_style", e.caption_style, [["bold", "Bold"], ["clean", "Clean"], ["boxed", "Boxed"], ["neon", "Neon"]])}
         ${segBtns("caption_pos", e.caption_pos, [["low", "Low"], ["middle", "Middle"], ["high", "High"]])}
@@ -3516,22 +3795,26 @@ function Studio(cid) {
         <div class="st-words" id="st-words"></div>
         <details><summary class="muted" style="font-size:12px;cursor:pointer">Caption font &amp; style</summary><div id="st-cts" class="stack" style="gap:8px;margin-top:8px"></div></details>
         <div class="muted" style="font-size:12px">Switch to Output view to see captions in the frame.</div></div>
-      <div class="sec"><h3>Headline</h3><div id="st-hl-ed" class="stack" style="gap:8px"></div>
+      <div class="sec" data-tool="headline"><h3>Headline</h3><div id="st-hl-ed" class="stack" style="gap:8px"></div>
         <details><summary class="muted" style="font-size:12px;cursor:pointer">Headline font &amp; style (over the theme)</summary><div id="st-hts" class="stack" style="gap:8px;margin-top:8px"></div></details>
         <div class="muted" style="font-size:12px">Switch to Output view to see the banner in the frame.</div></div>
-      <div class="sec"><h3>Streamer card</h3><div id="st-sc-ed" class="stack" style="gap:8px"></div></div>
-      <div class="sec"><h3>Effects</h3>
+      <div class="sec" data-tool="card"><h3>Streamer card</h3><div id="st-sc-ed" class="stack" style="gap:8px"></div></div>
+      <div class="sec" data-tool="effects"><h3>Effects</h3>
         <div id="st-ovi" class="stack" style="gap:8px"></div>
         <div class="row"><input type="text" id="st-txt" placeholder="Text or emoji sticker 🔥" maxlength="80"><button class="btn sm" data-act="add-text">＋ Add</button></div>
         <div class="muted" style="font-size:12px">Drag media onto the preview to place it · switch to Output view to see effects.</div></div>
-      <div class="sec"><h3>Media library</h3>
-        <div class="seg">${[["", "All"], ["image", "Images"], ["gif", "GIFs"], ["video", "Video"], ["sound", "Sounds"]].map(([v, l]) => `<button class="${T.akind === v ? "on" : ""}" data-act="akind" data-v="${v}">${l}</button>`).join("")}</div>
+      <div class="sec" data-tool="library"><h3>Media library</h3>
+        <div class="seg">${[["", "All"], ["image", "Images"], ["gif", "GIFs"], ["video", "Video"], ["sound", "Sounds"], ["fav", "★"], ["recent", "Recent"]].map(([v, l]) => `<button class="${T.akind === v ? "on" : ""}" data-act="akind" data-v="${v}">${l}</button>`).join("")}</div>
         <input type="text" id="st-aq" placeholder="Search by name or tag" value="${esc(T.aq)}">
         <div class="st-lib" id="st-libl"></div>
         <details><summary class="muted" style="font-size:12px;cursor:pointer">Upload media</summary>
-          <form id="st-up" class="stack" style="gap:6px;margin-top:8px"><input type="file" id="st-upf" accept="image/*,video/*,audio/*" required>
-            <input type="text" id="st-upn" placeholder="Name (optional)"><input type="text" id="st-upt" placeholder="Tags, comma separated"><button class="btn sm">Upload</button></form></details></div>
-      <div class="sec"><h3>AI director</h3>
+          <form id="st-up" class="stack" style="gap:6px;margin-top:8px"><input type="file" id="st-upf" accept="image/*,video/*,audio/*,.apng,.webm,.ttf,.otf" multiple required>
+            <label class="muted" style="font-size:12px">or a folder <input type="file" id="st-upd" webkitdirectory></label>
+            <label class="muted" style="font-size:12px"><input type="checkbox" id="st-upl"> Even out the loudness of sounds</label>
+            <input type="text" id="st-upn" placeholder="Name (optional)"><input type="text" id="st-upt" placeholder="Tags, comma separated"><button class="btn sm">Upload</button></form></details>
+        <div id="st-aed"></div></div>
+      <div class="sec" data-tool="media"><h3>Online media &amp; kits</h3><div id="st-media" class="stack" style="gap:8px"></div></div>
+      <div class="sec" data-tool="ai"><h3>AI director</h3>
         <div class="ask"><textarea id="st-ask" placeholder="Describe what you want… (leave empty for smart suggestions)"></textarea>
           <div class="row"><span class="hint grow">You get a checklist — nothing changes until you apply. <span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></span><button class="btn sm primary" data-act="plan">✦ Get suggestions</button></div></div>
         <div id="st-plan"></div>
@@ -3541,13 +3824,19 @@ function Studio(cid) {
     $("#st-ask").onkeydown = (ev) => { if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) $("[data-act=plan]").click(); };
     $("#st-up").onsubmit = async (ev) => {
       ev.preventDefault();
-      const f = $("#st-upf").files[0], btn = $("#st-up button");
-      if (!f) return;
-      const fd = new FormData();
-      fd.append("file", f); fd.append("name", $("#st-upn").value.trim() || f.name.replace(/\.[^.]+$/, "")); fd.append("tags", $("#st-upt").value);
+      const files = [...$("#st-upf").files, ...$("#st-upd").files], btn = $("#st-up button"), bad = [];
+      if (!files.length) return;
       btn.disabled = true;
-      try { await api("/api/assets", { body: fd }); T.assets = await api("/api/assets"); ev.target.reset(); renderLib(); toast("Added to your media library.", "ok"); }
-      catch (e) { fail(e); } finally { btn.disabled = false; }
+      for (const f of files) { // one request each: a bad file (type, size, unreadable) is reported, the rest still go in
+        const fd = new FormData();
+        fd.append("file", f); fd.append("name", (files.length === 1 && $("#st-upn").value.trim()) || f.name.replace(/\.[^.]+$/, ""));
+        fd.append("tags", $("#st-upt").value); fd.append("loudnorm", $("#st-upl").checked ? "true" : "false");
+        try { await api("/api/assets", { body: fd }); } catch (e) { bad.push(`${f.name}: ${e.message}`); }
+      }
+      try { T.assets = await api("/api/assets"); ev.target.reset(); renderLib(); } catch (e) { fail(e); }
+      btn.disabled = false;
+      if (bad.length) toast(`Not added: ${bad.slice(0, 3).join(" · ")}${bad.length > 3 ? ` (+${bad.length - 3})` : ""}`, "err", 9000);
+      else toast(`Added ${files.length} to your media library.`, "ok");
     };
     textStyleEditor($("#st-cts"), { get: (k) => c().edit[`caption_${k}`], set: (k, v) => queueEdit(`caption_${k}`, v), def: tsDefaults("caption", c().edit, ...outSize()), sample: "Captions look like this" });
     const hlStyle = () => textStyleEditor($("#st-hts"), { get: (k) => c().edit[`headline_${k}`], set: (k, v) => queueEdit(`headline_${k}`, v), def: hlTsDefaults(c().edit), sample: c().edit.headline?.text || "Your headline" });
@@ -3555,12 +3844,18 @@ function Studio(cid) {
     hlStyle();
     T.scDraw = streamerCardEditor($("#st-sc-ed"), { clip: c, set: (ed) => { Object.entries(ed).forEach(([k, v]) => queueEdit(k, v)); $("#st-sc") && ($("#st-sc")._k = null); }, avoid: () => scAvoid(c().edit, ...outSize()) });
     renderLib(); renderOvInspector(); renderPlan(); renderLayout(); renderAngles();
+    RWMedia.mount($("#st-media"), { assets: () => T.assets, reload: async () => { T.assets = await api("/api/assets"); renderLib(); }, add: (a) => addOverlay(assetOv(a, {})) });
     spanLabel(); renderTrack(); renderWords(); renderCuts(); renderActions(); renderSel();
   }
 
   // ----- effects (edit.overlays) -----
   const ovLabel = (o) => (o.kind === "text" ? o.text || "text" : T.assets?.find((a) => a.id === o.asset_id)?.name || o.kind);
-  const assetOv = (a, extra) => ({ kind: a.kind, asset_id: a.id, d: a.duration ? Math.min(+a.duration, 5) : 2.5, w: a.kind === "video" ? 0.45 : 0.35, ...extra });
+  const assetOv = (a, extra) => { // the asset's own defaults (Media library ✎), else its (trimmed) length up to 5 s
+    const df = a.defaults || {}, len = a.trim ? a.trim.out - a.trim.in : +a.duration;
+    RWMedia.used(a.id);
+    return { kind: a.kind, asset_id: a.id, d: df.d ?? (len ? Math.min(len, 5) : 2.5), w: df.w ?? (a.kind === "video" ? 0.45 : 0.35),
+      ...(df.x != null && { x: df.x }), ...(df.y != null && { y: df.y }), ...(df.volume != null && { volume: df.volume }), ...extra };
+  };
   function saveOverlays() {
     clearTimeout(T.ovTimer);
     T.ovTimer = setTimeout(async () => { T.ovTimer = null; try { await patch({ edit: { overlays: T.ovs } }); } catch (e) { fail(e); } }, 500);
@@ -3778,13 +4073,16 @@ function Studio(cid) {
     if (!el) return;
     if (!T.assets) { el.innerHTML = `<span class="muted" style="font-size:12px">The media library isn't available yet.</span>`; return; }
     const q = T.aq.trim().toLowerCase();
-    const list = T.assets.filter((a) => a.kind !== "font" && (!T.akind || a.kind === T.akind) && (!q || `${a.name} ${(a.tags || []).join(" ")}`.toLowerCase().includes(q)));
+    const rec = RWMedia.recentIds(), want = (a) => !T.akind || a.kind === T.akind || (T.akind === "fav" && a.fav) || (T.akind === "recent" && rec.includes(a.id));
+    const list = T.assets.filter((a) => a.kind !== "font" && want(a) && (!q || `${a.name} ${(a.tags || []).join(" ")}`.toLowerCase().includes(q)));
+    if (T.akind === "recent") list.sort((a, b) => rec.indexOf(a.id) - rec.indexOf(b.id));
     el.innerHTML = list.length ? list.map((a) => {
       const src = `/assets/${esc(a.file)}`;
       const pv = a.kind === "sound" ? `<audio controls preload="none" src="${src}"></audio>` : a.kind === "video" ? `<video src="${src}#t=0.1" muted preload="metadata"></video>` : `<img src="${src}" alt="" loading="lazy">`;
       return `<div class="st-asset" draggable="true" data-asset="${esc(a.id)}" title="${esc(a.name)} — drag onto the preview">${pv}
         <div class="row" style="gap:4px"><span class="grow st-aname">${esc(a.name)}</span>${a.builtin ? "" : `<button class="st-x" data-act="asset-del" data-id="${esc(a.id)}" title="Delete from library">✕</button>`}</div>
-        <button class="btn xs" data-act="asset-add" data-id="${esc(a.id)}">＋ At playhead</button></div>`;
+        <div class="row" style="gap:4px"><button class="btn xs grow" data-act="asset-add" data-id="${esc(a.id)}">＋ At playhead</button>
+          ${a.builtin ? "" : `<button class="st-x${a.fav ? " on" : ""}" data-act="asset-fav" data-id="${esc(a.id)}" title="Favourite">★</button><button class="st-x" data-act="asset-ed" data-id="${esc(a.id)}" title="Trim, defaults, tags">✎</button>`}</div></div>`;
     }).join("") : `<span class="muted" style="font-size:12px">No media matches.</span>`;
   }
   // ----- AI director: prompt -> plan (checklist) -> apply selected -----
@@ -4015,6 +4313,13 @@ function Studio(cid) {
         }
         case "akind": T.akind = a.dataset.v; $$("[data-act=akind]").forEach((b) => b.classList.toggle("on", b === a)); renderLib(); break;
         case "asset-add": { const as = T.assets?.find((x) => x.id === a.dataset.id); if (as) addOverlay(assetOv(as, {})); break; }
+        case "asset-fav": case "asset-ed": {
+          const as = T.assets?.find((x) => x.id === a.dataset.id), put = (n) => { T.assets = T.assets.map((x) => (x.id === n.id ? { ...x, ...n } : x)); renderLib(); };
+          if (!as) break;
+          if (a.dataset.act === "asset-ed") RWMedia.editAsset($("#st-aed"), as, put);
+          else put(await api(`/api/assets/${encodeURIComponent(as.id)}`, { method: "PATCH", body: { fav: !as.fav } }));
+          break;
+        }
         case "asset-del": {
           const as = T.assets?.find((x) => x.id === a.dataset.id);
           if (!as) break;
@@ -4344,7 +4649,7 @@ function Sources() {
 // ======================================================================
 function Obs() {
   this.every = 2500;
-  const OBS_STATUS = { connected: ["ok", "Connected"], connecting: ["run", "Connecting"], offline: ["err", "Offline"], off: ["", "Paused"] };
+  const OBS_STATUS = OBS_LINK;
   this.mount = async () => {
     const st = await api("/api/obs");
     view.innerHTML = `<div class="page"><h1>OBS link</h1><p class="sub">Clips you save in OBS (replay buffer “clip that”, or finished recordings) land in your Library and are analyzed automatically — from OBS on this PC or any PC on your network. Optional: nothing here runs unless you turn it on.</p>
@@ -4367,7 +4672,7 @@ function Obs() {
           <div class="row wrap"><label class="switch"><input type="checkbox" id="lon" ${st.enabled ? "checked" : ""}> Receive clips from other PCs</label>
             <label class="field" style="flex-direction:row;align-items:center;gap:8px">port <input type="number" id="lport" value="${+st.port}" min="1024" max="65535" style="width:90px"></label>
             <label class="switch" title="For safety, clips from other PCs are always scheduled as Private: you approve before anything goes public"><input type="checkbox" id="lap" ${st.autopilot?.enabled ? "checked" : ""}> Run Autopilot on received clips (posts stay private)</label></div>
-          <div id="lanstat"></div></div>
+          <div id="lannotice"></div><div id="lanstat"></div></div>
       </div>
       <div class="stack"><div id="conns" class="stack"></div></div></div></div>`;
     $("#of").onsubmit = async (e) => {
@@ -4399,6 +4704,9 @@ function Obs() {
     if (s === sig) return; sig = s;
     const url = st.ips.length ? `http://${st.ips[0]}:${st.port}` : `http://THIS-PC-IP:${st.port}`;
     const cmd = (extra) => `python reelwright_relay.py --token=${st.token} --server ${url}${extra}`;
+    $("#lannotice").innerHTML = st.relay_notice ? `<div class="card" style="border-color:var(--warn);font-size:12.5px;margin:0"><b>Relays on other PCs need updating.</b>
+      Reelwright's clip receiver moved from port 8766 to ${+st.port}. Re-download the relay script on other PCs, or run it with <span class="mono">--server ${esc(url)}</span>.
+      <div style="margin-top:6px"><button class="btn sm" data-lnok="1">Got it</button></div></div>` : "";
     $("#lanstat").innerHTML = !st.enabled ? `<div class="dim" style="font-size:12.5px">Off.</div>` : `
       ${st.error ? `<div style="color:var(--err);font-size:12.5px">${esc(st.error)}</div>` : `<div class="row"><span class="pill ${st.running ? "ok" : "warn"}">${st.running ? "Listening" : "Starting"}</span><span class="dim" style="font-size:12px">${esc(st.hostname)} · ${st.ips.map(esc).join(", ") || "no network address found"} · port ${+st.port} (TCP + UDP for auto-discovery)</span></div>`}
       <label class="field">Pairing token<div class="row"><input type="text" readonly value="${esc(st.token)}" class="mono grow" id="ltok"><button class="btn sm" data-copy="#ltok">Copy</button><button class="btn sm" data-newtok="1" title="Old relays stop working">New token</button></div></label>
@@ -4414,7 +4722,7 @@ function Obs() {
           <div class="dim mono" style="font-size:11.5px;margin-top:3px">${esc(c.host)}:${+c.port}${c.has_password ? " · password saved" : ""}${(c.path_map || []).length ? ` · ${c.path_map.length} folder mapping(s)` : ""}</div></div>
         <label class="switch"><input type="checkbox" data-oen="${c.id}" ${c.enabled ? "checked" : ""}> Active</label>
         <button class="btn sm ghost danger" data-orm="${c.id}">Remove</button></div>
-      ${c.error ? `<div style="color:var(--err);font-size:12px;margin-top:6px">${esc(c.error)}</div>` : ""}
+      ${c.error && c.enabled && c.status !== "connected" ? `<div style="color:${c.status === "waiting" ? "var(--muted)" : "var(--err)"};font-size:12px;margin-top:6px">${esc(c.error)}</div>` : ""}
       <div class="row wrap" style="margin-top:10px">
         <button class="btn sm primary" data-oact="save_replay" data-id="${c.id}" title="Save the last seconds of OBS's replay buffer as a clip">✂ Clip that</button>
         <button class="btn sm" data-oact="start_replay" data-id="${c.id}">Start replay buffer</button><button class="btn sm" data-oact="stop_replay" data-id="${c.id}">Stop replay buffer</button>
@@ -4426,10 +4734,11 @@ function Obs() {
       : `<div class="empty card"><b>No OBS connected yet</b>Add OBS on the left, or turn on “Receive clips from other PCs” and run the relay there.</div>`;
   };
   const onClick = async (e) => {
-    const t = e.target.closest("[data-copy],[data-newtok],[data-oen],[data-orm],[data-oact],[data-otest]");
+    const t = e.target.closest("[data-copy],[data-newtok],[data-lnok],[data-oen],[data-orm],[data-oact],[data-otest]");
     if (!t) return;
     try {
       if (t.dataset.copy) { await navigator.clipboard.writeText($(t.dataset.copy).value); return toast("Copied.", "ok"); }
+      if (t.dataset.lnok) await api("/api/settings", { method: "PUT", body: { notice_lan_relay: false } });
       if (t.dataset.newtok && (await confirmBox("New pairing token?", "Relays using the old token stop sending until you update them.", "Replace"))) await api("/api/lan/token", { method: "POST" });
       if (t.dataset.oen) await api(`/api/obs/${t.dataset.oen}`, { method: "PATCH", body: { enabled: t.checked } });
       if (t.dataset.orm && (await confirmBox("Remove this OBS?", "Clips already imported stay in your Library."))) await api(`/api/obs/${t.dataset.orm}`, { method: "DELETE" });
@@ -4762,6 +5071,11 @@ function Publish() {
         <div class="two"><input type="text" id="ttk" placeholder="Client key"><input type="password" id="tts" placeholder="Client secret"></div>
         <div class="row" style="margin-top:8px"><button class="btn sm" data-tt="save">Save app</button>${addBtn("tiktok", "Sign in with TikTok", tt.has_app ? "" : "disabled")}</div>
         <p class="dim" style="font-size:11.5px;margin:8px 0 0">Until TikTok audits your app, posts are private (only you can see them).</p>`;
+    // the move to port 38765 (config.migrate_ports): a TikTok app registered before it still names the old redirect URI
+    const ttPort = (tt.port_notice ? `<div class="card" style="border-color:var(--warn);font-size:12.5px;margin:0 0 10px"><b>Update your TikTok app's Redirect URI.</b> Reelwright moved to port 38765 so it no longer collides with other apps on this PC. In <a href="https://developers.tiktok.com/apps" target="_blank">TikTok for Developers</a> → your app → <b>Login Kit → Redirect URI</b>, replace <span class="mono">http://localhost:8765/oauth/tiktok/callback</span> with:
+        <div class="mono" style="background:#0d0e14;padding:6px 8px;border-radius:6px;margin:6px 0;word-break:break-all">${esc(tt.redirect_uri)}</div>Save it there, then use Reconnect if a TikTok sign-in fails. <a href="/guide/connect.html#tiktok-port" target="_blank">Details</a>
+        <div style="margin-top:6px"><button class="btn xs" data-tt="port-ok">Done, hide this</button></div></div>` : "")
+      + (tt.port_warning ? `<p style="color:var(--warn);font-size:12px;margin:0 0 8px">${esc(tt.port_warning)}</p>` : "");
     const reconIg = accs("instagram").find((a) => a.id === igTarget);
     const igBody = accs("instagram").length && !adding && !reconIg ? `<div class="row wrap">${addBtn("instagram")}</div>${hint("instagram")}`
       : `${reconIg ? `<p style="font-size:12.5px;margin:0 0 6px"><b>Reconnect ${esc(reconIg.name || "this account")}</b>: paste a new token for it.</p>` : ""}
@@ -4773,7 +5087,7 @@ function Publish() {
         <div class="row" style="margin-top:8px"><button class="btn primary sm" data-ig="save">${reconIg ? "Reconnect" : accs("instagram").length ? "Add account" : "Connect Instagram"}</button>${accs("instagram").length ? `<button class="btn ghost sm" data-ig="cancel">Cancel</button>` : ""}</div>${hint("instagram")}`;
     $("#conns").innerHTML = `<p class="muted" style="font-size:12.5px;margin:0 0 4px">Link as many accounts per platform as you like; each one is only posted to after you turn on <b>Approved for uploads</b>. Every permission each platform needs, and step-by-step portal setup: <a href="/guide/connect.html" target="_blank">Connection guide</a>.</p>
       <div class="card">${head("youtube")}${ytBody}${yt.error ? `<p style="color:var(--err);font-size:12px">${esc(yt.error)}</p>` : ""}</div>
-      <div class="card">${head("tiktok")}${ttBody}</div>
+      <div class="card">${head("tiktok")}${ttPort}${ttBody}</div>
       <div class="card">${head("instagram")}${igBody}</div>
       <div class="card" id="secvault"></div>`;
     securityCard();
@@ -4827,6 +5141,7 @@ function Publish() {
         window.open(url, "_blank");
         toast(t.dataset.recon ? "Approve Reelwright in the TikTok tab, signed in as that account." : "Approve Reelwright in the TikTok tab (to add a different account, log out on tiktok.com first), then come back here.", "info", 7000);
       }
+      if (t.dataset.tt === "port-ok") await api("/api/settings", { method: "PUT", body: { notice_tiktok_redirect: false } });
       if (t.dataset.tt === "save") { await api("/api/connections/tiktok/app", { method: "PUT", body: { client_key: $("#ttk").value, client_secret: $("#tts").value } }); toast("TikTok app saved.", "ok"); }
       if (t.dataset.ig === "cancel") { adding = igTarget = ""; return redraw(); }
       if (t.dataset.ig === "save") {
@@ -4897,13 +5212,14 @@ function Jobs() {
 // ======================================================================
 function Schedule() {
   this.every = 5000;
-  let week = 0, filter = "all", data = null, sig = "";
+  let week = 0, mon = 0, filter = "all", data = null, sig = "", mode = lsGet("rwSchedView") === "month" ? "month" : "week";
   const SRC = { yours: "from your own results", research: "from live research", default: "default — no data yet" };
   const dayStart = (offset) => { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + offset); return d; };
   this.mount = async () => {
-    view.innerHTML = `<div class="page"><h1>Schedule</h1><p class="sub">Every post waiting to go out. Drag a post to another hour to move it, or click it to change its time, move it to another approved account, or remove it. Shading shows the best hours for the selected platform.</p>
+    view.innerHTML = `<div class="page"><h1>Schedule</h1><p class="sub">Every post waiting to go out. Drag a post to another hour (or, in the month, another day: it keeps its time) to move it, or click it to change its time, move it to another approved account, or remove it. Shading shows the best hours for the selected platform.</p>
       <div id="sch-banner"></div>
-      <div class="row wrap" style="margin-bottom:12px"><button class="btn sm" data-wk="-1">‹ Prev</button><button class="btn sm" data-wk="0">This week</button><button class="btn sm" data-wk="1">Next ›</button>
+      <div class="row wrap" style="margin-bottom:12px"><div class="seg" id="sch-view" role="group" aria-label="Show">${[["week", "Week"], ["month", "Month"]].map(([v, l]) => `<button data-view="${v}" class="${mode === v ? "on" : ""}" aria-pressed="${mode === v}">${l}</button>`).join("")}</div>
+        <button class="btn sm" data-wk="-1" aria-label="Previous">‹ Prev</button><button class="btn sm" data-wk="0">Today</button><button class="btn sm" data-wk="1" aria-label="Next">Next ›</button>
         <b id="sch-range" style="margin:0 8px"></b><span class="grow"></span>
         <div class="seg" id="sch-filter">${["all", ...Object.keys(PLATFORM)].map((p) => `<button data-f="${p}" class="${p === filter ? "on" : ""}">${p === "all" ? "All" : PLATFORM[p]}</button>`).join("")}</div></div>
       <div class="dim" id="sch-source" style="font-size:12px;margin-bottom:8px"></div>
@@ -4914,7 +5230,7 @@ function Schedule() {
   };
   this.refresh = async () => {
     data = await api("/api/schedule");
-    const s = JSON.stringify([data, week, filter]);
+    const s = JSON.stringify([data, week, mon, mode, filter]);
     if (s === sig) return; sig = s;
     render();
   };
@@ -4932,6 +5248,11 @@ function Schedule() {
     $("#sch-range").textContent = `${first.toLocaleDateString([], { month: "short", day: "numeric" })} – ${last.toLocaleDateString([], { month: "short", day: "numeric" })}`;
     $("#sch-source").textContent = "Best-time shading: " + (filter === "all" ? Object.keys(PLATFORM).map((p) => `${PLATFORM[p]} ${SRC[data.heat[p].source]}`).join(" · ") : `${PLATFORM[filter]} ${SRC[data.heat[filter].source]}`);
     const items = data.items.filter((it) => filter === "all" || it.platform === filter);
+    $$("#sch-view button").forEach((b) => { b.classList.toggle("on", b.dataset.view === mode); b.setAttribute("aria-pressed", String(b.dataset.view === mode)); });
+    const asap = items.filter((it) => !it.when);
+    $("#sch-asap").innerHTML = asap.length ? asap.map((it) => `<div class="row">${chip(it)}<span class="dim" style="font-size:12px">${esc(UPLOAD_STATUS[it.status]?.[1] || it.status)}</span></div>`).join("") : `<div class="dim" style="font-size:12.5px">Nothing waiting.</div>`;
+    if (mode === "month") return renderMonth(items);
+    $("#sch-grid").className = "sch-grid";
     const byCell = {};
     for (const it of items) {
       if (!it.when) continue;
@@ -4949,10 +5270,56 @@ function Schedule() {
       }
     }
     $("#sch-grid").innerHTML = html;
-    const asap = items.filter((it) => !it.when);
-    $("#sch-asap").innerHTML = asap.length ? asap.map((it) => `<div class="row">${chip(it)}<span class="dim" style="font-size:12px">${esc(UPLOAD_STATUS[it.status]?.[1] || it.status)}</span></div>`).join("") : `<div class="dim" style="font-size:12.5px">Nothing waiting.</div>`;
     wireDnD();
   };
+  // ----- month view: compact chips per day (RWCal does the date maths, in local time) -----
+  const accColor = (k) => { let h = 0; for (const ch of String(k || "")) h = (h * 31 + ch.charCodeAt(0)) % 360; return `hsl(${h} 70% 62%)`; };
+  const hhmm = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const mchip = (it) => `<div class="sch-post sch-mchip plat-${it.platform}" draggable="true" data-post="${esc(it.id)}" title="${esc(it.title)} — ${esc(PLATFORM[it.platform])}${it.account ? " · " + esc(it.account) : ""}, ${esc(hhmm(it.when))}, ${esc(UPLOAD_STATUS[it.status]?.[1] || it.status)}${it.error ? " — " + esc(it.error) : ""}">
+      <i class="sch-acc" style="background:${accColor(it.account_id || it.account || it.platform)}" aria-hidden="true"></i><b>${esc(hhmm(it.when))}</b> ${esc((it.title || "").slice(0, 22))}${it.auto ? " ⚡" : ""}${it.status === "held" ? " ⏸" : ""}${it.error ? " ⚠" : ""}</div>`;
+  const MONTH_MAX = 3; // chips per day before "+N more"
+  const renderMonth = (items) => {
+    const now = new Date(), { y, m } = RWCal.addMonths(now.getFullYear(), now.getMonth(), mon), today = RWCal.dayKey(now);
+    $("#sch-range").textContent = new Date(y, m, 1).toLocaleDateString([], { month: "long", year: "numeric" });
+    const grid = RWCal.monthGrid(y, m), days = RWCal.byDay(items), el = $("#sch-grid");
+    const heatDay = (wd) => Math.max(...Array.from({ length: 24 }, (_, h) => heatAt(wd, h)));
+    el.className = "sch-month";
+    el.innerHTML = grid[0].map((c) => `<div class="sch-h">${new Date(c.y, c.m, c.d).toLocaleDateString([], { weekday: "short" })}</div>`).join("")
+      + grid.flat().map((c) => {
+        const its = days[c.key] || [], fit = its.length > MONTH_MAX ? MONTH_MAX - 1 : MONTH_MAX;
+        const label = new Date(c.y, c.m, c.d).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+        return `<div class="sch-mday${c.inMonth ? "" : " out"}${c.key < today ? " past" : ""}${c.key === today ? " today" : ""}" data-key="${c.key}" style="--heat:${heatDay(c.wd).toFixed(2)}">
+          <button class="sch-dnum" data-daykey="${c.key}" title="Open the week of ${esc(label)}" aria-label="${esc(label)}, ${its.length} post${its.length === 1 ? "" : "s"}: open its week">${c.d}</button>
+          ${its.slice(0, fit).map(mchip).join("")}${its.length > fit ? `<button class="sch-more" data-more="${c.key}">+${its.length - fit} more</button>` : ""}</div>`;
+      }).join("");
+    $$(".sch-post", el).forEach((p) => p.addEventListener("dragstart", (e) => { e.dataTransfer.setData("text/plain", p.dataset.post); p.classList.add("dragging"); }));
+    $$(".sch-mday", el).forEach((cell) => {
+      cell.addEventListener("dragover", (e) => { if (!cell.classList.contains("past")) { e.preventDefault(); cell.classList.add("over"); } });
+      cell.addEventListener("dragleave", () => cell.classList.remove("over"));
+      cell.addEventListener("drop", (e) => {
+        e.preventDefault(); cell.classList.remove("over");
+        const id = e.dataTransfer.getData("text/plain"), it = data.items.find((x) => x.id === id);
+        if (!it) return;
+        const when = RWCal.moveToDay(it.when, cell.dataset.key); // same time of day on the new date (9:00 for an "as soon as ready" post)
+        if (new Date(when) < new Date()) return toast("That time has already passed on that day: pick a later day, or click the post to set a time.", "err");
+        if (when !== it.when) move(id, { when });
+      });
+    });
+  };
+  const dayList = (key) => {
+    const its = RWCal.byDay(data.items.filter((it) => filter === "all" || it.platform === filter))[key] || [], { y, m, d } = (([a, b, c]) => ({ y: a, m: b - 1, d: c }))(key.split("-").map(Number));
+    modal(`<h2>${esc(new Date(y, m, d).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" }))}</h2>
+      <div class="stack" style="gap:6px">${its.map((it) => `<div class="row">${mchip(it)}<span class="dim" style="font-size:12px">${esc(UPLOAD_STATUS[it.status]?.[1] || it.status)}</span></div>`).join("")}</div>
+      <div class="foot"><button class="btn" data-week="${key}">Open this week</button><button class="btn" data-close>Close</button></div>`, (mm, close) => {
+      mm.addEventListener("click", (e) => {
+        const p = e.target.closest("[data-post]"), w = e.target.closest("[data-week]");
+        if (p) { const it = data.items.find((x) => x.id === p.dataset.post); close(); if (it) edit(it); }
+        else if (w) { close(); openWeek(w.dataset.week); }
+      });
+    });
+  };
+  const setMode = (m) => { mode = m; lsSet("rwSchedView", m); sig = ""; return this.refresh(); };
+  const openWeek = (key) => { week = RWCal.weekOffset(key); return setMode("week"); };
   const move = async (id, body) => {
     try { await api(`/api/uploads/${id}`, { method: "PATCH", body }); sig = ""; await this.refresh(); toast("Updated.", "ok"); }
     catch (err) { fail(err); }
@@ -5007,7 +5374,14 @@ function Schedule() {
   const onClick = async (e) => {
     const t = e.target;
     if (t.closest("#sch-resume, #sch-pause")) { await api("/api/autopilot", { method: "PUT", body: { paused: !!t.closest("#sch-pause") } }).catch(fail); sideStatus(); sig = ""; return this.refresh(); }
-    if (t.dataset.wk !== undefined) { week = +t.dataset.wk === 0 ? 0 : week + +t.dataset.wk; sig = ""; return this.refresh(); }
+    if (t.dataset.wk !== undefined) {
+      if (mode === "month") mon = +t.dataset.wk === 0 ? 0 : mon + +t.dataset.wk;
+      else week = +t.dataset.wk === 0 ? 0 : week + +t.dataset.wk;
+      sig = ""; return this.refresh();
+    }
+    if (t.closest("[data-view]")) return setMode(t.closest("[data-view]").dataset.view);
+    if (t.closest("[data-daykey]")) return openWeek(t.closest("[data-daykey]").dataset.daykey);
+    if (t.closest("[data-more]")) return dayList(t.closest("[data-more]").dataset.more);
     if (t.dataset.f) { filter = t.dataset.f; sig = ""; return this.refresh(); }
     const p = t.closest("[data-post]");
     if (p) { const it = data.items.find((x) => x.id === p.dataset.post); if (it) edit(it); }
@@ -5122,6 +5496,7 @@ function Settings() {
       </form>
       ${signalsCard()}
       ${renderCard()}
+      ${presetsCard()}
       <div class="card stack" style="margin-top:20px" id="appwin"><div class="row wrap"><h2 class="grow" style="margin:0">App window &amp; startup</h2>
           <button class="btn sm danger" id="appquit" hidden title="Close Reelwright completely (stops renders, uploads and Autopilot until you open it again)">⏻ Quit Reelwright</button></div>
         <label class="row" style="gap:8px"><input type="checkbox" id="c2t"> <span>Clicking ✕ minimizes to the taskbar instead of closing <span class="dim">— renders, uploads and Autopilot keep running</span></span></label>
@@ -5153,6 +5528,7 @@ function Settings() {
     };
     $("#doc").onclick = () => runDoctor(false);
     $("#docd").onclick = () => runDoctor(true);
+    drawPresetsCard().catch(fail);
     const appShow = (a) => {
       $("#c2t").checked = a.close_to_taskbar; $("#sob").checked = a.start_on_boot; $("#appquit").hidden = !a.desktop;
       $("#appnote").textContent = a.desktop ? "" : "These apply to the Reelwright desktop app (Reelwright.exe); this page is open in a browser.";
@@ -5323,7 +5699,6 @@ function Review() {
 }
 
 routes.long = LongForm;
-Object.assign(JOB_LABEL, { longform_capture: "Capture long form", longform_export: "Render long form" });
 const LF_MODES = [["condensed", "Condensed", "The whole video minus dead air: silences, idle menu/AFK screens with no speech, and “um”s."],
   ["highlights", "Highlights", "The AI picks the best moments (with the video-type playbook) up to a target length, in order, one chapter each."],
   ["clips", "From clips", "The clips you ticked in AI Clips, in the order you ticked them."]];
@@ -5378,6 +5753,8 @@ async function openLongCapture(pid, pickedIds = []) {
   });
 }
 
+const LF_TOOLS = [{ id: "segments", icon: "▤", label: "Segments" }, { id: "chapters", icon: "☰", label: "Chapters" }, { id: "style", icon: "✎", label: "Style" },
+  { id: "overlays", icon: "☺", label: "Overlays" }, { id: "ai", icon: "✧", label: "AI" }, { id: "publish", icon: "⇪", label: "Render & post" }];
 function LongForm(lid) {
   const L = { d: null, proj: null, words: [], starts: [], seq: [], offs: [], sel: 0, cur: 0, t: 0, tab: "segments", zoom: 1, plan: null, picked: new Set(), assets: null, akind: "", tsk: "caption",
     hist: RWUndo.History(100, 1000), srv: null }; // srv = the doc as the server has it (trim drags change segments in place)
@@ -5392,20 +5769,20 @@ function LongForm(lid) {
     L.d = await api(`/api/longform/${lid}`);
     L.srv = structuredClone(L.d);
     L.proj = await api(`/api/projects/${L.d.project_id}`);
-    const tr = await transcriptOf(L.d.project_id);
+    const [tr] = await Promise.all([transcriptOf(L.d.project_id), uilReady]);
     L.words = (tr.segments || []).flatMap((s) => s.words || []).sort((a, b) => a.s - b.s);
     L.starts = L.words.map((w) => w.s);
     reindex();
     layout();
     keyH = (e) => {
-      if (e.target.closest("input, textarea, select, [contenteditable]") || $("#modal-root").innerHTML) return;
+      if (e.target.closest("input, textarea, select, [contenteditable]") || $("#modal-root").innerHTML || L.tp?.key(e)) return;
       const z = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase();
       if (z === "z" || z === "y") { e.preventDefault(); undoRedo(z === "y" || e.shiftKey); }
       else if (e.code === "Space") { e.preventDefault(); toggle(); }
     };
     document.addEventListener("keydown", keyH);
   };
-  this.destroy = () => { cancelAnimationFrame(raf); video?.pause(); if (keyH) document.removeEventListener("keydown", keyH); };
+  this.destroy = () => { cancelAnimationFrame(raf); video?.pause(); if (keyH) document.removeEventListener("keydown", keyH); L.tp?.destroy(); };
   this.refresh = async () => {
     if (!L.d) return;
     const d = await api(`/api/longform/${lid}`);
@@ -5495,6 +5872,9 @@ function LongForm(lid) {
     }
     $("#lf-zoom").oninput = (e) => { L.zoom = +e.target.value; paintTimeline(); };
     $(".tabs").onclick = (e) => { const t = e.target.closest("[data-tab]"); if (t) { L.tab = t.dataset.tab; $$(".tabs button").forEach((b) => b.classList.toggle("on", b === t)); renderTab(); } };
+    L.tp?.destroy(); // its tools are tabs: the rail collapses the panel and jumps to a tab
+    L.tp = toolPanel("longform", $(".editor.lf"), LF_TOOLS, { custom: false,
+      beforeJump: (t) => { if (L.tab !== t.id) { L.tab = t.id; $$(".tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === t.id)); renderTab(); } } });
     view.onclick = onClick;
     bindTimeline();
     renderTop(); renderTab(); paintTimeline();
@@ -5810,6 +6190,8 @@ function phoneRemoteCard() {
         ${st.ips.length > 1 ? `<label class="field grow">This PC's address for the phone<select id="pr-ip">${st.ips.map((a) => `<option ${a === ip ? "selected" : ""}>${esc(a)}</option>`).join("")}</select></label>` : ""}
         <button class="btn sm" id="pr-save" style="align-self:flex-end">Save port</button></div>
       ${st.error ? `<p style="color:var(--err);font-size:12.5px;margin:0">${esc(st.error)}</p>` : ""}
+      ${st.rescan_notice ? `<div class="card" style="border-color:var(--warn);font-size:12.5px;margin:0"><b>Re-scan the QR code to reconnect phones.</b> The phone remote moved to port ${+st.port} (it was 8810) so it no longer collides with other apps. A phone keeps its key for one address only, so phones paired before can't reach the new one: press <b>Pair a phone</b> and scan the new code on each phone (then Revoke its old entry below, and remove the old Home Screen icon).
+        <div style="margin-top:6px"><button class="btn xs" id="pr-notice-ok">Done, hide this</button></div></div>` : ""}
       ${st.running && ip ? `<div class="dim" style="font-size:12.5px">Phone address <span class="mono">http://${esc(ip)}:${+st.port}</span>. If Windows asks, allow Reelwright on <b>private</b> networks.</div>` : ""}
       ${!st.running ? "" : pending ? `<div class="row wrap" style="align-items:flex-start;gap:16px">
           <div style="background:#fff;padding:6px;border-radius:8px;line-height:0">${pending.svg}</div>
@@ -5818,10 +6200,16 @@ function phoneRemoteCard() {
             <span class="muted">Then add it to the Home Screen: iPhone Safari → Share → Add to Home Screen; Android Chrome → ⋮ → Add to Home screen.</span>
             <div><button class="btn sm" id="pr-cancel">Cancel</button></div></div></div>`
         : `<div><button class="btn sm primary" id="pr-pair">＋ Pair a phone</button></div>`}
-      ${paired.length ? `<table style="width:100%;font-size:12.5px"><tbody>${paired.map((d) => `<tr><td><b>${esc(d.name || "Phone")}</b></td>
+      ${paired.length ? `<table style="width:100%;font-size:12.5px"><tbody>${paired.map((d) => `<tr><td><b>${esc(d.name || "Phone")}</b>${d.sim ? ' <span class="pill">simulator</span>' : ""}</td>
           <td class="dim">${d.last_seen ? `seen ${esc(agoS(d.last_seen))}${d.last_ip ? ` from ${esc(d.last_ip)}` : ""}` : "not seen yet"}</td>
           <td style="text-align:right"><button class="btn xs danger" data-revoke="${esc(d.id)}" data-name="${esc(d.name || "this phone")}">Revoke</button></td></tr>`).join("")}</tbody></table>`
-        : `<div class="dim" style="font-size:12.5px">No phones paired.</div>`}`;
+        : `<div class="dim" style="font-size:12.5px">No phones paired.</div>`}
+      <details style="font-size:12.5px"${st.dev_sim ? " open" : ""}><summary class="dim">Developer: test the phone app on this PC</summary>
+        <div class="stack" style="gap:8px;margin-top:8px">
+          <label class="row" style="gap:8px"><input type="checkbox" id="pr-sim" ${st.dev_sim ? "checked" : ""}> <span>Phone simulator (pairs itself from this PC only; never reachable from the network)</span></label>
+          <div class="row wrap"><button class="btn sm" id="pr-sim-open" ${st.dev_sim && st.running ? "" : "disabled"}>📱 Open phone simulator</button>
+            <button class="btn sm" id="pr-demo" title="A separate copy of Reelwright with sample projects and sandbox accounts: nothing is ever posted">🧪 Start a demo sandbox</button></div>
+          <span class="dim">The simulator shows the real phone app at iPhone, Pixel and tablet sizes${st.running ? "" : " (turn the phone remote on first)"}. The demo sandbox runs apart from your library, in its own window.</span></div></details>`;
   };
   const load = async () => {
     const was = pending;
@@ -5839,6 +6227,7 @@ function phoneRemoteCard() {
     try {
       if (e.target.id === "pr-on") { st = await api("/api/remote", { method: "PUT", body: { enabled: e.target.checked } }); if (!st.enabled) pending = null; draw(); }
       if (e.target.id === "pr-ip") { ip = e.target.value; if (pending) await pairNew(); }
+      if (e.target.id === "pr-sim") { st = await api("/api/remote", { method: "PUT", body: { dev_sim: e.target.checked } }); draw(); }
     } catch (err) { fail(err); load().catch(() => {}); }
   };
   el.onclick = async (e) => {
@@ -5847,6 +6236,9 @@ function phoneRemoteCard() {
     try {
       if (t.id === "pr-save") { st = await api("/api/remote", { method: "PUT", body: { port: +$("#pr-port", el).value } }); pending = null; draw(); toast("Saved.", "ok", 1200); }
       if (t.id === "pr-pair") await pairNew();
+      if (t.id === "pr-sim-open") { const r = await api("/api/remote/simulator", { body: {} }); if (!r.window) window.open(r.url, "_blank"); }
+      if (t.id === "pr-demo") { await api("/api/remote/demo", { body: {} }); toast("Starting the demo sandbox: its phone simulator opens in your browser in a few seconds.", "ok"); }
+      if (t.id === "pr-notice-ok") { await api("/api/settings", { method: "PUT", body: { notice_remote_rescan: false } }); await load(); }
       if (t.id === "pr-cancel") { st = await api(`/api/remote/devices/${encodeURIComponent(pending.device_id)}`, { method: "DELETE" }); pending = null; draw(); }
       if (t.dataset.revoke && await confirmBox(`Revoke ${t.dataset.name}?`, "It stops working at once, including videos it has open. Pair it again to use it.", "Revoke")) {
         st = await api(`/api/remote/devices/${encodeURIComponent(t.dataset.revoke)}`, { method: "DELETE" });
@@ -6391,7 +6783,8 @@ function ModelLab() {
         ${j.status === "running" ? `<button class="btn sm" data-mljob="pause" data-id="${j.id}">Pause</button>` : ""}
         ${j.status === "paused" ? `<button class="btn sm" data-mljob="resume" data-id="${j.id}">Resume</button>` : ""}
         ${["queued", "running", "paused"].includes(j.status) ? `<button class="btn sm" data-mljob="cancel" data-id="${j.id}">Cancel</button>` : ""}
-        ${j.kind === "train" && j.status === "done" ? `<label style="font-size:12px"><input type="checkbox" data-mlpaid="${j.id}"> also score Claude (paid)</label><button class="btn sm primary" data-mljob="export" data-id="${j.id}">Export &amp; evaluate</button>` : ""}</span></div>
+        ${j.kind === "train" && j.status === "done" ? `<label style="font-size:12px"><input type="checkbox" data-mlpaid="${j.id}"> also score Claude (paid)</label><button class="btn sm primary" data-mljob="export" data-id="${j.id}">Export &amp; evaluate</button>` : ""}
+        ${["done", "failed", "canceled"].includes(j.status) ? `<button class="btn sm" data-mldel="${j.id}" title="Delete this job's files (checkpoint, model, exports)">Delete</button>` : ""}</span></div>
         ${r.tok_s && j.kind === "pilot" ? `<div style="font-size:12.5px">Measured: <b>${r.tok_s.toLocaleString()} tok/s</b>, peak VRAM <b>${esc(r.peak_vram_gb)} GB</b> on ${esc(r.device)}</div>` : ""}
         ${j.events?.tokenizer && j.events.tokenizer.vocab !== j.events.tokenizer.requested ? `<div class="muted" style="font-size:12px">The tokenizer learned ${j.events.tokenizer.vocab} of ${j.events.tokenizer.requested} tokens (small dataset).</div>` : ""}
         ${j.error ? `<div style="color:var(--err);font-size:12.5px">${esc(j.error)}</div>` : ""}
@@ -6402,7 +6795,8 @@ function ModelLab() {
     <div style="font-size:13px">Active for finding clips: <b>${esc(st.active.find.provider)}:${esc(st.active.find.model)}</b> <button class="btn sm" id="ml-rollback">Roll back</button></div>
     ${st.releases.length ? st.releases.map((r) => `<div class="card" style="padding:10px;margin-top:8px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <b>${esc(r.id)}</b> <code>${esc(r.tag || "")}</code> <span class="pill">${esc(r.status)}</span>
-      ${r.status === "candidate" ? `<span style="margin-left:auto;display:flex;gap:6px"><select data-mltask="${r.id}"><option>find</option><option>judge</option><option>meta</option></select><button class="btn sm primary" data-mlpromote="${r.id}">Promote</button></span>` : ""}</div>
+      <span style="margin-left:auto;display:flex;gap:6px">${r.status === "candidate" ? `<select data-mltask="${r.id}"><option>find</option><option>judge</option><option>meta</option></select><button class="btn sm primary" data-mlpromote="${r.id}">Promote</button>` : ""}
+      ${r.status !== "active" ? `<button class="btn sm" data-mlreldel="${r.id}" title="Forget this candidate (its Ollama model stays)">Delete</button>` : ""}</span></div>
       <div style="font-size:12.5px">Candidate: ${card(r.card)} · vs ${esc(r.active_model || "active")}: ${card(r.active_card)}</div>
       ${r.reason ? `<div class="muted" style="font-size:12.5px">${esc(r.reason)}</div>` : ""}
       ${r.model?.license ? `<div style="font-size:12px">Licence: ${esc(r.model.license)}</div>` : ""}
@@ -6444,6 +6838,8 @@ function ModelLab() {
         }
         else if (t.id === "ml-pilot" || t.id === "ml-train") { await api("/api/training/jobs", { body: { ...design(), kind: t.id === "ml-pilot" ? "pilot" : "train" } }); toast("Queued.", "ok"); }
         else if (t.dataset.mljob) { await api(`/api/training/jobs/${t.dataset.id}/${t.dataset.mljob}`, { body: { eval_active: !!$(`[data-mlpaid="${t.dataset.id}"]`)?.checked } }); }
+        else if (t.dataset.mldel) { if (!(await confirmBox("Delete this training job?", "Its folder goes: checkpoint, trained weights and GGUF exports. Candidates already in Ollama stay.", "Delete"))) return; const r = await api(`/api/training/jobs/${t.dataset.mldel}`, { method: "DELETE" }); toast(`Deleted (${gb(r.bytes)} freed).`, "ok"); }
+        else if (t.dataset.mlreldel) { if (!(await confirmBox("Delete this candidate?", "Its record and manifest go; the model stays in Ollama (ollama rm removes it).", "Delete"))) return; await api(`/api/training/releases/${t.dataset.mlreldel}`, { method: "DELETE" }); }
         else if (t.dataset.mlpromote) { const r = await api(`/api/training/releases/${t.dataset.mlpromote}/promote`, { body: { task: $(`[data-mltask="${t.dataset.mlpromote}"]`).value } }); toast(r.reason, r.promoted ? "ok" : "err", 8000); }
         else if (t.id === "ml-rollback") { if (await confirmBox("Roll back?", "The task goes back to the model that was active before the last promotion.", "Roll back")) { const r = await api("/api/training/rollback", { body: { task: "find" } }); toast(`Back to ${r.active}.`, "ok"); } }
         else return;

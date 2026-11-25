@@ -304,3 +304,25 @@ def test_real_render_switches_layout_for_a_section(tmp_path):
     assert _px(out, 0.75, W // 2, H // 12) < 40   # single: the top middle of the centre crop is black
     assert _px(out, 2.5, W // 2, H // 12) > 200   # split (1.5..3.5 s out): the cam box fills the top tier
     assert _px(out, 4.0, W // 2, H // 12) < 40    # back to single after the section
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_caption_text_fits_the_scrubber_at_every_zoom():
+    """Zoomed in: each word at its own spoken time. Narrower: the phrase shrinks, then cuts with '…', then just its
+    first letter - text never vanishes while any of it can fit."""
+    script = r"""
+const T = require(process.argv[1]);
+const meas = (s, size) => s.length * size * 0.6;               // a monospace stand-in for canvas measureText
+const words = [{ s: 0, w: "this" }, { s: 0.5, w: "is" }, { s: 1, w: "insane" }];
+const lay = (pps, x1) => T.captionText(words, 0, x1, (t) => t * pps, meas, 10, 7);
+console.log(JSON.stringify({ wide: lay(200, 400), mid: lay(20, 80), small: lay(10, 30), tiny: lay(3, 9), none: lay(1, 3) }));
+"""
+    res = subprocess.run(["node", "-e", script, str(STATIC / "timeline.js")], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert res.returncode == 0, res.stderr
+    o = json.loads(res.stdout)
+    assert [(p["text"], p["x"]) for p in o["wide"]] == [("this", 0), ("is", 100), ("insane", 200)]  # per word, on its time
+    assert all(p["size"] == 10 for p in o["wide"])
+    assert len(o["mid"]) == 1 and o["mid"][0]["text"] == "this is insane" and 7 <= o["mid"][0]["size"] < 10  # shrunk
+    assert len(o["small"]) == 1 and o["small"][0]["text"].endswith("…") and o["small"][0]["size"] == 7  # cut
+    assert o["tiny"] == [{"text": "t", "x": 1, "size": 7}]   # just the first letter
+    assert o["none"] == []                                   # nothing fits: the block alone shows

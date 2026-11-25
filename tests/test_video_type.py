@@ -150,7 +150,7 @@ def test_upload_and_import_take_a_fixed_type(monkeypatch):
     r = c.post("/api/projects/url", json={"url": "https://example.com/v"})  # default: auto-detect
     assert store.get("project", r.json()["id"]).get("video_type") is None
     assert c.post("/api/projects/url", json={"url": "https://example.com/v", "video_type": "nope"}).status_code == 400
-    r = c.post("/api/projects", files={"file": ("a.mp4", b"x")}, data={"video_type": "vlog"})
+    r = c.post("/api/projects", params={"name": "a.mp4", "video_type": "vlog"}, content=b"x")
     assert store.get("project", r.json()["id"])["video_type"]["type"] == "vlog"
 
 

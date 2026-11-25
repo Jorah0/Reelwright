@@ -14,7 +14,7 @@ import socket
 import threading
 import time
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 from . import config, log, media, pipeline, store
 from .relay import DISCOVER_MAGIC, server_proof, sign
@@ -148,7 +148,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(503, {"detail": "Reelwright's storage folder isn't available right now; try again later"})
         if shutil.disk_usage(config.projects_dir()).free < length + DISK_RESERVE:
             return self._send(507, {"detail": "Not enough disk space on the Reelwright PC for this clip"})
-        source = urllib.parse.unquote(self.headers.get("X-Source", ""))[:60] or self.client_address[0]
+        source = "".join(c for c in urllib.parse.unquote(self.headers.get("X-Source", "")) if c.isprintable())[:60].strip()             or self.client_address[0]  # printable only: it goes into the event log and the project's origin
         kind = self.headers.get("X-Kind", "file") if self.headers.get("X-Kind") in ("replay", "recording", "file") else "file"
         ap = config.load()["obs_autopilot"]
         # whoever holds the token can send clips; they must never be able to post publicly to the creator's channels,
@@ -222,11 +222,11 @@ def apply() -> dict:
         if want and not _state["http"]:
             token()
             try:
-                srv = ThreadingHTTPServer(("0.0.0.0", want), Handler)
+                from .remote import Server  # private-network filter + connection caps; no SO_REUSEADDR on Windows
+                srv = Server(("0.0.0.0", want), Handler)
             except OSError as e:
                 _state["error"] = f"Port {want} is in use or blocked: {e}"
                 return status()
-            srv.daemon_threads = True
             stop = threading.Event()
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             udp = _udp_socket(want)

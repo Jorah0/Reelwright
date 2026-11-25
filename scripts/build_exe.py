@@ -70,6 +70,7 @@ def main():
         "--icon", str(ROOT / "assets" / "reelwright.ico"),
         "--add-data", f"{ROOT / 'reelwright' / 'static'}{SEP}reelwright/static",
         "--add-data", f"{ROOT / 'reelwright' / 'training' / 'worker.py'}{SEP}reelwright/training",  # runs in the training env
+        "--add-data", f"{ROOT / 'reelwright' / 'relay.py'}{SEP}reelwright",  # OBS page: "Download reelwright_relay.py"
         "--collect-all", "faster_whisper", "--collect-all", "ctranslate2", "--collect-all", "webview",
         "--collect-data", "googleapiclient", "--collect-submodules", "uvicorn", "--collect-submodules", "yt_dlp",
         "--collect-submodules", "websockets",  # OBS link: websockets loads its sync client lazily

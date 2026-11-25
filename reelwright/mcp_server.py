@@ -12,7 +12,8 @@ injection, so:
 - a post is always made as an Autopilot post: only to accounts the creator approved AND allowed for Autopilot (the app
   checks again when it uploads, pipeline._refusal), held while Autopilot is paused, in the creator's default privacy;
 - Autopilot can be paused from here, never resumed.
-Light on purpose: it imports nothing of the app (no database, no models), only the standard library and the MCP SDK.
+Light on purpose: of the app it imports only config's port constants (no database, no models), plus the standard
+library and the MCP SDK.
 """
 import json
 import os
@@ -38,13 +39,15 @@ _port: int | None = None
 
 
 def _ports() -> list[int]:
-    want = int(os.environ.get("REELWRIGHT_PORT", 8765))
-    return [want] + [p for p in range(want + 1, want + 35) if p != 8766]  # desktop.pick_port's range
+    from .config import DEFAULT_PORT, app_ports
+    return app_ports(int(os.environ.get("REELWRIGHT_PORT", DEFAULT_PORT)))  # desktop.pick_port's range
 
 
 def _open(method: str, path: str, body, port: int):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method=method, headers={"Content-Type": "application/json"})
+    from .config import app_token  # read per call: the app makes a new token at each start
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method=method,
+                                 headers={"Content-Type": "application/json", "X-Reelwright-Token": app_token()})
     return _NO_PROXY.open(req, timeout=30)
 
 
@@ -218,7 +221,8 @@ def claude_config(port: int | None = None) -> dict:
         py = Path(sys.executable)
         py = py.with_name("python.exe") if py.name.lower() == "pythonw.exe" and py.with_name("python.exe").exists() else py
         entry = {"command": str(py), "args": ["-m", "reelwright", "mcp"], "env": {"PYTHONPATH": str(Path(__file__).resolve().parent.parent)}}
-    if port and not 8765 <= port <= 8799:  # a custom REELWRIGHT_PORT outside the range the server scans
+    from .config import DEFAULT_PORT, app_ports
+    if port and port not in app_ports(DEFAULT_PORT):  # a custom REELWRIGHT_PORT outside the range the app scans
         entry.setdefault("env", {})["REELWRIGHT_PORT"] = str(port)
     return {"mcpServers": {"reelwright": entry}}
 

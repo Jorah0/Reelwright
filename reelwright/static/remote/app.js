@@ -38,6 +38,7 @@ let pair = ls.get(KEY); // {id, secret, name, pc}
 let clockOffset = 0;    // seconds to add to this phone's clock (set from the PC's when they disagree)
 let stale = false;      // the PC refused this phone's key: wait for the user (Try again / pair) instead of polling
 class Unpaired extends Error {}
+class Offline extends Error {} // the PC couldn't be reached (no answer at all)
 const nonce = () => { const b = new Uint8Array(16); crypto.getRandomValues(b); return C.hex(b); };
 
 async function api(path, body, auth = pair, retried = false) {
@@ -49,7 +50,7 @@ async function api(path, body, auth = pair, retried = false) {
   if (text) headers["Content-Type"] = "application/json";
   let r;
   try { r = await fetch(url, { method, headers, body: text || undefined, cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer" }); }
-  catch { throw new Error("Can't reach Reelwright. Is the PC on with Reelwright running, and this phone on the same Wi-Fi?"); }
+  catch { throw new Offline("Can't reach Reelwright. Is the PC on with Reelwright running, and this phone on the same Wi-Fi?"); }
   const buf = new Uint8Array(await r.arrayBuffer());
   let data = {};
   try { data = JSON.parse(new TextDecoder().decode(buf)); } catch { /* not JSON */ }
@@ -64,6 +65,34 @@ async function api(path, body, auth = pair, retried = false) {
   }
   if (!r.ok) throw new Error(data.detail || `Request failed (${r.status}).`);
   return data;
+}
+
+// ---------- offline queue: safe actions (ratings, edits, moves) wait on the phone and are sent when the PC is back ----------
+const QKEY = "rw-queue";
+async function act(path, body, label) {
+  try { return await api(path, body); } catch (e) {
+    if (!(e instanceof Offline)) throw e;
+    const q = ls.get(QKEY) || [];
+    q.push({ path, body, label, at: Date.now() });
+    ls.set(QKEY, q.slice(-50));
+    toast(`Offline: “${label}” is queued and goes to the PC when it's reachable.`, "", null, 6000);
+    return null;
+  }
+}
+let flushing = false;
+async function flushQueue() {
+  const q = ls.get(QKEY) || [];
+  if (!q.length || !pair || stale || flushing) return;
+  flushing = true;
+  const left = [];
+  for (const it of q) {
+    if (left.length) { left.push(it); continue; } // still offline: keep the order
+    try { await api(it.path, it.body); toast(`Sent: ${it.label}`, "ok"); } catch (e) {
+      if (e instanceof Offline) left.push(it); else toast(`${it.label}: ${e.message}`, "err", null, 7000); // refused: dropped, with why
+    }
+  }
+  ls.set(QKEY, left);
+  flushing = false;
 }
 
 // ---------- UI helpers ----------
@@ -249,7 +278,8 @@ async function Home(_, alive) {
     setBadge($("#rev-n"), d.review);
     const hint = standalone || ls.get("rw-hint-off") ? "" : `<div class="card row" id="hint"><span class="grow small">📲 Add Reelwright to your Home Screen for a full-screen app.</span>
       <button class="btn sm" type="button" id="hint-how">How</button><button class="icon" type="button" id="hint-x" aria-label="Dismiss">✕</button></div>`;
-    view.innerHTML = `${hint}
+    const queued = (ls.get(QKEY) || []).length;
+    view.innerHTML = `${hint}${queued ? `<div class="note" style="margin-bottom:10px">${plural(queued, "action")} waiting to be sent: they go as soon as the PC answers.</div>` : ""}
       <div class="card ap ${d.paused ? "paused" : ""}"><span class="dot"></span>
         <div class="grow"><b>Autopilot ${d.paused ? "paused" : "on"}</b><div class="tiny muted">${d.paused ? `${plural(d.held, "post")} held until you resume` : "Scheduling and posting as planned"}</div></div>
         <button class="btn ${d.paused ? "primary" : ""}" type="button" id="ap">${d.paused ? "▶ Resume" : "⏸ Pause"}</button></div>
@@ -318,7 +348,7 @@ async function Review(_, alive) {
     card.style.transform = `translateX(${v * 130}%) rotate(${v * 14}deg)`;
     card.style.opacity = "0";
     try {
-      await api(`clips/${enc(c.id)}/rate`, { rating: v });
+      await act(`clips/${enc(c.id)}/rate`, { rating: v }, `${v > 0 ? "Keep" : "Skip"} “${c.title}”`);
       queue.shift();
       total = Math.max(0, total - 1);
       toast(v > 0 ? `Kept “${c.title}”` : `Skipped “${c.title}”`, v > 0 ? "ok" : "", { label: "Undo", run: async () => {
@@ -391,7 +421,8 @@ async function ClipView(id, alive) {
       <div class="grid2" style="margin-top:12px"><button class="btn" type="button" id="r-1">👎 Skip</button><button class="btn" type="button" id="r1">👍 Keep</button></div>
       <h3>Render</h3><div class="card" id="c-status"></div>
       <h3>Posts</h3><div class="card" id="c-posts"></div>
-      <div class="grid2" style="margin-top:16px"><button class="btn primary" type="button" id="pub">⇪ Publish…</button><button class="btn danger" type="button" id="del">Delete…</button></div>`;
+      ${c.locked ? "" : `<a class="btn block" style="margin-top:16px" href="#edit/${esc(enc(c.id))}">✎ Edit: trim, layout, captions…</a>`}
+      <div class="grid2" style="margin-top:10px"><button class="btn primary" type="button" id="pub">⇪ Publish…</button><button class="btn danger" type="button" id="del">Delete…</button></div>`;
     $("#back").onclick = () => back("#review");
     for (const v of [1, -1]) {
       $(`#r${v}`).onclick = async () => {
@@ -412,32 +443,58 @@ async function ClipView(id, alive) {
   poll(5000, refresh);
 }
 
-function publishSheet(c, onDone) {
-  const ok = c.accounts.filter((a) => a.platform !== "tiktok"), tt = c.accounts.filter((a) => a.platform === "tiktok");
+// Publish a clip (or a long form: lf = true): approved accounts only, the account's description template, AI words, best time.
+async function publishSheet(c, onDone, lf = false) {
+  let info;
+  try {
+    info = lf ? { title: c.title, description: "", accounts: (await api("schedule")).accounts.map((a) => ({ ...a, approved: true, template: "" })), best: {}, ai: {} }
+      : await api(`clips/${enc(c.id)}/publish`);
+  } catch (err) { return fail(err); }
+  const ok = info.accounts.filter((a) => a.approved && a.platform !== "tiktok");
+  const off = info.accounts.filter((a) => !a.approved || a.platform === "tiktok");
   let mode = "now";
-  sheet(`<h2>Publish</h2>
+  sheet(`<h2>Publish${lf ? " long form" : ""}</h2>
     ${ok.length ? ok.map((a, i) => `<label class="check"><input type="checkbox" class="acc" value="${esc(a.id)}" data-plat="${esc(a.platform)}" ${i === 0 ? "checked" : ""}> ${platTag(a.platform)} ${esc(a.name)}</label>`).join("")
       : `<div class="note">No account is approved for uploads yet. On the PC: Publish page → link an account and turn on “Approved for uploads”.</div>`}
-    ${tt.length ? `<div class="note" style="margin:6px 0">TikTok (${tt.map((a) => esc(a.name)).join(", ")}): TikTok asks for its own posting choices, so publish there from the PC.</div>` : ""}
+    ${off.map((a) => `<label class="check" aria-disabled="true" style="opacity:.55"><input type="checkbox" disabled> ${platTag(a.platform)} ${esc(a.name)}
+      <span class="tiny muted">${a.platform === "tiktok" ? "TikTok: publish from the PC (it asks its own posting choices)" : "not approved for uploads (approve it on the PC)"}</span></label>`).join("")}
     <div class="stack" style="margin-top:8px">
-      <label class="field">Title<input type="text" id="pt" maxlength="100" value="${esc(c.title)}"></label>
+      <label class="field">Title<input type="text" id="pt" maxlength="100" value="${esc(info.title || c.title)}"></label>
+      <label class="field">Description<textarea id="pd" rows="3" maxlength="5000">${esc(info.description)}</textarea></label>
+      ${lf ? "" : `<button class="btn sm" type="button" id="pai" ${info.ai.ready ? "" : "disabled"}>✨ Write title and description with AI</button>
+      <div class="tiny muted">${info.ai.ready ? `Uses ${info.ai.provider === "anthropic" ? "Claude (costs a little; the cost is shown after)" : esc(info.ai.provider)}.` : "AI isn't set up on the PC (Settings → AI)."}</div>`}
+      <details id="ptpl"><summary class="small muted">Preview with this account's description template</summary><pre class="snippet" style="white-space:pre-wrap" id="ptv"></pre></details>
       <label class="field">Caption (Instagram)<textarea id="pc" rows="2" maxlength="2200">${esc(c.title)}</textarea></label>
       <label class="field">Visibility (YouTube)<select id="pv"><option value="">As in Settings</option><option value="public">Public</option><option value="unlisted">Unlisted</option><option value="private">Private</option></select></label>
       <label class="check"><input type="checkbox" id="pk"> Made for kids (YouTube)</label>
       <div class="seg" id="pw"><button type="button" class="on" data-v="now">Post now</button><button type="button" data-v="at">Schedule</button></div>
-      <div id="ptl" class="stack" hidden><input type="datetime-local" id="ptime" value="${tomorrow9()}"><button class="btn sm" type="button" id="pbest">★ Best time</button></div>
+      <div id="ptl" class="stack" hidden><input type="datetime-local" id="ptime" value="${tomorrow9()}" aria-label="Post at"><button class="btn sm" type="button" id="pbest">★ Best time</button></div>
       <p class="tiny muted" id="ph" style="margin:0"></p></div>
     <div class="foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="button" id="pgo" ${ok.length ? "" : "disabled"}>Queue post</button></div>`,
   (el, close) => {
     const help = { now: "Posts as soon as the render is ready.", at: "YouTube uploads now as private and goes public at this time; Instagram is posted at this time (the PC must be on)." };
     const setMode = (v) => { mode = v; $$("#pw button", el).forEach((b) => b.classList.toggle("on", b.dataset.v === v)); $("#ptl", el).hidden = v === "now"; $("#ph", el).textContent = help[v]; };
+    const first = () => ok.find((a) => $$(".acc", el).some((x) => x.checked && x.value === a.id));
+    const tpl = () => { const a = first(); $("#ptpl", el).hidden = !a?.template; $("#ptv", el).textContent = a?.template || ""; };
     setMode("now");
+    tpl();
+    el.addEventListener("change", (e) => e.target.classList.contains("acc") && tpl());
     $("#pw", el).onclick = (e) => e.target.dataset.v && setMode(e.target.dataset.v);
-    $("#pbest", el).onclick = async () => {
-      const plat = $$(".acc", el).find((x) => x.checked)?.dataset.plat || "youtube";
+    $("#pai", el)?.addEventListener("click", async (e) => {
+      e.currentTarget.disabled = true;
       try {
-        const r = await api("suggest", { platform: plat });
-        if (r.times?.[0]) { $("#ptime", el).value = toLocalInput(new Date(r.times[0])); toast(`Best time for ${PLATFORM[plat]} (${r.source === "yours" ? "from your results" : r.source === "research" ? "from live research" : "a default until there's data"}).`); }
+        const r = await api(`clips/${enc(c.id)}/meta`, {});
+        $("#pt", el).value = r.title || $("#pt", el).value;
+        $("#pd", el).value = r.description || $("#pd", el).value;
+        toast(r.cost != null ? `Written by ${r.provider === "anthropic" ? "Claude" : r.provider} · cost $${r.cost.toFixed(4)}` : "Written by AI.", "ok");
+      } catch (err) { fail(err); }
+      e.currentTarget.disabled = false;
+    });
+    $("#pbest", el).onclick = async () => {
+      const plat = first()?.platform || "youtube";
+      try {
+        const t = info.best?.[plat] || (await api("suggest", { platform: plat })).times?.[0];
+        if (t) { $("#ptime", el).value = toLocalInput(new Date(t)); toast(`Best time for ${PLATFORM[plat]}.`); }
       } catch (err) { fail(err); }
     };
     $("#pgo", el).onclick = async (e) => {
@@ -447,8 +504,8 @@ function publishSheet(c, onDone) {
       if (t && !(t > new Date())) return toast("Pick a time in the future.", "err");
       e.currentTarget.disabled = true;
       try {
-        await api(`clips/${enc(c.id)}/publish`, { accounts: accs, title: $("#pt", el).value.trim(), caption: $("#pc", el).value.trim(),
-          privacy: $("#pv", el).value || null, made_for_kids: $("#pk", el).checked, when: t ? t.toISOString() : null });
+        await api(`${lf ? "longform" : "clips"}/${enc(c.id)}/publish`, { accounts: accs, title: $("#pt", el).value.trim(), description: $("#pd", el).value.trim(),
+          caption: $("#pc", el).value.trim(), privacy: $("#pv", el).value || null, made_for_kids: $("#pk", el).checked, when: t ? t.toISOString() : null });
         close();
         toast(t ? `Scheduled for ${when(t.toISOString())}.` : "Queued: it posts when the render is ready.", "ok");
         onDone?.();
@@ -479,24 +536,33 @@ function deleteSheet(c) {
   });
 }
 
-let pendingShare = "";
+let pendingShare = "", libFilter = "";
 async function Projects(_, alive) {
   view.innerHTML = `<h1>Projects</h1>
     <form class="card stack" id="imp"><label class="field">Import a video by link
         <input type="text" id="iurl" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Paste a YouTube or Twitch link" value="${esc(pendingShare)}"></label>
       <button class="btn primary" type="submit">Import</button>
       <div class="tiny dim">In the YouTube or Twitch app: Share → Copy link, then paste it here.</div></form>
-    <h3>Your projects</h3><div class="card"><div class="list" id="plist"><div class="muted small"><span class="spin"></span></div></div></div>`;
+    <h3>Your projects</h3><div class="stack" style="gap:8px;margin-bottom:10px"><input type="text" id="psearch" placeholder="Search projects" aria-label="Search projects" autocomplete="off">
+      <div class="seg" id="pfilter">${[["", "All"], ["ready", "Ready"], ["busy", "Working"], ["failed", "Failed"]].map(([k, l]) => `<button type="button" data-f="${k}" class="${k === libFilter ? "on" : ""}">${l}</button>`).join("")}</div></div>
+    <div class="card"><div class="list" id="plist"><div class="muted small"><span class="spin"></span></div></div></div>`;
   pendingShare = "";
-  const draw = async () => {
-    const d = await api("projects");
-    if (!alive()) return;
-    $("#plist").innerHTML = d.projects.length ? d.projects.map((p) => `<a class="item" href="#project/${esc(enc(p.id))}">
+  let last = null;
+  const paintList = () => {
+    const q = $("#psearch").value.trim().toLowerCase(), busy = ["importing", "queued", "analyzing"];
+    const list = last.projects.filter((p) => (!q || p.name.toLowerCase().includes(q)) && (!libFilter || (libFilter === "busy" ? busy.includes(p.status) : p.status === libFilter)));
+    $("#plist").innerHTML = list.length ? list.map((p) => `<a class="item" href="#project/${esc(enc(p.id))}">
         ${p.poster ? `<img class="thumb" src="${esc(p.poster)}" alt="" loading="lazy">` : `<span class="thumb"></span>`}
         <div class="txt"><div class="t">${esc(p.name)}</div><div class="s">${pill(PROJECT, p.status)} ${p.status === "ready" ? plural(p.clips, "clip") : esc(p.status === "failed" ? p.error : p.stage)}</div>
           ${["importing", "analyzing"].includes(p.status) ? bar(p.progress) : ""}</div><span class="chev">›</span></a>`).join("")
-      : `<div class="muted small">No projects yet. Import a link above, or add a video in Reelwright on the PC.</div>`;
+      : `<div class="muted small">${last.projects.length ? "Nothing matches." : "No projects yet. Import a link above, or add a video in Reelwright on the PC."}</div>`;
   };
+  const draw = async () => {
+    last = await api("projects");
+    if (alive()) paintList();
+  };
+  $("#psearch").oninput = paintList;
+  $("#pfilter").onclick = (e) => { const f = e.target.dataset.f; if (f === undefined) return; libFilter = f; $$("#pfilter button").forEach((b) => b.classList.toggle("on", b.dataset.f === f)); paintList(); };
   $("#imp").onsubmit = async (e) => {
     e.preventDefault();
     const b = $("#imp button");
@@ -521,6 +587,7 @@ async function ProjectView(id, alive) {
     <form class="card stack" id="find" style="margin-top:12px"><label class="field">Find more clips
       <input type="text" id="fq" maxlength="300" placeholder="Optional: describe a moment, e.g. “the boss fight”"></label>
       <button class="btn primary" type="submit" id="fgo">✨ Find more clips</button><div class="tiny dim" id="fnote"></div></form>
+    <button class="btn block" type="button" id="reana" style="margin-top:10px">↻ Analyse again</button>
     <h3>Clips</h3><div class="card"><div class="list" id="clist"></div></div>`;
   const paint = () => {
     $("#pn").textContent = p.name;
@@ -530,6 +597,12 @@ async function ProjectView(id, alive) {
     $("#clist").innerHTML = p.items.length ? p.items.map(clipRow).join("") : `<div class="muted small">${p.status === "ready" ? "No clips yet: find some above." : esc(p.stage || "Waiting…")}</div>`;
   };
   $("#back").onclick = () => back("#projects");
+  $("#reana").onclick = async (e) => {
+    if (!(await confirmSheet("Analyse this video again?", "Reelwright re-runs the transcript and clip search on the PC. Your existing clips stay.", "Analyse"))) return;
+    e.currentTarget.disabled = true;
+    try { await api(`projects/${enc(id)}/analyze`, {}); toast("Analysis queued on the PC.", "ok"); } catch (err) { fail(err); }
+    e.currentTarget.disabled = false;
+  };
   $("#find").onsubmit = async (e) => {
     e.preventDefault();
     $("#fgo").disabled = true;
@@ -614,6 +687,257 @@ async function Activity(_, alive) {
   setBadge($("#bell-n"), 0);
 }
 
+// ---------- editor: trim (touch scrubber, frame steps), layout, captions, headline, streamer card, cuts, presets, media ----------
+const secs = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(2).padStart(5, "0")}`;
+const NAME = (k) => String(k || "").replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+
+async function Editor(id, alive) {
+  let d = await api(`clips/${enc(id)}/editor`);
+  if (!alive()) return;
+  let st = { start: d.start, end: d.end }, ed = JSON.parse(JSON.stringify(d.edit)), rendering = false;
+  const frame = 1 / (d.fps || 30), max = Math.max(d.source_duration || 0, d.end);
+  const trim = (k) => `<div class="trim"><div class="row"><b class="grow">${k === "start" ? "In" : "Out"} <span class="mono" id="t-${k}">${secs(st[k])}</span></b>
+      <button class="btn sm" type="button" data-step="${k}" data-d="-1" aria-label="${k === "start" ? "In" : "Out"} back 1 second">−1s</button>
+      <button class="btn sm" type="button" data-step="${k}" data-d="-f" aria-label="${k === "start" ? "In" : "Out"} back 1 frame">‹</button>
+      <button class="btn sm" type="button" data-step="${k}" data-d="f" aria-label="${k === "start" ? "In" : "Out"} forward 1 frame">›</button>
+      <button class="btn sm" type="button" data-step="${k}" data-d="1" aria-label="${k === "start" ? "In" : "Out"} forward 1 second">+1s</button></div>
+    <input type="range" id="r-${k}" min="0" max="${max}" step="${frame}" value="${st[k]}" aria-label="${k === "start" ? "In point" : "Out point"}"></div>`;
+  const draw = () => {
+    const hl = ed.headline || {};
+    view.innerHTML = `<div class="row" style="margin-bottom:10px"><button class="btn sm" type="button" id="back">‹ Clip</button><h1 class="grow" style="margin:0">Edit</h1></div>
+      ${d.locked ? `<div class="note">Posted: the video is final. Make a new version on the PC to change it.</div>` : ""}
+      <div class="rcard">${mediaBox(d, false)}<div class="rbody"><div class="t">${esc(d.title)}</div><div class="tiny muted" id="e-status"></div></div></div>
+      <fieldset ${d.locked ? "disabled" : ""} class="bare">
+      <h3>Trim</h3><div class="card stack">${trim("start")}${trim("end")}<div class="tiny muted" id="t-len"></div></div>
+      <h3>Layout</h3><div class="chips" role="radiogroup" aria-label="Layout">${d.options.layouts.map((l) => `<button type="button" role="radio" aria-checked="${l === ed.layout}" data-layout="${esc(l)}" class="chip ${l === ed.layout ? "on" : ""}">${esc(NAME(l))}</button>`).join("")}</div>
+      <h3>Captions</h3><div class="card stack"><label class="check"><input type="checkbox" id="e-cap" ${ed.captions ? "checked" : ""}> Burn in captions</label>
+        <label class="field">Style<select id="e-style">${d.options.caption_styles.map((x) => `<option ${x === ed.caption_style ? "selected" : ""} value="${esc(x)}">${esc(NAME(x))}</option>`).join("")}</select></label></div>
+      <h3>Headline</h3><div class="card stack"><label class="check"><input type="checkbox" id="e-hl" ${hl.on ? "checked" : ""}> Show a headline</label>
+        <label class="field">Text<input type="text" id="e-hlt" maxlength="120" value="${esc(hl.text || "")}"></label>
+        <label class="field">Theme<select id="e-hlth">${d.options.themes.filter((x) => x !== "custom").map((x) => `<option ${x === (hl.theme || "auto") ? "selected" : ""} value="${esc(x)}">${esc(NAME(x))}</option>`).join("")}</select></label></div>
+      <h3>Streamer card</h3><div class="card"><label class="check"><input type="checkbox" id="e-card" ${ed.streamer_card?.on ? "checked" : ""}> Show the streamer card</label></div>
+      <h3>Cuts</h3><div class="card stack"><div class="list" id="e-cuts"></div>
+        <button class="btn sm" type="button" id="e-addcut">✂ Cut 1 s here (after the in point)</button>
+        <div class="tiny muted">Cuts remove parts of the clip. Move the in point to where a cut should start, then tap the button.</div></div>
+      <h3>Presets</h3><div class="chips">${d.presets.length ? d.presets.map((p) => `<button type="button" class="chip" data-preset="${esc(p.id)}">${p.fav ? "★ " : ""}${esc(p.name)}</button>`).join("") : `<span class="muted small">No presets yet: save one in the Studio on the PC.</span>`}</div>
+      <h3>Sounds and stickers</h3><div class="card stack"><div class="list" id="e-ovs"></div>
+        ${d.assets.length ? `<div class="row"><select id="e-asset" aria-label="Sound or sticker" class="grow">${d.assets.map((a) => `<option value="${esc(a.id)}">${a.kind === "sound" ? "🔊" : "🏷"} ${esc(a.name)}</option>`).join("")}</select>
+          <button class="btn sm" type="button" id="e-addov">Add at in point</button></div>` : `<span class="muted small">Your library has no sounds or stickers yet (add some on the PC).</span>`}</div>
+      </fieldset>
+      <div class="savebar"><button class="btn" type="button" id="e-save" ${d.locked ? "disabled" : ""}>Save</button><button class="btn primary" type="button" id="e-render" ${d.locked ? "disabled" : ""}>Save and render</button></div>`;
+    paint();
+    $("#back").onclick = () => back(`#clip/${enc(id)}`);
+  };
+  const paint = () => {
+    $("#t-start").textContent = secs(st.start);
+    $("#t-end").textContent = secs(st.end);
+    $("#t-len").textContent = `Length ${(st.end - st.start).toFixed(2)} s · frame steps of ${frame.toFixed(3)} s`;
+    $("#e-cuts").innerHTML = (ed.cuts || []).map((c, i) => `<div class="item"><span class="grow small mono">${secs(c[0] - st.start)} → ${secs(c[1] - st.start)}</span><button class="btn sm" type="button" data-uncut="${i}" aria-label="Remove cut">✕</button></div>`).join("") || `<span class="muted small">No cuts.</span>`;
+    $("#e-ovs").innerHTML = (ed.overlays || []).map((o) => `<div class="item"><span class="grow small">${o.kind === "sound" ? "🔊" : "🏷"} ${esc((d.assets.find((a) => a.id === o.asset_id) || {}).name || o.kind)} at ${(+o.t).toFixed(1)} s</span>
+      <button class="btn sm" type="button" data-unov="${esc(o.id)}" aria-label="Remove">✕</button></div>`).join("") || `<span class="muted small">None.</span>`;
+    $("#e-status").textContent = rendering ? "Rendering on the PC…" : d.rendered ? "Preview: the current render." : "Not rendered since the last change.";
+  };
+  const read = () => {
+    ed.captions = $("#e-cap").checked;
+    ed.caption_style = $("#e-style").value;
+    ed.headline = { on: $("#e-hl").checked, text: $("#e-hlt").value.trim(), theme: $("#e-hlth").value };
+    ed.streamer_card = { on: $("#e-card").checked };
+  };
+  const changes = () => {
+    read();
+    const out = {}, e = {};
+    if (Math.abs(st.start - d.start) > 1e-6) out.start = +st.start.toFixed(3);
+    if (Math.abs(st.end - d.end) > 1e-6) out.end = +st.end.toFixed(3);
+    for (const k of ["layout", "captions", "caption_style", "headline", "streamer_card", "cuts"]) if (JSON.stringify(ed[k]) !== JSON.stringify(d.edit[k])) e[k] = ed[k];
+    if (e.headline) e.headline = Object.fromEntries(Object.entries(e.headline).filter(([, v]) => v !== null && v !== undefined));
+    if (Object.keys(e).length) out.edit = e;
+    return out;
+  };
+  const reload = async () => { d = await api(`clips/${enc(id)}/editor`); st = { start: d.start, end: d.end }; ed = JSON.parse(JSON.stringify(d.edit)); if (alive()) draw(); };
+  const save = async () => {
+    const body = changes();
+    if (!Object.keys(body).length) return true;
+    const r = await act(`clips/${enc(id)}/edit`, body, `Edit “${d.title}”`);
+    if (r) { toast("Saved.", "ok", null, 1500); await reload(); }
+    return !!r;
+  };
+  draw();
+  view.oninput = (e) => {
+    const k = e.target.id === "r-start" ? "start" : e.target.id === "r-end" ? "end" : null;
+    if (!k) return;
+    st[k] = +e.target.value;
+    if (st.end - st.start < 0.5) st[k] = k === "start" ? st.end - 0.5 : st.start + 0.5;
+    paint();
+  };
+  view.onclick = async (e) => {
+    const b = e.target.closest("button");
+    if (!b || b.disabled) return;
+    try {
+      if (b.dataset.step) {
+        const k = b.dataset.step, dd = b.dataset.d === "f" ? frame : b.dataset.d === "-f" ? -frame : +b.dataset.d;
+        st[k] = Math.min(max, Math.max(0, st[k] + dd));
+        if (st.end - st.start < 0.5) st[k] -= dd;
+        $(`#r-${k}`).value = st[k];
+        paint();
+      } else if (b.dataset.layout) {
+        ed.layout = b.dataset.layout;
+        $$(".chip[data-layout]").forEach((x) => { x.classList.toggle("on", x === b); x.setAttribute("aria-checked", x === b); });
+      } else if (b.id === "e-addcut") {
+        const a = Math.max(st.start, d.start), cut = [+a.toFixed(3), +Math.min(a + 1, st.end - 0.5).toFixed(3)];
+        if (cut[1] > cut[0]) { ed.cuts = [...(ed.cuts || []), cut]; paint(); }
+      } else if (b.dataset.uncut) {
+        ed.cuts = ed.cuts.filter((_, i) => i !== +b.dataset.uncut);
+        paint();
+      } else if (b.dataset.preset) {
+        if (!(await confirmSheet("Apply this preset?", "Its look (layout, captions, headline…) replaces this clip's. App settings in it are never changed from the phone.", "Apply"))) return;
+        if (!(await save())) return;
+        await api(`clips/${enc(id)}/preset`, { preset_id: b.dataset.preset });
+        toast("Preset applied.", "ok");
+        await reload();
+      } else if (b.id === "e-addov" || b.dataset.unov) {
+        if (!(await save())) return;
+        await api(`clips/${enc(id)}/media`, b.dataset.unov ? { remove: b.dataset.unov } : { asset_id: $("#e-asset").value, t: Math.max(0, +(st.start - d.start).toFixed(2)) });
+        await reload();
+      } else if (b.id === "e-save") {
+        b.disabled = true;
+        await save();
+        b.disabled = false;
+      } else if (b.id === "e-render") {
+        b.disabled = true;
+        if (await save()) {
+          await api(`clips/${enc(id)}/render`, {});
+          rendering = true;
+          paint();
+          toast("Rendering on the PC: the preview updates when it's done.", "ok");
+        }
+        b.disabled = false;
+      }
+    } catch (err) { fail(err); }
+  };
+  poll(3000, async () => { // the live preview: when the PC finishes the render, show it
+    if (!rendering) return;
+    const n = await api(`clips/${enc(id)}/editor`);
+    if (!alive()) return;
+    if (n.rendered && !n.render.busy) { rendering = false; d = n; draw(); toast("Rendered ✓", "ok"); }
+  });
+}
+
+// ---------- schedule: agenda and month, moves follow the PC's reschedule rules ----------
+let schedMode = null;
+async function Schedule(_, alive) {
+  const d = await api("schedule");
+  if (!alive()) return;
+  schedMode = schedMode || ls.get("rw-sched") || "agenda";
+  let month = new Date(), pick = null;
+  month.setDate(1);
+  const items = d.items.filter((i) => i.when).sort((a, b) => Date.parse(a.when) - Date.parse(b.when));
+  const asap = d.items.filter((i) => !i.when);
+  const day = (t) => new Date(t).toDateString();
+  const row = (i) => `<button type="button" class="item" data-move="${esc(i.id)}" style="width:100%;background:none;border-left:0;border-right:0;border-top:0;text-align:left">
+      ${i.cover ? `<img class="thumb" src="${esc(i.cover)}" alt="" loading="lazy">` : `<span class="thumb"></span>`}
+      <div class="txt"><div class="t">${esc(i.title || "Post")}</div><div class="s">${platTag(i.platform)} ${esc(i.account || "")} · ${esc(i.when ? new Date(i.when).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "as soon as rendered")}${i.auto ? " · Autopilot" : ""}</div></div>
+      ${pill(UPLOAD, i.status)}</button>`;
+  const agenda = (list) => {
+    if (!list.length) return `<div class="muted small">Nothing scheduled.</div>`;
+    let out = "", last = "";
+    for (const i of list) {
+      const k = day(i.when);
+      if (k !== last) { out += `<h3 style="margin-top:12px">${esc(new Date(i.when).toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" }))}</h3>`; last = k; }
+      out += row(i);
+    }
+    return out;
+  };
+  const grid = () => {
+    const y = month.getFullYear(), m = month.getMonth(), first = (new Date(y, m, 1).getDay() + 6) % 7, n = new Date(y, m + 1, 0).getDate();
+    const count = {};
+    items.forEach((i) => { const t = new Date(i.when); if (t.getFullYear() === y && t.getMonth() === m) count[t.getDate()] = (count[t.getDate()] || 0) + 1; });
+    const today = new Date().toDateString();
+    let cells = "";
+    for (let i = 0; i < first; i++) cells += `<span></span>`;
+    for (let x = 1; x <= n; x++) {
+      const k = new Date(y, m, x).toDateString();
+      cells += `<button type="button" class="day ${k === today ? "today" : ""} ${k === pick ? "on" : ""}" data-day="${esc(k)}" aria-label="${esc(new Date(y, m, x).toDateString())}${count[x] ? `, ${count[x]} posts` : ""}">${x}${count[x] ? `<i>${count[x]}</i>` : ""}</button>`;
+    }
+    return `<div class="row" style="margin-bottom:8px"><button class="btn sm" type="button" data-mon="-1" aria-label="Previous month">‹</button>
+      <b class="grow" style="text-align:center">${esc(month.toLocaleDateString([], { month: "long", year: "numeric" }))}</b><button class="btn sm" type="button" data-mon="1" aria-label="Next month">›</button></div>
+      <div class="month">${["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((w) => `<span class="wd">${w}</span>`).join("")}${cells}</div>
+      ${pick ? `<div style="margin-top:10px">${agenda(items.filter((i) => day(i.when) === pick))}</div>` : ""}`;
+  };
+  const draw = () => {
+    view.innerHTML = `<div class="row"><h1 class="grow">Schedule</h1>${d.paused ? `<span class="pill warn">Autopilot paused</span>` : ""}</div>
+      <div class="seg" id="smode" style="margin-bottom:12px"><button type="button" data-m="agenda" class="${schedMode === "agenda" ? "on" : ""}">Agenda</button><button type="button" data-m="month" class="${schedMode === "month" ? "on" : ""}">Month</button></div>
+      <div class="card">${schedMode === "month" ? grid() : agenda(items)}</div>
+      ${asap.length ? `<h3>When rendered</h3><div class="card">${asap.map(row).join("")}</div>` : ""}
+      <p class="tiny dim">Tap a post to move it to another time or account. Posts that are uploading or already out can't move.</p>`;
+  };
+  view.onclick = (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.dataset.m) { schedMode = b.dataset.m; ls.set("rw-sched", schedMode); draw(); }
+    if (b.dataset.mon) { month.setMonth(month.getMonth() + +b.dataset.mon); pick = null; draw(); }
+    if (b.dataset.day) { pick = pick === b.dataset.day ? null : b.dataset.day; draw(); }
+    if (b.dataset.move) moveSheet(d.items.find((i) => i.id === b.dataset.move), d.accounts);
+  };
+  draw();
+}
+
+function moveSheet(i, accs) {
+  const fixed = ["uploading", "done"].includes(i.status);
+  sheet(`<h2>Move “${esc(i.title || "post")}”</h2>
+    ${fixed ? `<div class="note">${i.status === "uploading" ? "It's uploading right now." : "It's already posted."} It can't be moved.</div>` : `<div class="stack">
+      <label class="field">Post at<input type="datetime-local" id="mt" value="${esc(i.when ? toLocalInput(new Date(i.when)) : tomorrow9())}"></label>
+      <label class="field">Account<select id="ma">${accs.map((a) => `<option value="${esc(a.id)}" ${a.id === i.account_id ? "selected" : ""}>${esc(PLATFORM[a.platform] || a.platform)} · ${esc(a.name)}</option>`).join("")}</select></label></div>`}
+    <div class="foot"><button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="button" id="mgo" ${fixed ? "disabled" : ""}>Move</button></div>`,
+  (el, close) => {
+    $("#mgo", el).onclick = async (e) => {
+      const t = new Date($("#mt", el).value);
+      if (!(t > new Date())) return toast("Pick a time in the future.", "err");
+      const body = { when: t.toISOString() }, a = $("#ma", el).value;
+      if (a && a !== i.account_id) body.account_id = a;
+      e.currentTarget.disabled = true;
+      try {
+        const r = await act(`uploads/${enc(i.id)}/move`, body, `Move “${i.title || "post"}”`);
+        close();
+        if (r) { toast(`Moved to ${when(r.when)}.`, "ok"); route(); }
+      } catch (err) { e.currentTarget.disabled = false; fail(err); }
+    };
+  });
+}
+
+// ---------- long form ----------
+async function LongForm(_, alive) {
+  const draw = async () => {
+    const d = await api("longform");
+    if (!alive()) return;
+    view.innerHTML = `<h1>Long form</h1>${d.items.length ? `<div class="card"><div class="list">${d.items.map((x) => `<div class="item"><div class="txt">
+        <div class="t">${esc(x.title)}</div><div class="s">${dur(x.duration)} · ${x.locked ? "posted" : x.busy ? "rendering…" : x.rendered ? "rendered" : "not rendered"}${x.error ? ` · ${esc(x.error)}` : ""}</div></div>
+        ${x.locked ? "" : `<button class="btn sm" type="button" data-lfr="${esc(x.id)}" ${x.busy || x.rendered ? "disabled" : ""}>Render</button>
+        <button class="btn sm primary" type="button" data-lfp="${esc(x.id)}">Publish</button>`}</div>`).join("")}</div></div>`
+      : `<div class="empty"><b>No long-form edits</b>Make one on the PC (a project's Long form tab): it shows up here to render and publish.</div>`}`;
+    view.onclick = async (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      try {
+        if (b.dataset.lfr) { b.disabled = true; await api(`longform/${enc(b.dataset.lfr)}/render`, {}); toast("Rendering on the PC.", "ok"); draw().catch(fail); }
+        if (b.dataset.lfp) publishSheet(d.items.find((x) => x.id === b.dataset.lfp), () => draw().catch(fail), true);
+      } catch (err) { fail(err); }
+    };
+  };
+  await draw();
+  poll(8000, draw);
+}
+
+// ---------- more ----------
+async function More() {
+  view.innerHTML = `<h1>More</h1><div class="card"><div class="list">
+      <a class="item" href="#longform"><span class="txt"><span class="t">🎬 Long form</span><div class="s">Render and publish long-form edits</div></span><span class="chev">›</span></a>
+      <a class="item" href="#board"><span class="txt"><span class="t">⇶ Pipeline board</span><div class="s">Every video and clip by stage</div></span><span class="chev">›</span></a>
+      <a class="item" href="#obs"><span class="txt"><span class="t">⏺ OBS</span><div class="s">Clip that, markers, recording</div></span><span class="chev">›</span></a>
+      <a class="item" href="#activity"><span class="txt"><span class="t">🔔 Activity</span><div class="s">Renders, posts and failures</div></span><span class="chev">›</span></a></div></div>
+    <button class="btn block" type="button" id="more-menu" style="margin-top:12px">⋯ App and pairing</button>`;
+  $("#more-menu").onclick = menuSheet;
+}
+
 // ---------- activity badge (polled while the app is open: no push without HTTPS) ----------
 let newest = null;
 async function checkActivity() {
@@ -626,13 +950,15 @@ async function checkActivity() {
 }
 
 // ---------- routing ----------
-const routes = { home: Home, review: Review, projects: Projects, project: ProjectView, board: Board, obs: Obs, activity: Activity, clip: ClipView };
-const TAB = { project: "projects", clip: "review", activity: "" };
+const routes = { home: Home, review: Review, projects: Projects, project: ProjectView, board: Board, obs: Obs, activity: Activity, clip: ClipView,
+  edit: Editor, schedule: Schedule, longform: LongForm, more: More };
+const TAB = { project: "projects", clip: "review", edit: "review", activity: "more", board: "more", obs: "more", longform: "more" };
 let seq = 0;
 async function route() {
   timers.forEach(clearInterval);
   timers = [];
   view.onclick = null;
+  view.oninput = null;
   $$(".scrim").forEach((s) => s.remove());
   const h = location.hash.slice(1);
   if (h.startsWith("pair=")) return PairScreen(decodeURIComponent(h.slice(5)));
@@ -664,6 +990,8 @@ $("#menu").onclick = menuSheet;
 window.addEventListener("hashchange", route);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) checkActivity().catch(() => {}); });
 setInterval(() => { if (!document.hidden) checkActivity().catch(() => {}); }, 20000);
+window.addEventListener("online", () => flushQueue());
+setInterval(() => { if (!document.hidden) flushQueue(); }, 15000);
 if ("serviceWorker" in navigator && window.isSecureContext) navigator.serviceWorker.register("sw.js").catch(() => {}); // http:// Wi-Fi: not available, and not needed
 
 { // shared from another app (Web Share Target: where the platform supports it): prefill the import form
@@ -672,3 +1000,4 @@ if ("serviceWorker" in navigator && window.isSecureContext) navigator.serviceWor
 }
 route();
 checkActivity().catch(() => {});
+flushQueue();

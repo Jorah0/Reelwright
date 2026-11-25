@@ -4,8 +4,11 @@ from __future__ import annotations
 import base64
 import bisect
 import contextvars
+import gc
 import math
+import sys
 import threading
+import time
 from typing import Literal, Optional
 
 import numpy as np
@@ -19,6 +22,37 @@ from .media import LAYOUTS, REGION_LAYOUTS
 _whisper = {}
 _whisper_lock = threading.Lock()
 _cuda_broken = False
+_whisper_used = 0.0  # time.monotonic() when the last transcription ended
+WHISPER_IDLE_S = 600.0  # an unused model is freed after this long (VRAM for renders, training, games; RAM on CPU)
+
+
+def whisper_on_cuda() -> bool:
+    """Whether the next transcription will run on the GPU (setting "whisper_device", a CUDA device, CUDA not failed)."""
+    device = config.load()["whisper_device"]
+    if device == "cpu" or (device == "auto" and _cuda_broken):
+        return False
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:  # not installed / no driver
+        return False
+
+
+def release_whisper(idle: float = WHISPER_IDLE_S) -> bool:
+    """Free the resident Whisper model once it sat unused for `idle` s (the scheduler asks every tick); never while a
+    transcription holds it. The next transcription reloads it (a few seconds)."""
+    if not _whisper or time.monotonic() - _whisper_used < idle or not _whisper_lock.acquire(blocking=False):
+        return False
+    try:
+        _whisper.clear()  # CTranslate2 frees the model's GPU memory when the last reference goes
+    finally:
+        _whisper_lock.release()
+    gc.collect()
+    torch = sys.modules.get("torch")  # only if something already loaded it: never import torch just to empty a cache
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    log.event("whisper", f"model released after {idle / 60:.0f} min unused")
+    return True
 
 
 def _enable_cuda_dlls():
@@ -79,7 +113,7 @@ def transcribe(path, duration: float, progress=None, vocab: str = "") -> dict:
     """Speech -> segments with word times. Audio goes in WINDOW_S windows (media.pcm), on CUDA through faster-whisper's
     batched pipeline. vocab = hotwords (brand names, slang) for every window; setting "whisper_language" pins the
     language, else the first window with speech (or a confident detection) decides it for the rest."""
-    global _cuda_broken
+    global _cuda_broken, _whisper_used
     s = config.load()
     devices = ["cuda", "cpu"] if s["whisper_device"] == "auto" else [s["whisper_device"]]
     if _cuda_broken and len(devices) > 1:
@@ -105,6 +139,7 @@ def transcribe(path, duration: float, progress=None, vocab: str = "") -> dict:
                     cut = _stitch(out, segs, off, cut, None if final else end, progress, duration)
                     if not lang and (len(out) > had or (getattr(info, "language_probability", 0) or 0) >= 0.5):
                         lang = info.language  # a silent or music-only opening doesn't decide the whole video's language
+                _whisper_used = time.monotonic()
                 return {"language": lang or info.language, "device": device, "segments": out}
             except media.DecodeError:
                 raise  # the file, not the GPU: no CPU retry, and CUDA stays trusted
@@ -149,12 +184,16 @@ def provider_cfg(provider: str, task: str) -> dict:
 
 
 def provider_ready(name: str) -> bool:
+    if config.DEMO:  # demo mode: callers take their non-AI fallback
+        return False
     return bool(config.api_key()) if name == "anthropic" else bool(config.provider(name).get("model"))
 
 
 def ready(task: str) -> bool:
     """Whether the AI path for a task can run (callers fall back to heuristics when not)."""
     p = route(task)
+    if config.DEMO:
+        return False
     return provider_ready(p) or (p != "anthropic" and bool(provider_cfg(p, task).get("model")))
 
 
@@ -164,6 +203,8 @@ def _ask(system: str, user: str | list | tuple[str, str | list], schema: type[Ba
     of the same video then re-read the transcript from cache (~10% of the price, faster). Keep volatile text in task.
     user (or task) may also be a list of content blocks, e.g. text interleaved with image blocks.
     Routed (setting "ai_routes", or provider=) to another provider, the same call goes through providers.ask."""
+    if config.DEMO:  # never a paid (or any remote) AI call in demo mode
+        raise RuntimeError("Demo mode: AI features are off (nothing is sent to any AI provider).")
     routed = TASK_OF.get(schema.__name__, "other")
     provider = provider or route(routed)
     if provider != "anthropic":

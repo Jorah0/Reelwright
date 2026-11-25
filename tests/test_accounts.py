@@ -176,20 +176,20 @@ def test_tiktok_sign_in_state_routes_the_login_to_the_right_account(monkeypatch)
     monkeypatch.setattr(platforms.httpx, "post", post_)
     monkeypatch.setattr(platforms.httpx, "get", get_)
 
-    url = platforms.tiktok_auth_url(8765)  # "+ Add another account"
+    url = platforms.tiktok_auth_url(38765)  # "+ Add another account"
     q = httpx.URL(url).params
     assert q["disable_auto_auth"] == "1"  # TikTok always shows its authorization page
-    new = platforms.tiktok_callback("code", q["state"], 8765)
+    new = platforms.tiktok_callback("code", q["state"], 38765)
     assert new["id"] != old["id"] and new["name"] == "Name o2" and not new["approved"]
     assert accounts.get(old["id"])["access_token"] == "T"  # the first account's sign-in is untouched
 
     open_id["v"] = "o1"  # Reconnect the first account
-    url = platforms.tiktok_auth_url(8765, account_id=old["id"])
-    again = platforms.tiktok_callback("code", httpx.URL(url).params["state"], 8765)
+    url = platforms.tiktok_auth_url(38765, account_id=old["id"])
+    again = platforms.tiktok_callback("code", httpx.URL(url).params["state"], 38765)
     assert again["id"] == old["id"] and accounts.get(old["id"])["access_token"] == "NEW-o1" and accounts.get(old["id"])["approved"]
     assert len(accounts.all_accounts("tiktok")) == 2
     with pytest.raises(RuntimeError, match="start the TikTok connection again"):
-        platforms.tiktok_callback("code", "forged-state", 8765)
+        platforms.tiktok_callback("code", "forged-state", 38765)
 
 
 def test_youtube_sign_in_goes_to_a_new_account_and_offers_the_account_picker(monkeypatch, tmp_path):

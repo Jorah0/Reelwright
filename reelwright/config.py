@@ -13,13 +13,41 @@ ROOT = Path(__file__).resolve().parent.parent
 FROZEN = getattr(sys, "frozen", False)  # running as the packaged Reelwright.exe
 _default_data = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Reelwright" if FROZEN else ROOT / "data"
 DATA = Path(os.environ.get("REELWRIGHT_DATA", _default_data)).resolve()
+# demo mode (demo.py): a seeded sandbox library; no platform upload, no paid/remote AI call, no real account is ever used
+DEMO = os.environ.get("REELWRIGHT_DEMO") == "1"
 DEFAULT_PROJECTS = DATA / "projects"  # where project folders live unless the creator picks another folder: use projects_dir()
 STATIC = Path(__file__).resolve().parent / "static"
 SETTINGS_FILE = DATA / "settings.json"
 YT_SECRET = DATA / "youtube_client_secret.json"
 YT_TOKEN = DATA / "youtube_token.json"
+TOKEN_FILE = DATA / "app-token"  # the running app's per-launch API token (server.py writes it at start-up)
+
+
+def app_token() -> str:
+    """What local tools (desktop's second launch, the MCP helper, scripts/update_exe.py) send as X-Reelwright-Token: this
+    data folder's token and, from a source checkout, the installed Reelwright.exe's too (comma-separated; one must match)."""
+    out = []
+    exe = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Reelwright" / TOKEN_FILE.name
+    for f in dict.fromkeys((TOKEN_FILE, exe)):
+        try:
+            out.append(f.read_text("utf-8").strip())
+        except OSError:
+            pass
+    return ",".join(t for t in dict.fromkeys(out) if t)
 
 DEFAULT_PROJECTS.mkdir(parents=True, exist_ok=True)  # never a chosen folder: a missing one is flagged, not recreated
+
+# Reelwright's own port block: clear of other local apps (Lodestar and others use 8765), of Windows' excluded TCP ranges
+# and below the 49152+ dynamic range. REELWRIGHT_PORT overrides the main one. relay.DISCOVERY_PORT must equal the LAN one.
+DEFAULT_PORT = 38765         # the main app on 127.0.0.1 (the TikTok redirect URI is registered against it)
+DEFAULT_LAN_PORT = 38766     # the OBS receiver (lan.py) and its UDP discovery
+DEFAULT_REMOTE_PORT = 38810  # the phone remote (remote.py): outside the main app's fallback range
+OLD_PORTS = {"lan_port": 8766, "remote_port": 8810}  # the defaults before 38765; migrate_ports moves these once
+
+
+def app_ports(want: int) -> list[int]:
+    """Where the main app may run: `want`, else the next 34 ports (never the LAN or phone remote default)."""
+    return [want] + [p for p in range(want + 1, want + 35) if p not in (DEFAULT_LAN_PORT, DEFAULT_REMOTE_PORT)]
 
 DEFAULTS = {
     "anthropic_api_key": "",
@@ -40,7 +68,7 @@ DEFAULTS = {
     "autopilot_paused": False,  # stops Autopilot everywhere; its queued posts are held, not deleted
     # OBS over the network: an optional receiver other PCs' Reelwright Relay pushes clips to (token-protected)
     "lan_receive": False,
-    "lan_port": 8766,
+    "lan_port": DEFAULT_LAN_PORT,
     "lan_token": "",
     "obs_autopilot": {"enabled": False},  # Autopilot settings applied to clips arriving from OBS
     # storage + space saver (storage.py). storage_dir / storage_move / retention_since / retention_at are set by the app only
@@ -55,8 +83,9 @@ DEFAULTS = {
     "archive_other_dir": "",    # sources and long forms ("" = the uploaded-clips folder)
     # phone remote (remote.py): a separate opt-in Wi-Fi listener for the phone app; one signing secret per paired phone
     "remote_enabled": False,
-    "remote_port": 8810,        # outside the main app's 8765-8799 fallback range and the LAN receiver's 8766
+    "remote_port": DEFAULT_REMOTE_PORT,  # outside the main app's fallback range (app_ports) and the LAN receiver's
     "remote_devices": [],       # [{id, name, secret, created, paired_at}] (never sent to any browser)
+    "remote_dev_sim": False,    # Developer: the phone simulator's pairing shortcut (loopback only; never reachable from the LAN)
     "ui_scale": {},             # per-component interface scale, e.g. {"app": 1.1, "text": 1.2} (kept across restarts/updates)
     "close_to_taskbar": True,   # the window's ✕ minimizes (jobs keep running); "Quit Reelwright" exits
     # other AI providers (providers.py): which one each task uses, their settings, and the two-model consensus mode
@@ -93,8 +122,13 @@ DEFAULTS = {
     # publishing & security (vault.py, routes_publish.py): secrets sealed with DPAPI (see SEALED), disclosure, templates
     "ai_disclosure": "auto",    # auto: label posts as AI content when the clip used AI-generated media | always
     "description_template": "Full stream: {source_url}",  # added to each post's text; an account's own template wins.
-                                # {title} {hook} {description} {source_url} {vod_time} {channel} {hashtags}; a line whose
-                                # variables are all empty is left out ("" = no template)
+                                # {title} {hook} {description} {source_url} {vod_time} {channel} {hashtags} {attributions};
+                                # a line whose variables are all empty is left out ("" = no template). {attributions} (credits
+                                # for CC BY media the clip uses) is added at the end when a template doesn't place it
+    # online media search (media_search.py, routes_media.py): the creator's own free API keys, sealed (never sent to a browser)
+    "media_keys": {},           # {"giphy" | "freesound" | "pixabay" | "pexels": key}
+    "media_monetized": False,   # the channel earns money: non-commercial (CC BY-NC) sounds are hidden and flagged in QA
+    "giphy_storage_ok": False,  # GIPHY's API terms forbid storing its GIFs: importing needs the creator's written OK from GIPHY
     # model marketplace (models/, routes_models.py): named hardware profiles hold back VRAM; selections live in the store
     "model_hw_profiles": [{"name": "Idle", "reserve_gib": 0}, {"name": "OBS live", "reserve_gib": 3}],
     "model_hw_profile": "Idle",  # the profile fit estimates use by default
@@ -105,8 +139,13 @@ DEFAULTS = {
     "training_target": "",      # a remote Ollama / Reelwright host the specialist is exported to and fit-checked on ("" = this PC)
     "training_margin": 0.02,    # promote only when precision@k beats the active model by this much
     "training_tolerance": 0.02, # ...and no golden eval metric gets worse than this
+    # the move to the 38765 port block (migrate_ports): done once; the notices stay until dismissed in the UI
+    "ports_migrated": False,
+    "notice_tiktok_redirect": False,  # Publish page + guide: register http://localhost:38765/oauth/tiktok/callback
+    "notice_remote_rescan": False,    # Phone remote: paired phones must scan a new QR code (new address = new storage)
+    "notice_lan_relay": False,        # OBS page: relay scripts already on other PCs still look for the old 8766 port
 }
-SEALED = ("anthropic_api_key", "lan_token", "gsi_token", "vts_token", "remote_devices")  # + ai_providers.*.api_key
+SEALED = ("anthropic_api_key", "lan_token", "gsi_token", "vts_token", "remote_devices", "media_keys")  # + ai_providers.*.api_key
 PROVIDER_DEFAULTS = {
     "ollama": {"base_url": "http://127.0.0.1:11434", "model": "", "num_ctx": 16384},
     "openai": {"base_url": "https://api.openai.com/v1", "model": "", "api_key": "", "vision": True},
@@ -195,6 +234,31 @@ def save(patch: dict) -> dict:
     return cur
 
 
+def migrate_ports() -> list[str]:
+    """Once per install, at startup: a LAN / phone-remote port still on its old default (8766 / 8810) moves to the new
+    block; a port the user chose stays. An install that existed before also gets the TikTok redirect notice (shown only when
+    a TikTok app is set up), the phone notice when the remote's port moved with phones paired, and the relay notice when the
+    OBS receiver's port moved on an install that was receiving clips from relays. Returns what moved."""
+    with _lock:
+        raw = _raw()
+        existed = bool(raw)  # an install from before (a fresh one has no settings yet)
+        if raw.get("ports_migrated"):
+            return []
+        patch: dict = {"ports_migrated": True, "notice_tiktok_redirect": existed}
+        moved = []
+        for k, old in OLD_PORTS.items():
+            if raw.get(k) == old:
+                patch[k] = DEFAULTS[k]
+                moved.append(f"{k} {old} -> {DEFAULTS[k]}")
+        if "remote_port" in patch and load()["remote_devices"]:  # phones paired at the old address
+            patch["notice_remote_rescan"] = True
+        if "lan_port" in patch and raw.get("lan_receive"):  # relays out there use 8766 (lan_token alone isn't a sign:
+            # the OBS page makes one just by being opened)
+            patch["notice_lan_relay"] = True
+        save(patch)
+    return moved
+
+
 def locked() -> list[str]:
     """Secret settings sealed on another PC or Windows user (they read as empty here)."""
     raw = _raw()
@@ -215,6 +279,8 @@ def forget_locked() -> None:
 
 
 def api_key() -> str:
+    if DEMO:  # demo mode never calls a paid AI
+        return ""
     return load()["anthropic_api_key"] or os.environ.get("ANTHROPIC_API_KEY", "")
 
 
@@ -225,6 +291,7 @@ def public() -> dict:
         s.pop(k)      # the OBS page shows the relay token through /api/obs/lan)
     s["vault_locked"] = locked()  # secrets sealed on another PC / Windows user: enter them again
     key = api_key()
+    s["media_keys_set"] = {p: bool(v) for p, v in (load()["media_keys"] or {}).items()}  # which are set, never the keys
     s["anthropic_key_set"] = bool(key)
     s["anthropic_key_hint"] = f"…{key[-4:]}" if key else ""
     s["ai_providers"] = {}

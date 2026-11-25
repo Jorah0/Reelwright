@@ -15,6 +15,8 @@ deleted, or moved to archive folders under readable names with a sidecar JSON. E
 and no clock starts before the creator switched the space saver on ("retention_since"), so nothing already on disk goes
 early. Never touched: anything pinned with Keep (the item or its whole project), anything with a pending post or a
 queued/running job on its project. Analysis files, posters, clip docs, post history and learning feedback always stay.
+Model Lab files (scope "training", off unless ticked; in the app data folder) go by the same days, in delete mode only:
+see _prune_training.
 """
 import hashlib
 import json
@@ -34,7 +36,7 @@ DAY = 86400.0
 RESERVE = 2 * 1024 ** 3   # a move or an archive copy never fills a drive to its last 2 GB
 STARTUP_DELAY = 300       # the first clean-up after a start waits 5 minutes
 MODES = ("off", "delete", "archive")
-SCOPE_DEFAULTS = {"sources": True, "unfinished": True, "uploaded": True, "longform": True, "local_sources": False}
+SCOPE_DEFAULTS = {"sources": True, "unfinished": True, "uploaded": True, "longform": True, "local_sources": False, "training": False}
 PENDING = {"waiting_render", "queued", "scheduled", "held", "uploading", "needs_auth"}
 ARCHIVE_KEYS = ("archive_uploaded_dir", "archive_unfinished_dir", "archive_other_dir")
 APP_KEYS = ("storage_dir", "storage_move", "retention_since", "retention_at")  # set by the app, never through PUT /api/settings
@@ -167,7 +169,12 @@ def usage() -> dict:
                     kind = ("renders" if top == ("exports",) else
                             "sources" if (not top and f == proj.get("source")) or (top == ("angles",) and video) else "other")
                     out[kind] += n
-    return {**out, "total": sum(out.values()), "chatlogs": _chat_size(chatlog.DIR)}
+    try:
+        from .training import runner
+        training = runner.usage()  # app data folder, like the chat logs: not part of total
+    except OSError:  # a file removed mid-walk: shown next time
+        training = {"jobs": 0, "exports": 0, "datasets": 0}
+    return {**out, "total": sum(out.values()), "chatlogs": _chat_size(chatlog.DIR), "training": training}
 
 
 def _chat_size(d: Path) -> int:
@@ -356,10 +363,14 @@ def source_url(p: dict) -> str | None:
 def _items(pol: dict, project_ids=None) -> list[dict]:
     """Everything the policy covers, each with its due time; pinned, out-of-scope and already removed items left out."""
     scope, out = pol["scope"], []
-    projects = {p["id"]: p for p in store.find("project") if not project_ids or p["id"] in project_ids}
-    by_item: dict[str, list] = {}
-    for u in store.find("upload"):
-        by_item.setdefault(u.get("longform_id") or u.get("clip_id"), []).append(u)
+    if project_ids:  # the Editor's poll: its own project, not the whole library
+        projects = {p["id"]: p for p in filter(None, (store.get("project", pid) for pid in project_ids))}
+    else:
+        projects = {p["id"]: p for p in store.find("project")}
+    done_at: dict[str, list] = {}  # clip / long-form id -> when each of its done posts went out (fields: no whole uploads)
+    for _, lid, cid, status, at in store.fields("upload", "longform_id", "clip_id", "status", "uploaded_at"):
+        if status == "done":
+            done_at.setdefault(lid or cid, []).append(_ts(at))
 
     def add(kind, doc, proj, bucket, clock):
         out.append({"kind": kind, "id": doc["id"], "project_id": proj["id"], "bucket": bucket,
@@ -371,18 +382,21 @@ def _items(pol: dict, project_ids=None) -> list[dict]:
             continue
         if scope["sources" if source_url(p) else "local_sources"]:
             add("source", p, p, "other", max(_ts(p.get("created")), _ts(p.get("source_at"))))
+    names = ("project_id", "keep", "expired", "export", "created", "title", "name")  # what a due date needs, not the edit
     for kind in ("clip", "longform"):
-        for d in store.find(kind):
-            p = projects.get(d["project_id"])
-            if not p or p.get("keep") or d.get("keep") or d.get("expired") or not (d.get("export") or {}).get("file"):
+        rows = ([r for pid in projects for r in store.fields(kind, *names, project_id=pid)] if project_ids
+                else store.fields(kind, *names))
+        for did, pid, keep, expired, export, created, title, name in rows:
+            p, export = projects.get(pid), export or {}
+            if not p or p.get("keep") or keep or expired or not export.get("file"):
                 continue
-            done = [u for u in by_item.get(d["id"], []) if u.get("status") == "done"]
-            made = max(_ts(d.get("created")), _ts((d.get("export") or {}).get("at")))
+            d, done = {"id": did, "title": title, "name": name}, done_at.get(did, [])
+            made = max(_ts(created), _ts(export.get("at")))
             if kind == "longform":
                 if scope["longform"]:
-                    add(kind, d, p, "other", max([_ts(u.get("uploaded_at")) for u in done] or [made]))
+                    add(kind, d, p, "other", max(done or [made]))
             elif done and scope["uploaded"]:
-                add(kind, d, p, "uploaded", max(_ts(u.get("uploaded_at")) for u in done) or made)
+                add(kind, d, p, "uploaded", max(done) or made)
             elif not done and scope["unfinished"]:
                 add(kind, d, p, "unfinished", made)
     return out
@@ -567,6 +581,11 @@ def cleanup(job: dict | None = None, now: float | None = None) -> dict:
             _prune_chatlogs(pol, now)  # in the app's data folder: not held by a missing storage drive
         except OSError:
             log.error("retention", "chat logs")
+        if pol["scope"]["training"]:
+            try:
+                _prune_training(pol, now)  # also in the app's data folder
+            except OSError:
+                log.error("retention", "training files")
     if not pol["mode"] or hold_reason():
         return {"done": done, "skipped": skipped}
     due = [i for i in _items(pol) if i["due"] <= now]
@@ -609,6 +628,40 @@ def _prune_chatlogs(pol: dict, now: float) -> None:
                 pass
     if gone:
         log.event("retention", f"deleted {gone} chat log(s) older than {pol['days']:.0f} days")
+
+
+def _prune_training(pol: dict, now: float) -> None:
+    """Model Lab files past the space saver's days, in delete mode only (archive mode moves nothing out of Model Lab,
+    so it deletes nothing there either): finished jobs' folders (checkpoints, adapters, GGUF exports) and their records,
+    then dataset folders no remaining job uses (their records stay for lineage; the newest build always stays). Never a
+    queued/running/paused job, nor one any release record points at (a candidate not yet released included: its files
+    are what Release loads), nor the active release or the one Roll back returns to (runner.delete_job refuses those)."""
+    from .training import dataset, runner
+    if pol["mode"] != "delete":
+        return
+    due = lambda t: max(t, pol["since"]) + pol["days"] * DAY <= now  # noqa: E731
+    rels = store.find("train_release")
+    keep = {(r.get("manifest") or {}).get("train_job") for r in rels}
+    gone = 0
+    for j in store.find("train_job"):
+        if j["status"] in runner.LIVE or j["id"] in keep or not due(max(_ts(j.get("created")), _ts(j.get("finished")))):
+            continue
+        try:
+            gone += runner.delete_job(j["id"])["bytes"]
+        except (RuntimeError, ValueError, LookupError):  # live, protected or in use: kept (retried next run)
+            continue
+    used = {(j.get("result") or {}).get("dataset") for j in store.find("train_job")} | \
+        {(r.get("hashes") or {}).get("dataset") for r in rels}
+    for d in store.find("train_dataset")[1:]:  # newest first: the latest build stays
+        folder = dataset.root() / d["id"][:16]
+        stamp = folder / "manifest.json"
+        if d["id"] in used or not d["id"].isalnum() or not folder.is_dir():
+            continue
+        if due(max(_ts(d.get("created")), stamp.stat().st_mtime if stamp.is_file() else 0)):
+            gone += runner.size(folder)
+            shutil.rmtree(folder)
+    if gone:
+        log.event("retention", f"deleted {gb(gone)} of old training files")
 
 
 def tick() -> None:
@@ -682,31 +735,22 @@ def start() -> None:
 
 # ---------------- re-import a removed source ----------------
 
-def reimport(p: dict, fileobj, filename: str) -> dict:
-    """Put a removed source back from a file the creator picks. It must be the same video (same length), so every clip's
-    times still line up."""
+def reimport(p: dict, src: Path, filename: str) -> dict:
+    """Put a removed source back from a file the creator picks (src: it, already received into the storage folder; the
+    caller removes it if this refuses). It must be the same video (same length), so every clip's times still line up."""
     if not p.get("source_removed"):
         raise ValueError("This project still has its source video.")
-    ext = Path(filename or "").suffix.lower()
-    if ext not in media.VIDEO_EXT:
-        raise ValueError(f"Unsupported file type {ext or '(none)'}.")
     check_writable()
-    dst = pipeline.pdir(p["id"]) / f"source{ext}"
-    tmp = dst.with_name(f".reimport{ext}")
+    dst = pipeline.pdir(p["id"]) / f"source{Path(src).suffix.lower()}"
     try:
-        with open(tmp, "wb") as f:
-            shutil.copyfileobj(fileobj, f, 8 * 1024 * 1024)
-        try:
-            meta = media.probe(tmp)
-        except Exception:
-            raise ValueError("That file isn't a readable video.") from None
-        want = float((p.get("meta") or {}).get("duration") or 0)
-        if want and abs(float(meta["duration"]) - want) > 1.5:
-            raise ValueError(f"That video is {meta['duration']:.0f} s long and the original was {want:.0f} s: choose the "
-                             "same video, so your clips still line up.")
-        os.replace(tmp, dst)
-    finally:
-        tmp.unlink(missing_ok=True)
+        meta = media.probe(src)
+    except Exception:
+        raise ValueError("That file isn't a readable video.") from None
+    want = float((p.get("meta") or {}).get("duration") or 0)
+    if want and abs(float(meta["duration"]) - want) > 1.5:
+        raise ValueError(f"That video is {meta['duration']:.0f} s long and the original was {want:.0f} s: choose the "
+                         "same video, so your clips still line up.")
+    os.replace(src, dst)
     log.event("storage", f"re-imported the source of project {p['id']} from {filename}")
     return store.update("project", p["id"], {"source": dst.name, "source_removed": None, "source_at": pipeline.now_iso(),
                                              "meta": {**(p.get("meta") or {}), **meta}})
@@ -762,27 +806,26 @@ def import_short_paths(paths: list, video_type: dict | None = None) -> dict:
     return {"added": added, "duplicates": dups, "skipped": skipped}
 
 
-def import_short_upload(fileobj, filename: str, video_type: dict | None = None) -> dict:
-    """One short uploaded from the browser: hashed while it is written, so a duplicate never becomes a project."""
-    ext = Path(filename or "").suffix.lower()
-    if ext not in media.VIDEO_EXT:
-        raise ValueError(f"Unsupported file type {ext or '(none)'}.")
-    check_writable()
-    tmp, h = root() / f".incoming-{store.new_id()}{ext}", hashlib.sha256()
+def import_short_upload(src: Path, filename: str, digest: str, video_type: dict | None = None) -> dict:
+    """One short uploaded from the browser (src: already received into the storage folder, hashed on the way in; the
+    caller removes it if it isn't moved): a duplicate never becomes a project."""
+    dup = _duplicate(digest)
+    if dup:
+        return {"duplicate": {"id": dup["id"], "name": dup.get("name"), "file": filename}}
+    p = pipeline.new_project(Path(filename).stem, None, origin={"kind": SHORT_ORIGIN, "file": Path(filename).name},
+                             video_type=video_type)
+    return {"project": adopt_upload(p, src, source_hash=digest)}
+
+
+def adopt_upload(p: dict, src: Path, **fields) -> dict:
+    """Move a received upload into its new project (a rename: same folder tree) and queue the analysis. If the move
+    fails the half-made project goes too, never left "importing" forever."""
+    ext = Path(src).suffix.lower()
     try:
-        with open(tmp, "wb") as out:
-            while chunk := fileobj.read(8 * 1024 * 1024):
-                h.update(chunk)
-                out.write(chunk)
-        dup = _duplicate(h.hexdigest())
-        if dup:
-            return {"duplicate": {"id": dup["id"], "name": dup.get("name"), "file": filename}}
-        p = pipeline.new_project(Path(filename).stem, None, origin={"kind": SHORT_ORIGIN, "file": Path(filename).name},
-                                 video_type=video_type)
-        os.replace(tmp, pipeline.pdir(p["id"]) / f"source{ext}")
-        store.update("project", p["id"], {"source": f"source{ext}", "source_hash": h.hexdigest(), "status": "queued",
-                                          "stage": "Queued for analysis"})
-        pipeline.submit("analyze", project_id=p["id"])
-        return {"project": store.get("project", p["id"])}
-    finally:
-        tmp.unlink(missing_ok=True)
+        os.replace(src, pipeline.pdir(p["id"]) / f"source{ext}")
+    except OSError:
+        pipeline.delete_project(p["id"])
+        raise
+    store.update("project", p["id"], {"source": f"source{ext}", "status": "queued", "stage": "Queued for analysis", **fields})
+    pipeline.submit("analyze", project_id=p["id"])
+    return store.get("project", p["id"])

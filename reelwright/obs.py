@@ -11,13 +11,18 @@ import socket
 import threading
 import time
 
-from . import config, log, pipeline, store
-from .relay import OBS, OBSError, saved_file
+from . import config, log, pipeline, store, vault
+from .relay import OBS, OBSAuthError, OBSError, OBSNotRunning, saved_file
 
 ACTIONS = {"save_replay": "SaveReplayBuffer", "start_replay": "StartReplayBuffer", "stop_replay": "StopReplayBuffer",
            "start_record": "StartRecord", "stop_record": "StopRecord"}
 _threads: dict[str, threading.Thread] = {}
 _started = False
+# Retry caps (seconds). OBS on this PC is usually just not open yet (Start with Windows opens Reelwright first): try
+# every few seconds so it links moments after OBS opens. Another PC backs off further; a wrong password retries slowly.
+LOCAL_CAP, REMOTE_CAP, AUTH_WAIT = 5, 60, 60
+# status: connecting (not tried yet) / connected / waiting (OBS not open, or its WebSocket server off) / auth (wrong or
+# missing password) / offline (other PC unreachable or another error) / off (turned off)
 
 
 def url(conn: dict) -> str:
@@ -47,6 +52,22 @@ def map_path(path: str, rules: list, host: str) -> str | None:
     return path if is_local(host) else None
 
 
+def password(conn: dict) -> str:
+    """The OBS password, unsealed (vault.py). One sealed on another PC / Windows user reads as empty: OBS then says it
+    needs a password, which is what the user has to do (enter it again)."""
+    try:
+        return vault.unseal(conn.get("password")) or ""
+    except vault.Locked:
+        return ""
+
+
+def reseal() -> None:
+    """Seal every saved OBS password (or write it back plain after vault.rollback); vault._reseal_all at each start."""
+    for c in store.find("obs"):
+        if c.get("password"):
+            store.update("obs", c["id"], fn=lambda d: d.update(password=vault.keep(d.get("password"), d.get("password"))))
+
+
 def public(conn: dict) -> dict:
     """Safe for the browser: never send the OBS password back (and a recording's marks only as a count)."""
     rec = conn.get("rec")
@@ -55,11 +76,11 @@ def public(conn: dict) -> dict:
 
 
 def connect(conn: dict, events: bool = False) -> OBS:
-    return OBS(url(conn), conn.get("password", ""), events=events).connect()
+    return OBS(url(conn), password(conn), events=events).connect()
 
 
 def probe(conn: dict) -> dict:
-    with OBS(url(conn), conn.get("password", ""), events=False) as o:
+    with OBS(url(conn), password(conn), events=False) as o:
         v = o.request("GetVersion")
         out = {"obs_version": v.get("obsVersion"), "websocket_version": v.get("obsWebSocketVersion"),
                "platform": v.get("platformDescription")}
@@ -80,7 +101,7 @@ def action(conn: dict, what: str) -> dict:
         return {"ok": True, "marks": mark(source="ui", cid=conn["id"])}
     if what not in ACTIONS:
         raise RuntimeError(f"Unknown OBS action {what}")
-    with OBS(url(conn), conn.get("password", ""), events=False) as o:
+    with OBS(url(conn), password(conn), events=False) as o:
         o.request(ACTIONS[what])
     return probe(conn)
 
@@ -219,6 +240,22 @@ def handle_file(conn: dict, path: str, kind: str, markers: list | None = None) -
     return p
 
 
+def _delay(host: str, status: str, backoff: int) -> int:
+    """Seconds before the next try: slow after a wrong password, short for OBS on this PC, longer for another PC."""
+    if status == "auth":
+        return AUTH_WAIT
+    return min(backoff, LOCAL_CAP if is_local(host) else REMOTE_CAP)
+
+
+def _pause(cid: str, rev: int, seconds: int) -> None:
+    """Wait before retrying, but stop early when the user turns the connection off, removes or edits it."""
+    for _ in range(int(seconds)):
+        time.sleep(1)
+        cur = store.get("obs", cid)
+        if not cur or not cur.get("enabled") or cur.get("rev", 0) != rev:
+            return
+
+
 def _watch(cid: str):
     backoff = 2
     while True:
@@ -227,7 +264,7 @@ def _watch(cid: str):
             break
         rev = conn.get("rev", 0)
         try:
-            with OBS(url(conn), conn.get("password", ""), events=True) as o:
+            with OBS(url(conn), password(conn), events=True) as o:
                 store.update("obs", cid, {"status": "connected", "error": "", "connected_at": pipeline.now_iso()})
                 _sync_recording(cid, o)
                 backoff = 2
@@ -243,17 +280,20 @@ def _watch(cid: str):
                                      or kind == "recording" and cur.get("import_recordings")):
                             handle_file(cur, path, kind, marks)
         except Exception as e:
+            local = is_local(conn["host"])
+            st = ("auth" if isinstance(e, OBSAuthError) else
+                  "waiting" if isinstance(e, OBSNotRunning) or (local and isinstance(e, OBSError)) else "offline")
             if not isinstance(e, OBSError):
                 log.error("obs", f"watcher {cid}")
-            elif store.get("obs", cid).get("status") != "offline":
+            cur = store.get("obs", cid)
+            if not cur:
+                break  # removed meanwhile
+            if isinstance(e, OBSError) and cur.get("status") != st:  # log each change of state once, not every retry
                 log.event("obs", f"{conn.get('name')}: {e}")
-            store.update("obs", cid, {"status": "offline", "error": str(e)[:300]})
-            for _ in range(backoff):  # wait, but notice quickly if the user disables or edits it
-                time.sleep(1)
-                cur = store.get("obs", cid)
-                if not cur or not cur.get("enabled") or cur.get("rev", 0) != rev:
-                    break
-            backoff = min(backoff * 2, 60)
+            if (cur.get("status"), cur.get("error")) != (st, str(e)[:300]):  # written on a change, not every retry
+                store.update("obs", cid, {"status": st, "error": str(e)[:300]})
+            _pause(cid, rev, _delay(conn["host"], st, backoff))
+            backoff = min(backoff * 2, REMOTE_CAP)
     if store.get("obs", cid):
         store.update("obs", cid, {"status": "off"})
     _threads.pop(cid, None)
@@ -267,18 +307,35 @@ def reconcile():
             _threads[conn["id"]].start()
 
 
+def reset_status() -> None:
+    """At start: a status left by the last run (killed or crashed while "connected") is stale until the watcher links
+    again. Until then a stale recording must not take marks (recording() needs "connected") nor the UI claim a live link."""
+    for c in store.find("obs"):
+        st = "connecting" if c.get("enabled") else "off"
+        if c.get("status") != st:
+            store.update("obs", c["id"], {"status": st})
+
+
+def _tick():
+    try:
+        reconcile()
+    except Exception:  # a store hiccup must not end auto-linking: the next tick tries again
+        log.error("obs", "reconcile failed")
+
+
 def start():
     global _started
     if _started:
         return
     _started = True
+    try:
+        reset_status()
+    except Exception:
+        log.error("obs", "status reset failed")
 
     def loop():
         while True:
-            try:
-                reconcile()
-            except Exception:
-                log.error("obs", "reconcile failed")
+            _tick()
             time.sleep(5)
 
     threading.Thread(target=loop, daemon=True).start()
@@ -289,4 +346,5 @@ def start():
 def lan_status() -> dict:  # convenience for the UI: both ways of receiving OBS clips in one call
     from . import lan
     return {**lan.status(), "connections": [public(c) for c in store.find("obs")], "hostname": socket.gethostname(),
-            "obs_autopilot": config.load()["obs_autopilot"]}
+            "obs_autopilot": config.load()["obs_autopilot"],
+            "relay_notice": bool(config.load()["notice_lan_relay"])}  # the receiver's port moved (config.migrate_ports)

@@ -17,9 +17,12 @@ _db.execute("CREATE TABLE IF NOT EXISTS docs (kind TEXT, id TEXT, created REAL, 
 _db.execute("DROP INDEX IF EXISTS docs_created")  # ponytail: with it the planner sorts by date instead of using a field index
 for _f in INDEXED:
     _db.execute(f"CREATE INDEX IF NOT EXISTS docs_{_f} ON docs (kind, json_extract(data, '$.{_f}'))")
+_CLIP_PID, _CLIP_EXP = "json_extract(data, '$.project_id')", "json_extract(data, '$.expired')"
+_db.execute(f"CREATE INDEX IF NOT EXISTS docs_clip_live ON docs (kind, {_CLIP_PID}, {_CLIP_EXP}, created, id)")  # covers live_clips
 _db.commit()
 _lock = threading.RLock()
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_PATH = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")  # a field or a nested one: "edit.aspect"
 
 
 def new_id() -> str:
@@ -72,13 +75,47 @@ def find(kind: str, /, **match) -> list[dict]:  # positional-only so docs can be
     return [d for d in docs if all(d.get(k) == v for k, v in match.items())]
 
 
-def fields(kind: str, *names: str) -> list[tuple]:
-    """(id, *those fields' values) for every doc of a kind, newest first, without parsing whole docs (missing = None)."""
-    assert all(_NAME.fullmatch(n) for n in names)
+def fields(kind: str, /, *names: str, **match: str) -> list[tuple]:
+    """(id, *those fields' values) for every doc of a kind, newest first, without parsing whole docs (missing = None).
+    A name may be nested ("edit.aspect"). `match` narrows the rows to docs whose field equals that string (indexed for INDEXED)."""
+    assert all(_PATH.fullmatch(n) for n in names) and all(_NAME.fullmatch(k) for k in match) and all(isinstance(v, str) and _sql_value(v) for v in match.values())
     cols = "".join(f", data -> '$.{n}'" for n in names)  # -> gives each value as JSON text: loads() returns it exactly
+    where = "".join(f" AND json_extract(data, '$.{k}') = ?" for k in match)  # a JSON string's text: == as in Python
     with _lock:
-        rows = _db.execute(f"SELECT id{cols} FROM docs WHERE kind=? ORDER BY created DESC", (kind,)).fetchall()
+        rows = _db.execute(f"SELECT id{cols} FROM docs WHERE kind=?{where} ORDER BY created DESC", (kind, *match.values())).fetchall()
     return [(r[0], *(None if v is None else json.loads(v) for v in r[1:])) for r in rows]
+
+
+def slim(kind: str, /, *names: str, **match: str) -> list[dict]:
+    """Stand-ins for find(kind, **match) holding only these fields (nested names rebuild their parent dicts, always
+    present): what list views read, without parsing each doc's bulk (a clip's edit words / track). A missing or null
+    field is left out, so .get() defaults behave as on the whole doc."""
+    out = []
+    for row in fields(kind, *names, **match):
+        d = {"id": row[0]}
+        for name, v in zip(names, row[1:]):
+            *parents, leaf = name.split(".")
+            t = d
+            for p in parents:
+                t = t.setdefault(p, {})
+            if v is not None:
+                t[leaf] = v
+        out.append(d)
+    return out
+
+
+def live_clips(expired: bool = False) -> dict:
+    """project id -> (how many of its clips have no truthy "expired", the newest such clip's id); expired=True counts all. Read from the covering
+    index docs_clip_live, so no clip JSON is parsed (3,000 clips: ~150 ms -> ~2 ms on every /api/projects poll).
+    ponytail: "expired" is a mark dict or absent; a JSON string "{}" / "[]" there would count as not expired."""
+    with _lock:
+        rows = _db.execute(f"SELECT {_CLIP_PID}, {_CLIP_EXP}, id FROM docs WHERE kind='clip' ORDER BY created DESC").fetchall()
+    out: dict = {}
+    for pid, exp, cid in rows:
+        if expired or exp in (None, 0, "", "[]", "{}"):  # json_extract: falsy JSON -> NULL / 0 / '' / '[]' / '{}'
+            n, first = out.get(pid, (0, cid))
+            out[pid] = (n + 1, first)
+    return out
 
 
 def newest(kind: str, n: int) -> list[dict]:
@@ -101,10 +138,24 @@ def update(kind: str, id: str, patch: dict | None = None, fn=None) -> dict | Non
         return put(kind, doc)
 
 
+PLAN_OF = {"clip": "clip_id", "longform": "longform_id"}  # an AI edit plan goes with the clip / long form it was for
+
+
 def delete(kind: str, id: str) -> None:
     with _lock:
         _db.execute("DELETE FROM docs WHERE kind=? AND id=?", (kind, id))
+        if kind in PLAN_OF:  # every delete path (Editor, Pipeline board, project delete, re-analysis) drops its plans
+            _db.execute(f"DELETE FROM docs WHERE kind='plan' AND json_extract(data, '$.{PLAN_OF[kind]}') = ?", (id,))
         _db.commit()
+
+
+def keep_newest(kind: str, n: int) -> int:
+    """Delete all but the n newest docs of a kind; returns how many went."""
+    with _lock:
+        gone = _db.execute("DELETE FROM docs WHERE kind=? AND id NOT IN (SELECT id FROM docs WHERE kind=? ORDER BY created DESC LIMIT ?)",
+                           (kind, kind, n)).rowcount
+        _db.commit()
+    return gone
 
 
 JOB_DAYS = 7
@@ -120,5 +171,6 @@ def prune_jobs(days: float = JOB_DAYS) -> int:
         n = _db.execute(f"DELETE FROM docs WHERE kind='job' AND json_extract(data, '$.status') IN ('done', 'failed', 'canceled') "
                         f"AND coalesce(json_extract(data, '$.kind'), '') NOT IN ({','.join('?' * len(JOB_KEEP))}) AND {last} < ?",
                         (*JOB_KEEP, cutoff)).rowcount
+        _db.execute("DELETE FROM docs WHERE kind='plan' AND created < ?", (cutoff,))  # unapplied AI plans: stale after a week
         _db.commit()
     return n

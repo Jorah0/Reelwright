@@ -23,6 +23,7 @@ _ai = queue.Queue()       # Claude + metadata lookups (search, virality, trainin
 _uploads = queue.Queue()  # network uploads, one at a time
 _enqueued: set[str] = set()
 _started = False
+REPORTS_KEPT = 200  # virality reports: the Reports page lists the newest 50; a clip's badge links its own (recent) one
 _serial = threading.Lock()  # analysis holds it per job; a render takes it too when it must not run alongside
 QUEUE_OF = {"upload": _uploads, "find": _ai, "virality": _ai, "train": _ai, "research": _ai, "scan_source": _ai, "results": _ai,
             "cleanup": _ai, "export": _render, "longform_export": _render, "proxy": _render, "track": _render}
@@ -63,24 +64,32 @@ def load_json(pid: str, name: str, default=None):
         return default
 
 
-_words_memo: dict = {}  # transcript path -> ((mtime_ns, size), its words)
+_segs_memo: dict = {}  # transcript path -> ((mtime_ns, size), its segments)
+
+
+def transcript_segments(pid: str, copy: bool = False) -> list[dict]:
+    """The transcript's segments, parsed once per file version (mtime + size): Triage, Remote and Live cards, lessons
+    and renders each used to re-read a 5-20 MB transcript per clip. The list is SHARED: read it only. copy=True gives
+    segments (and their word dicts) the caller may change."""
+    f = pdir(pid) / "transcript.json"
+    try:
+        st = f.stat()  # before the read: a write in between leaves an old key, so the next call re-parses
+    except FileNotFoundError:
+        return []
+    key, hit = (st.st_mtime_ns, st.st_size), _segs_memo.get(f)
+    if not hit or hit[0] != key:
+        segs = json.loads(f.read_text("utf-8")).get("segments") or []
+        if len(_segs_memo) >= 3:  # ponytail: a few projects at most (a 20 MB transcript is ~100 MB parsed); LRU if it thrashes
+            _segs_memo.clear()
+        _segs_memo[f] = hit = (key, segs)
+    if copy:
+        return [{**s, "words": [dict(w) for w in s["words"]]} if "words" in s else dict(s) for s in hit[1]]
+    return hit[1]
 
 
 def transcript_words(pid: str) -> list[dict]:
-    """Every transcript word, in order. The parse is kept per file version (mtime + size): Autopilot renders N clips of
-    one VOD and each used to re-read a 10-20 MB transcript. Callers get their own word dicts."""
-    f = pdir(pid) / "transcript.json"
-    try:
-        st = f.stat()
-    except FileNotFoundError:
-        return []
-    key, hit = (st.st_mtime_ns, st.st_size), _words_memo.get(f)
-    if not hit or hit[0] != key:
-        words = [w for seg in json.loads(f.read_text("utf-8"))["segments"] for w in seg.get("words", [])]
-        if len(_words_memo) >= 4:  # ponytail: a few projects' words at most; renders of one VOD come in a row
-            _words_memo.clear()
-        _words_memo[f] = hit = (key, words)
-    return [dict(w) for w in hit[1]]
+    """Every transcript word, in order, as the caller's own dicts."""
+    return [dict(w) for seg in transcript_segments(pid) for w in seg.get("words", [])]
 
 
 def save_json(pid: str, name: str, data) -> None:
@@ -111,7 +120,7 @@ def guidance() -> str:
 # why: "rated" (explicit 👍/👎, always wins) | "published" (implicit +1) | "dismissed" (deleted an AI pick unrated, -1)
 
 def clip_text(clip: dict) -> str:
-    segs = load_json(clip["project_id"], "transcript.json", {"segments": []})["segments"]
+    segs = transcript_segments(clip["project_id"])
     return " ".join(s["text"] for s in segs if clip["start"] <= s["start"] < clip["end"])
 
 
@@ -120,8 +129,9 @@ def remember(clip: dict | None, why: str) -> None:
     if not clip or clip.get("parts"):  # gone, or a montage (a compilation, not a pick)
         return
     try:
+        snap = _snapshot(clip)  # file reads stay outside the store lock: other threads' writes don't wait on them
         with store._lock:  # read-decide-write as one step so quick rating toggles can't interleave
-            _remember(clip, why)
+            _remember(clip, why, snap)
     except Exception:
         log.error("learning", f"remember {why} {clip.get('id')}")
 
@@ -131,7 +141,7 @@ def _snapshot(clip: dict) -> dict:
     proj = store.get("project", clip["project_id"]) or {}
     feats = clip.get("features")
     if not feats:
-        segs = load_json(clip["project_id"], "transcript.json", {"segments": []})["segments"]
+        segs = transcript_segments(clip["project_id"])
         feats = learn.features(clip, segs, load_json(clip["project_id"], "signals.json", {}) or {},
                                (proj.get("meta") or {}).get("duration") or clip["end"])
     ab = clip.get("ai_bounds")
@@ -144,11 +154,11 @@ def _snapshot(clip: dict) -> dict:
             "video_type": (proj.get("video_type") or {}).get("type")}
 
 
-def _remember(clip: dict, why: str) -> None:
+def _remember(clip: dict, why: str, snap: dict) -> None:
     old = store.get("feedback", clip["id"])
     if why == "refresh":  # the clip was edited after a lesson was recorded: keep the verdict, update what it says
         if old:
-            store.put("feedback", {**old, **_snapshot(clip)})
+            store.put("feedback", {**old, **snap})
         return
     if why == "rated":
         signal = clip.get("rating") or 0
@@ -156,7 +166,7 @@ def _remember(clip: dict, why: str) -> None:
             if old and old["why"] == "rated":
                 store.delete("feedback", clip["id"])
             if clip.get("posts"):
-                _remember(clip, "published")
+                _remember(clip, "published", snap)
             return
     elif old or (why == "dismissed" and not replaceable(clip)):
         return  # implicit signals never overwrite a lesson; only deleting an untouched AI pick means "not this"
@@ -164,7 +174,7 @@ def _remember(clip: dict, why: str) -> None:
         signal = 1 if why == "published" else -1
     keep = {k: old[k] for k in RESULT_FIELDS if old and k in old}  # real results survive a re-rating
     store.put("feedback", {"id": clip["id"], "created": time.time(), "project_id": clip["project_id"], "signal": signal,
-                           "why": why, **_snapshot(clip), **keep})
+                           "why": why, **snap, **keep})
 
 
 def feedback(limit: int = 200) -> list[dict]:
@@ -315,6 +325,13 @@ def _render_gate():
 
 
 def _run_job(jid: str):
+    try:
+        _run(jid)
+    finally:
+        _enqueued.discard(jid)  # finished (or skipped): the set only ever holds what is waiting or running
+
+
+def _run(jid: str):
     job = store.get("job", jid)
     if not job or job["status"] == "canceled":
         return
@@ -499,6 +516,10 @@ def _detect_type(pid: str, src, dur: float, signals: dict | None, segs: list | N
     return (store.update("project", pid, fn=keep_user) or {}).get("video_type") or vt
 
 
+class _Abandoned(BaseException):
+    """Raised inside the GPU Whisper thread of an analysis that already failed."""
+
+
 def _analyze(job):
     pid = job["project_id"]
     proj = store.update("project", pid, {"status": "analyzing", "error": ""})
@@ -522,38 +543,67 @@ def _analyze(job):
     if meta["has_audio"]:
         step(0, "Analyzing audio energy and silences", 0.08, 0.12)  # one decode: silences fill in signals["silences"]
         signals["waveform"], signals["loud"] = media.audio_signals(src, signals["silences"])
-    step(0, "Detecting scene cuts and on-screen action", 0.12, 0.25)
-    from . import hud  # screen events the creator taught (hud.py): matched in the same decode, saved before markers merge
-    tpl = hud.active()
-    try:  # one decode for both; the on-screen part is best-effort and clip finding works without it
-        signals["visual"] = vision.analyze(src, meta, lambda f: step(f, None, 0.12, 0.25), faces=faces, scenes=True,
-                                           sprite=(count, pdir(pid) / "sprite.jpg"),
-                                           **({"hud": tpl} if tpl else {}))  # no templates: the call is exactly as before
-        signals["scenes"] = signals["visual"].pop("scenes")
-        sprite = signals["visual"].pop("sprite", False)
-        hud.save_markers(pid, signals["visual"].pop("hud", None), tpl)
-    except Exception as e:
-        log.event("vision", f"on-screen analysis skipped: {e}")
-        signals.pop("visual", None)
-        signals["scenes"] = media.scenes(src)
-        sprite = False
-    if not sprite:  # no frames from the on-screen pass: the sprite's own decode
-        try:
-            media.sprite(src, dur, pdir(pid) / "sprite.jpg", count)
-            sprite = True
-        except RuntimeError:
-            pass
-    if sprite:
-        store.update("project", pid, {"sprite_count": count})
-    chat = next(pdir(pid).glob("*.live_chat.json"), None)
-    if chat:
-        signals["chat"] = chat_counts(chat, dur)
-    save_json(pid, "signals.json", signals)
+    heard: dict = {}  # Whisper on the GPU hears the audio while the on-screen pass (CPU) decodes the frames
+    shown = threading.Event()  # its progress shows once the on-screen pass is done (one bar, never jumping back)
+    stop = threading.Event()  # the job failed before the join: the GPU Whisper gives up at its next segment
 
-    transcript = {"segments": [], "language": None}
-    if meta["has_audio"]:
-        step(0, "Transcribing speech (Whisper)", 0.3, 0.3)
-        transcript = ai.transcribe(src, dur, lambda f: step(f, None, 0.3, 0.8), vocab=sig.vocab(proj, config.load(), active_profile()))
+    def heard_progress(f):
+        if stop.is_set():
+            raise _Abandoned  # not an Exception: ai.transcribe doesn't retry it on the CPU, and its lock is released
+        shown.is_set() and step(f, None, 0.3, 0.8)
+
+    def listen():
+        try:
+            heard["t"] = ai.transcribe(src, dur, heard_progress, vocab=sig.vocab(proj, config.load(), active_profile()))
+        except BaseException as e:  # re-raised by the job thread at the join below
+            heard["e"] = e
+    ear = threading.Thread(target=listen, name=f"whisper-{pid}", daemon=True) if meta["has_audio"] and ai.whisper_on_cuda() else None
+    if ear:
+        ear.start()
+    try:  # until the GPU Whisper is joined: a failure here must not leave it running (and holding the GPU)
+        step(0, "Detecting scene cuts and on-screen action", 0.12, 0.25)
+        from . import hud  # screen events the creator taught (hud.py): matched in the same decode, saved before markers merge
+        tpl = hud.active()
+        try:  # one decode for both; the on-screen part is best-effort and clip finding works without it
+            signals["visual"] = vision.analyze(src, meta, lambda f: step(f, None, 0.12, 0.25), faces=faces, scenes=True,
+                                               sprite=(count, pdir(pid) / "sprite.jpg"),
+                                               **({"hud": tpl} if tpl else {}))  # no templates: the call is exactly as before
+            signals["scenes"] = signals["visual"].pop("scenes")
+            sprite = signals["visual"].pop("sprite", False)
+            hud.save_markers(pid, signals["visual"].pop("hud", None), tpl)
+        except Exception as e:
+            log.event("vision", f"on-screen analysis skipped: {e}")
+            signals.pop("visual", None)
+            signals["scenes"] = media.scenes(src)
+            sprite = False
+        if not sprite:  # no frames from the on-screen pass: the sprite's own decode
+            try:
+                media.sprite(src, dur, pdir(pid) / "sprite.jpg", count)
+                sprite = True
+            except RuntimeError:
+                pass
+        if sprite:
+            store.update("project", pid, {"sprite_count": count})
+        chat = next(pdir(pid).glob("*.live_chat.json"), None)
+        if chat:
+            signals["chat"] = chat_counts(chat, dur)
+        save_json(pid, "signals.json", signals)
+
+        transcript = {"segments": [], "language": None}
+        if meta["has_audio"]:
+            step(0, "Transcribing speech (Whisper)", 0.3, 0.3)
+            if ear:  # started before the on-screen pass: wait for it (CPU Whisper stays serial: it would fight vision for cores)
+                shown.set()
+                ear.join()
+                if "e" in heard:
+                    raise heard["e"]
+                transcript = heard["t"]
+            else:
+                transcript = ai.transcribe(src, dur, lambda f: step(f, None, 0.3, 0.8), vocab=sig.vocab(proj, config.load(), active_profile()))
+    finally:
+        if ear and ear.is_alive():  # this job failed before the join: stop it at its next segment, then wait for it
+            stop.set()
+            ear.join()
     save_json(pid, "transcript.json", transcript)
     store.update("project", pid, {"has_transcript": bool(transcript["segments"]), "language": transcript.get("language")})
     _video_type(pid, src, dur, signals, transcript["segments"])  # refine an unsure guess now that the words are known
@@ -602,7 +652,7 @@ def visual_picks(spikes: list[dict], clip_max: float, dur: float) -> list[dict]:
 def _find(pid: str, query: str, job: dict | None = None, count: int | None = None, target=None, max_len=None):
     s = config.load()
     proj = store.get("project", pid)
-    segs = load_json(pid, "transcript.json", {"segments": []})["segments"]
+    segs = transcript_segments(pid, copy=True)  # handed on to the AI / heuristics: their own copy
     signals = load_json(pid, "signals.json", {})
     if proj.get("source") and not proj.get("source_removed"):  # lets the long-video judge look at frames (ai.rank_moments)
         signals["video"] = str(pdir(pid) / proj["source"])
@@ -739,6 +789,20 @@ def streamer_guess(proj: dict) -> dict:
     return {k: v for k, v in out.items() if v}
 
 
+def _preset_for_new(proj: dict | None, c: dict, length: float, preset_id: str | None = None) -> dict:
+    """A preset's edit for a new clip (the default one, or preset_id): a headline gets this clip's hook as its text and a
+    streamer card's empty fields come from the source, as with the single-purpose defaults."""
+    from . import routes_presets  # static, function-level: routes_presets uses server, which imports this module
+    pre = routes_presets.new_clip_edit(proj, length, preset_id)
+    if (pre.get("headline") or {}).get("on"):
+        text = media.headline_text(c.get("hook") or c.get("title"))
+        pre["headline"] = {**pre["headline"], "text": text} if text else {**pre["headline"], "on": False}
+    if (pre.get("streamer_card") or {}).get("on"):
+        guess = streamer_guess(proj or {})
+        pre["streamer_card"] = {**pre["streamer_card"], **{k: v for k, v in guess.items() if not pre["streamer_card"].get(k)}}
+    return pre
+
+
 def new_clip(pid: str, c: dict, source: str = "manual", query: str = "", parts: list | None = None) -> dict:
     s = config.load()
     proj = store.get("project", pid)
@@ -749,9 +813,6 @@ def new_clip(pid: str, c: dict, source: str = "manual", query: str = "", parts: 
         edit.update(aspect=t["aspect"], layout=t["layout"], caption_style=t["caption_style"], caption_pos=t["caption_pos"])
     edit.update(learn.house_style(feedback()))  # what the creator actually keeps choosing beats the profile's guess
     edit.update(default_layout(proj))  # a layout saved as default beats both
-    m = proj.get("meta") or {}
-    if m.get("height", 1) > m.get("width", 0) and edit["aspect"] != "source":
-        edit.update(aspect="9:16", layout="single")  # already vertical
     hl = (store.get("pref", "headline") or {}).get("edit")  # "headline on new clips": the saved look, this clip's hook as text
     if hl and (text := media.headline_text(c.get("hook") or c.get("title"))):
         edit.update(hl, headline={**hl.get("headline", {}), "on": True, "text": text})
@@ -759,6 +820,11 @@ def new_clip(pid: str, c: dict, source: str = "manual", query: str = "", parts: 
     if sc.get("auto") and sc.get("card"):  # "streamer card on new clips": the saved card, empty fields from this source
         guess = streamer_guess(proj or {})
         edit["streamer_card"] = {**sc["card"], "on": True, **{k: v for k, v in guess.items() if not sc["card"].get(k)}}
+    m = proj.get("meta") or {}
+    if m.get("height", 1) > m.get("width", 0) and edit["aspect"] != "source":
+        edit.update(aspect="9:16", layout="single")  # already vertical
+    if not parts:  # "use for new clips": the default preset's parts beat the defaults above (a layout in it is the creator's)
+        edit.update(_preset_for_new(proj, c, c["end"] - c["start"]))
     ai_pick = source in ("ai", "auto", "search")
     return store.put("clip", {
         "project_id": pid, "start": c["start"], "end": c["end"], "title": c.get("title") or "Untitled clip",
@@ -826,7 +892,7 @@ def _render_clip(clip: dict, prog) -> str:
     for o in overlays:
         a = store.get("asset", o.get("asset_id") or "") if o["kind"] not in ("text", "emoji") else None
         if a and assets.path(a).exists():
-            placed.append({**o, "path": str(assets.path(a))})
+            placed.append(assets.placed(o, a))  # the file, and its trim
     headline = media.headline_spec(e, (proj.get("video_type") or {}).get("type"),
                                    (store.get("pref", "headline_theme") or {}).get("theme")) if e.get("headline") else None
     bad = media.bleep_list(s["bleep_words"]) if e["bleep"] in ("beep", "mute") else []
@@ -1317,7 +1383,7 @@ def _autopilot(pid: str):
     n = int(ap.get("top_n", 3))
     pool = [c for c in store.find("clip", project_id=pid) if not c.get("parts")]
     times = stagger(next_slot(ap.get("first_publish")), float(ap.get("interval_hours", 24)), n)
-    segs = load_json(pid, "transcript.json", {"segments": []})["segments"]
+    segs = transcript_segments(pid, copy=True)  # handed on to the AI / heuristics: their own copy
     mode = ap.get("mode", "publish_at")  # publish_at: upload now, YouTube publishes later | upload_at: post at that time
     s, fb, ups = config.load(), feedback(), store.find("upload")
     glob, opts, target = learn.train(fb), experiments.allowed(s.get("experiments"), slot=smart), lengths(s)[1]
@@ -1346,9 +1412,11 @@ def _autopilot(pid: str):
 
 
 def _autopilot_prepare(clip: dict, ap: dict, segs: list[dict]) -> tuple[dict, dict]:
-    """Autopilot's look (aspect, captions, jump cuts) on the clip, and its title/description/tags."""
+    """Autopilot's look (aspect, captions, jump cuts, then the preset it was given) on the clip, and its title/description/tags."""
     edit = {**clip["edit"], "aspect": ap.get("aspect", clip["edit"]["aspect"]), "captions": ap.get("captions", True),
             "remove_silence": ap.get("jump_cuts", clip["edit"].get("remove_silence", False))}
+    if ap.get("preset_id"):  # a deleted preset gives {} and Autopilot's own look stays
+        edit.update(_preset_for_new(store.get("project", clip["project_id"]), clip, clip["end"] - clip["start"], str(ap["preset_id"])))
     clip = store.update("clip", clip["id"], {"edit": edit, "rev": clip["rev"] + 1})
     meta = {"title": clip["title"], "description": clip.get("hook", ""), "tags": [h.lstrip("#") for h in clip.get("hashtags", [])],
             "category_id": "22"}
@@ -1449,11 +1517,12 @@ def _virality(job):
         pid = job["project_id"]
         proj = store.get("project", pid)
         start, end, title = 0.0, proj["meta"]["duration"], proj["name"]
-    segs = load_json(pid, "transcript.json", {"segments": []})["segments"]
+    segs = transcript_segments(pid, copy=True)  # handed on to the AI / heuristics: their own copy
     _progress(job["id"], 0.2, "Researching similar videos")
     report = ai.virality(segs, load_json(pid, "signals.json", {}), start, end, title, guidance(), job.get("query", ""))
     report.update(project_id=pid, clip_id=job.get("clip_id"), title=title, at=now_iso())
     r = store.put("report", report)
+    store.keep_newest("report", REPORTS_KEPT)
     if job.get("clip_id"):
         store.update("clip", job["clip_id"], {"viral": {"score": report["score"], "report_id": r["id"]}})
     else:
@@ -1632,6 +1701,7 @@ def _scheduler_tick():
     if time.time() - _last_prune > 86400:
         _last_prune = time.time()
         store.prune_jobs()
+    ai.release_whisper()  # an idle model gives its VRAM back
     for u in store.find("upload", status="scheduled"):
         if _due(u):
             _queue_or_schedule(u)
@@ -1692,7 +1762,8 @@ def delete_project(pid: str):
 def _project_jobs(pid: str) -> list[dict]:
     """Queued or running jobs that work on a project: its own, or its clips' and long forms'."""
     ids = {("clip_id", c["id"]) for c in store.find("clip", project_id=pid)} |           {("longform_id", d["id"]) for d in store.find("longform", project_id=pid)} | {("project_id", pid)}
-    return [j for j in store.find("job") if j["status"] in ("queued", "running") and any(j.get(k) == v for k, v in ids)]
+    live = sorted(store.find("job", status="queued") + store.find("job", status="running"), key=lambda j: -j["created"])
+    return [j for j in live if any(j.get(k) == v for k, v in ids)]
 
 
 # ---------- delete from the Pipeline board ----------
@@ -1814,6 +1885,11 @@ def _import_failed(job, err):
         store.update("project", job["project_id"], {"status": "ready", "stage": "Ready", "progress": 1.0},
                      fn=lambda p: p.update(source_removed={**(p.get("source_removed") or {}), "error": f"Re-download failed: {err}"}))
         return
+    keep = (store.get("project", job["project_id"]) or {}).get("source")
+    with contextlib.suppress(OSError, ValueError):  # a failed download's partials (.part, .ytdl, fragments) are GBs no one
+        for f in pdir(job["project_id"]).glob("source*"):  # will use: retention never sees them (the project has no source)
+            if f.name != keep and f.is_file():
+                f.unlink(missing_ok=True)
     _analyze_failed(job, err)
 
 
@@ -1860,19 +1936,47 @@ def _recover_uploads():
         log.event("upload", f"upload {u['id']} was interrupted; it resumes ({', '.join(sorted(u.get('resume') or {})) or 'nothing saved'})")
 
 
+TEMP_GLOBS = ("*/exports/*.rendering.mp4", "*/*.rendering.mp4", "*/exports/.work_*", "*/.work_*", "*/exports/.lf_*",
+              ".incoming-*")  # server._receive's upload in progress (storage.root() is this folder)
+
+
+def sweep_temp(age: float = 3600) -> None:
+    """Remove what a crash or a killed render left behind (half-written .rendering.mp4, render work folders, partial
+    project uploads, partial asset downloads/uploads), when older than `age` s. Called by start() before the workers run, so no job is writing them."""
+    cutoff = time.time() - age
+    found = [p for g in TEMP_GLOBS for p in config.projects_dir().glob(g)]
+    found += [p for g in (".dl-*", ".kit-*", ".upload-*") for p in assets.ASSETS.glob(g)]
+    for p in found:
+        try:
+            if p.stat().st_mtime > cutoff:
+                continue
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def start():
     global _started
     if _started:
         return
     _started = True
-    for j in store.find("job"):  # recover after a restart: anything mid-flight runs again
-        if j["status"] in ("queued", "running"):
-            store.update("job", j["id"], {"status": "queued"})
-            _enqueue(j)
+    try:  # before any worker starts: nothing is writing these yet
+        sweep_temp()
+    except OSError:
+        log.error("pipeline", "temp sweep failed")
+    live = sorted(store.find("job", status="queued") + store.find("job", status="running"), key=lambda j: -j["created"])
+    for j in live:  # recover after a restart: anything mid-flight runs again (newest first, as before)
+        store.update("job", j["id"], {"status": "queued"})
+        _enqueue(j)
     _recover_uploads()
-    for c in store.find("clip"):  # one-time backfill: ratings/posts made before the feedback memory existed
-        if (c.get("rating") or c.get("posts")) and not store.get("feedback", c["id"]):
-            remember(c, "rated" if c.get("rating") else "published")
+    if not store.get("pref", "feedback_backfill"):  # one-time backfill: ratings/posts made before the feedback memory existed
+        for cid, rating, posts in store.fields("clip", "rating", "posts"):  # two fields, not every whole clip
+            if (rating or posts) and not store.get("feedback", cid) and (c := store.get("clip", cid)):
+                remember(c, "rated" if rating else "published")
+        store.put("pref", {"id": "feedback_backfill", "done": True})  # later starts skip the scan
     for target, args in ((_worker, (_heavy, _analysis_gate)), (_worker, (_render, _render_gate)), (_worker, (_ai,)),
                          (_worker, (_uploads,)), (_scheduler, ())):
         threading.Thread(target=target, args=args, daemon=True).start()

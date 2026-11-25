@@ -15,7 +15,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 EXE = ROOT / "dist" / "Reelwright" / "Reelwright.exe"
 SOURCES = [ROOT / "reelwright", ROOT / "Reelwright.pyw", ROOT / "requirements.txt", ROOT / "scripts" / "build_exe.py", ROOT / "assets"]
-PORTS = [8765, *range(8767, 8800)]  # desktop.pick_port: 8765, or a fallback when another program holds it
+sys.path.insert(0, str(ROOT))
+from reelwright.config import DEFAULT_PORT, app_ports  # noqa: E402
+
+# desktop.pick_port's ports, then the old 8765 block: a build from before the move must still be found (and waited for)
+PORTS = [*app_ports(DEFAULT_PORT), 8765, *range(8767, 8800)]
 
 
 def newest_source(paths=SOURCES) -> float:
@@ -31,14 +35,14 @@ def outdated(exe: Path = EXE, paths=SOURCES) -> bool:
 
 
 def _get(path: str, port: int):
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"Host": f"127.0.0.1:{port}"})
+    from reelwright.config import app_token  # the running app's per-launch token (its data folder)
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"Host": f"127.0.0.1:{port}", "X-Reelwright-Token": app_token()})
     with urllib.request.urlopen(req, timeout=3) as r:
         return json.loads(r.read())
 
 
 def _app_port() -> int | None:
-    """The port the running Reelwright answers on (another app on 8765 answers differently and is skipped)."""
-    sys.path.insert(0, str(ROOT))
+    """The port the running Reelwright answers on (another app on its port answers differently and is skipped)."""
     from reelwright.desktop import _port_in_use  # instant bind test; a request to a closed port costs ~2 s on Windows
     for port in PORTS:
         if not _port_in_use(port):

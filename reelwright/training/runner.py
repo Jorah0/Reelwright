@@ -36,6 +36,7 @@ LLAMA_CPP = {"tag": "b12206",  # 2026-11-08
              "source_sha256": "5595781cb4fa7d961c2f0f165fc2d33eede3c7d73176afd62f79ae2c36892b7d"}  # its code runs in the env
 MAX_UNZIPPED = 2 << 30  # an archive that expands past 2 GiB is refused (zip bomb)
 RENDER_KINDS = {"export", "longform_export", "proxy", "track"}  # pipeline's render queue: GPU encodes and tracking
+GPU_KINDS = RENDER_KINDS | {"analyze"}  # analysis runs Whisper (and vision) on the GPU too: training must not share it
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 QUANT = "Q4_K_M"
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -244,8 +245,9 @@ _lease_lock = threading.Lock()
 _holder: str | None = None
 
 
-def _rendering() -> bool:
-    return any(j["kind"] in RENDER_KINDS for j in store.find("job", status="running"))
+def _rendering() -> str | None:
+    """The kind of a running pipeline job that holds the GPU (a render, tracking or an analysis), else None."""
+    return next((j["kind"] for j in store.find("job", status="running") if j["kind"] in GPU_KINDS), None)
 
 
 def block_reason() -> str | None:
@@ -255,8 +257,8 @@ def block_reason() -> str | None:
     if rec or live:
         names = ", ".join(c.get("name") or "OBS" for c in rec + live)
         return f"OBS is {'recording' if rec else 'streaming'} ({names}): training waits so the stream never drops frames."
-    if _rendering():
-        return "A render is running: training waits for it to finish."
+    if kind := _rendering():
+        return ("A video is being analysed (Whisper runs on the GPU)" if kind == "analyze" else "A render is running") +             ": training waits for it to finish."
     return None
 
 
@@ -327,6 +329,8 @@ def apply_progress(job: dict, ev: dict) -> None:
     else:
         job.setdefault("events", {})[kind] = ev
 
+
+PROGRESS_EVERY = 3.0  # seconds between batched progress writes of a running job
 
 # ---------- export ----------
 
@@ -481,9 +485,26 @@ def _subprocess(jid: str, argv: list[str]):
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                             errors="replace", cwd=job["dir"], env=envv, creationflags=NO_WINDOW)
     _procs[jid] = proc
-    stop = threading.Event()
+    stop, plock, pending, last = threading.Event(), threading.Lock(), [], [0.0]
 
-    def guard():  # OBS / render watchdog and cancel enforcement
+    def flush(force=False, watch=False):
+        """Progress is batched: each store write rewrites the whole job doc (2000 metrics + 200 log lines), so at most
+        one per PROGRESS_EVERY s, plus a watchdog change when there is one; force (the end) writes what's left."""
+        with plock:  # held through the write, so batches land in order
+            if not (watch or pending and (force or time.monotonic() - last[0] >= PROGRESS_EVERY)):
+                return
+            evs = pending[:]
+            pending.clear()
+            last[0] = time.monotonic()
+
+            def fn(j):
+                for ev in evs:
+                    apply_progress(j, ev)
+                if watch:
+                    _watch(j)
+            store.update("train_job", jid, fn=fn)
+
+    def guard():  # OBS / render watchdog, cancel enforcement, and a quiet worker's last lines
         while not stop.wait(2):
             j = store.get("train_job", jid)
             if not j or j["status"] == "canceled":
@@ -491,18 +512,20 @@ def _subprocess(jid: str, argv: list[str]):
                 if not stop.wait(30):
                     proc.terminate()  # ponytail: under WSL this ends wsl.exe; the worker also exits on the cancel file
                 return
-            if j["gpu"]:
-                store.update("train_job", jid, fn=_watch)
+            flush(watch=bool(j["gpu"]) and watchdog(j)["status"] != j["status"])  # written only when it changes
 
     threading.Thread(target=guard, daemon=True).start()
     try:
-        for line in proc.stdout:  # ponytail: one store write per line; the worker prints a step line at most every ~0.5 s
+        for line in proc.stdout:
             ev = parse_progress(line)
             if ev["event"] != "log" or ev["text"]:
-                store.update("train_job", jid, fn=lambda j, ev=ev: apply_progress(j, ev))
+                with plock:
+                    pending.append(ev)
+                flush()
         code = proc.wait()
     finally:
         stop.set()
+        flush(force=True)
         _procs.pop(jid, None)
     if code:
         j = store.get("train_job", jid)
@@ -538,3 +561,79 @@ def cancel(jid: str) -> dict:
     (Path(j["dir"]) / "control" / "cancel").touch()
     (Path(j["dir"]) / "control" / "pause").unlink(missing_ok=True)
     return store.update("train_job", jid, {"status": "canceled", "message": "Canceled (checkpoint kept)"})
+
+
+# ---------- artifacts on disk ----------
+
+LIVE = ("queued", "running", "paused")
+EXPORTS = ("merged", "*.gguf")  # what an export leaves in its training job's folder
+
+
+def job_dir(jid: str) -> Path:
+    """A job's folder, always under jobs_dir() (never the doc's stored path: a hand-edited doc can't steer a delete)."""
+    if not jid.isalnum():
+        raise ValueError("Bad job id.")
+    return jobs_dir() / jid
+
+
+def drop_checkpoint(job: dict) -> dict:
+    """A finished training job that has been exported never resumes: its checkpoint.pt (~12 bytes a parameter) goes.
+    A paused, failed or canceled one keeps it."""
+    if not job or job.get("status") != "done":
+        return {}
+    f = job_dir(job["id"]) / "checkpoint.pt"
+    n = f.stat().st_size if f.is_file() else 0
+    f.unlink(missing_ok=True)
+    return {"checkpoint_freed": n}
+
+
+def drop_export_intermediates(job_dir: Path, lora: bool) -> dict:
+    """After a successful export (ollama has its own copy): the f16 GGUF (only the quantizer's input, rebuilt by the next
+    export) and, for a LoRA job, merged/ (full HF weights, rebuilt from the adapter). A scratch model's merged/ is the
+    trained model itself, so it stays: a re-export converts from it. model-q4_k_m.gguf stays (the release hashes it)."""
+    job_dir, n = Path(job_dir), 0
+    f16 = job_dir / "model-f16.gguf"
+    if f16.is_file():
+        n += f16.stat().st_size
+        f16.unlink()
+    if lora and (job_dir / "merged").is_dir():
+        n += size(job_dir / "merged")
+        shutil.rmtree(job_dir / "merged", ignore_errors=True)
+    return {"export_freed": n}
+
+
+def size(p: Path) -> int:
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.is_dir() else 0
+
+
+def delete_job(jid: str) -> dict:
+    """Delete a finished job's folder and record. Refused while it (or an export of it) is queued, running or paused,
+    and for a job whose model is the active release or the one Roll back returns to."""
+    from . import release
+    d = job_dir(jid)
+    j = store.get("train_job", jid)
+    if not j:
+        raise LookupError("No such training job.")
+    if j["status"] in LIVE:
+        raise RuntimeError("Cancel the job first: a queued, running or paused job can't be deleted.")
+    if any((x.get("spec") or {}).get("train_job") == jid for x in store.find("train_job") if x["status"] in LIVE):
+        raise RuntimeError("An export of this job is queued or running.")
+    if jid in release.protected()[1]:
+        raise RuntimeError("This job's model is the active release or the one Roll back returns to: it stays.")
+    n = size(d)
+    try:
+        if d.exists():
+            shutil.rmtree(d)
+    except OSError as e:  # a file still open (e.g. a GGUF being read): nothing is forgotten, retry later
+        raise RuntimeError(f"Couldn't delete {d}: {e}") from None
+    store.delete("train_job", jid)
+    log.event("training", f"deleted job {jid} ({n / 1e6:.1f} MB)")
+    return {"ok": True, "bytes": n}
+
+
+def usage() -> dict:
+    """Bytes in the app data folder: training jobs (checkpoints, adapters, logs), their exports (merged weights, GGUFs),
+    and the datasets."""
+    from . import dataset
+    exports = sum(size(p) if p.is_dir() else p.stat().st_size for pat in EXPORTS for p in jobs_dir().glob(f"*/{pat}"))
+    return {"jobs": size(jobs_dir()) - exports, "exports": exports, "datasets": size(dataset.root())}

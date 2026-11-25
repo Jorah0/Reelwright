@@ -434,10 +434,11 @@ def test_reimport_a_local_file_checks_it_is_the_same_video(api, monkeypatch):
     assert api.post(f"/api/projects/{p['id']}/redownload").status_code == 400
     lengths = iter([40.0, 100.0])
     monkeypatch.setattr(storage.media, "probe", lambda f: {"duration": next(lengths), "width": 1920, "height": 1080, "has_audio": True})
-    r = api.post(f"/api/projects/{p['id']}/source", files={"file": ("other.mp4", b"x", "video/mp4")})
+    r = api.post(f"/api/projects/{p['id']}/source", params={"name": "other.mp4"}, content=b"x")
     assert r.status_code == 400 and "same video" in r.json()["detail"]
-    r = api.post(f"/api/projects/{p['id']}/source", files={"file": ("orig.mp4", b"back", "video/mp4")})
+    r = api.post(f"/api/projects/{p['id']}/source", params={"name": "orig.mp4"}, content=b"back")
     assert r.status_code == 200 and not r.json().get("source_removed") and has_source(p)
+    assert sorted(f.name for f in pipeline.pdir(p["id"]).parent.iterdir()) == [p["id"]]  # no .incoming-* left behind
 
 
 def test_render_and_edits_are_blocked_cleanly_when_the_source_is_gone(api):
@@ -478,10 +479,58 @@ def test_bulk_short_import_one_project_each_and_duplicates_skipped(api, tmp_path
 
 
 def test_uploaded_short_is_deduplicated_by_content(api):
-    r1 = api.post("/api/shorts", files={"file": ("clip.mp4", b"S" * 50, "video/mp4")}).json()
-    r2 = api.post("/api/shorts", files={"file": ("renamed.mp4", b"S" * 50, "video/mp4")}).json()
+    r1 = api.post("/api/shorts", params={"name": "clip.mp4"}, content=b"S" * 50).json()
+    r2 = api.post("/api/shorts", params={"name": "renamed.mp4"}, content=b"S" * 50).json()
     assert r1["project"]["id"] and r2["duplicate"]["id"] == r1["project"]["id"] and len(store.find("project")) == 1
     assert [f.name for f in config.projects_dir().iterdir()] == [r1["project"]["id"]]  # no temp file left behind
+
+
+def test_browser_upload_streams_straight_into_the_project_with_no_temp_spool(api, jobs, monkeypatch):
+    """A multi-GB VOD from the browser was spooled whole into %TEMP% by the form parser, then copied again."""
+    import starlette.formparsers
+    monkeypatch.setattr(starlette.formparsers, "SpooledTemporaryFile", None)  # any form spool would now crash
+    body = (b"V" * (1 << 20) for _ in range(24))  # a 24 MB "video", arriving in 1 MB chunks
+    r = api.post("/api/projects", params={"name": "My stream.MP4", "video_type": "vlog", "autopilot": '{"enabled": true}'},
+                 content=body)
+    assert r.status_code == 200, r.text
+    p = store.get("project", r.json()["id"])
+    assert (p["name"], p["source"], p["status"], p["video_type"]["type"]) == ("My stream", "source.mp4", "queued", "vlog")
+    assert p["autopilot"]["enabled"] and (pipeline.pdir(p["id"]) / "source.mp4").stat().st_size == 24 << 20
+    assert [f.name for f in config.projects_dir().iterdir()] == [p["id"]]  # renamed into place: no .incoming-* left
+    assert jobs == [{"kind": "analyze", "project_id": p["id"]}]
+    assert api.post("/api/projects", params={"name": "notes.txt"}, content=b"x").status_code == 400
+
+
+def test_a_failed_upload_leaves_no_partial_file_and_no_stuck_project(api):
+    def body():  # the disk fills (or the browser goes away) half way through
+        yield b"V" * 1000
+        raise OSError(28, "No space left on device")
+    try:
+        r = api.post("/api/projects", params={"name": "big.mp4"}, content=body())
+        assert r.status_code >= 400
+    except Exception:  # the test client re-raises the server's error (possibly wrapped in an ExceptionGroup)
+        pass
+    assert list(config.projects_dir().iterdir()) == [] and store.find("project") == []
+    storage_away = config.projects_dir()
+    shutil.rmtree(storage_away)  # the storage drive unplugged: refused before a byte is written anywhere
+    assert api.post("/api/projects", params={"name": "a.mp4"}, content=b"V").status_code == 400
+    assert store.find("project") == []
+
+
+def test_desktop_import_by_path_copies_the_file_in_once_with_no_upload(api, jobs, tmp_path):
+    src = tmp_path / "vod.mkv"
+    src.write_bytes(b"v" * 100)
+    (tmp_path / "notes.txt").write_text("x")
+    r = api.post("/api/projects/paths", json={"paths": [str(src), str(tmp_path / "notes.txt")], "video_type": "vlog",
+                                              "autopilot": {"enabled": True}}).json()
+    [a] = r["added"]
+    assert [s["path"] for s in r["skipped"]] == [str(tmp_path / "notes.txt")]
+    p = store.get("project", a["id"])
+    assert (p["name"], p["video_type"]["type"], p["autopilot"]["enabled"]) == ("vod", "vlog", True)
+    assert jobs == [{"kind": "ingest_file", "project_id": p["id"], "path": str(src), "stable": True}]
+    pipeline._ingest_file({"id": "j", **jobs[0]})  # one copy, straight into the project (the original stays put)
+    assert (pipeline.pdir(p["id"]) / "source.mkv").read_bytes() == b"v" * 100 and src.exists()
+    assert api.post("/api/projects/paths", json={"paths": []}).status_code == 400
 
 
 def test_an_imported_short_becomes_one_whole_clip(monkeypatch):

@@ -97,20 +97,20 @@ def ai_clip(rendered=b""):
 def test_listener_is_off_by_default_and_its_port_is_outside_the_main_range():
     assert config.DEFAULTS["remote_enabled"] is False and config.DEFAULTS["remote_devices"] == []
     port = config.DEFAULTS["remote_port"]
-    assert port == 8810 and port not in range(8765, 8800) and port != 8766
+    assert port == config.DEFAULT_REMOTE_PORT and port not in config.app_ports(config.DEFAULT_PORT) and port != config.DEFAULT_LAN_PORT
     config.save({"remote_enabled": False})
     assert not remote.apply()["running"]
 
 
 def test_port_must_stay_clear_of_the_main_app_and_the_lan_receiver():
-    for bad in (8765, 8766, 8780, 8799, 80, 70000, config.load()["lan_port"]):
+    for bad in (38765, 38766, 38780, 38799, 80, 70000, config.load()["lan_port"]):
         with pytest.raises(ValueError):
             remote.check_port(bad)
-    assert remote.check_port(8810) == 8810 and remote.check_port(8800) == 8800
+    assert remote.check_port(38810) == 38810 and remote.check_port(38800) == 38800
     with pytest.raises(Exception) as e:
-        remote.put_remote({"port": 8770})
+        remote.put_remote({"port": 38770})
     assert getattr(e.value, "status_code", None) == 400
-    assert config.load()["remote_port"] != 8770
+    assert config.load()["remote_port"] != 38770
 
 
 def test_only_private_and_link_local_clients_are_served():
@@ -357,7 +357,7 @@ def test_import_refuses_links_to_this_network_in_any_spelling(phone, monkeypatch
     port, did, key = phone
     real, fake = socket.getaddrinfo, {"evil.example": "192.168.1.1", "videos.example": "93.184.216.34"}
     monkeypatch.setattr(socket, "getaddrinfo", lambda h, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (fake[h], 0))] if h in fake else real(h, *a, **k))
-    for bad in ("http://127.0.0.1:8765/api/settings", "http://localhost./x", "http://0.0.0.0:8765/", "http://evil.example/v", "http://[::1]/", "no link"):
+    for bad in ("http://127.0.0.1:38765/api/settings", "http://localhost./x", "http://0.0.0.0:38765/", "http://evil.example/v", "http://[::1]/", "no link"):
         assert call(port, did, key, "POST", "/remote/api/import", {"url": bad})[0] == 400, bad
     st, js, _ = call(port, did, key, "POST", "/remote/api/import", {"url": "Watch this https://videos.example/v/1"})
     assert st == 200 and store.get("project", js["project_id"])

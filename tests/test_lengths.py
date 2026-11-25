@@ -58,8 +58,8 @@ def test_a_search_can_override_the_lengths(monkeypatch):
 
 def test_settings_reject_lengths_that_cant_work():
     from fastapi.testclient import TestClient
-    from reelwright.server import app
-    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    from reelwright.server import PORT, app
+    c = TestClient(app, base_url=f"http://127.0.0.1:{PORT}")
     assert c.put("/api/settings", json={"clip_min": 50, "clip_max": 40}).status_code == 400
     r = c.put("/api/settings", json={"clip_min": 15, "clip_target": 25, "clip_max": 45})
     assert r.status_code == 200 and r.json()["clip_target"] == 25
@@ -77,10 +77,10 @@ def test_a_search_with_a_picked_length_is_told_that_length(monkeypatch):
 def test_an_old_max_below_the_default_target_doesnt_block_saving_settings():
     from fastapi.testclient import TestClient
     from reelwright import config
-    from reelwright.server import app
+    from reelwright.server import PORT, app
     config.SETTINGS_FILE.write_text('{"clip_min": 10, "clip_max": 30}', "utf-8")  # saved before clip_target existed
     assert config.load()["clip_target"] == 0  # out of range -> automatic, not the 35 s default
-    c = TestClient(app, base_url="http://127.0.0.1:8765")
+    c = TestClient(app, base_url=f"http://127.0.0.1:{PORT}")
     s = c.get("/api/settings").json()
     assert c.put("/api/settings", json={"clip_min": s["clip_min"], "clip_target": s["clip_target"], "clip_max": s["clip_max"],
                                         "model": s["model"]}).status_code == 200

@@ -4,7 +4,7 @@
 Single file, Python 3.10+ standard library. OBS mode also needs `pip install websockets`.
 
   OBS mode (recommended): sends every replay-buffer save (and, with --recordings, finished recordings)
-      python reelwright_relay.py --token TOKEN [--server http://192.168.1.20:8766] [--obs-password PASS]
+      python reelwright_relay.py --token TOKEN [--server http://192.168.1.20:38766] [--obs-password PASS]
       In OBS: Tools → WebSocket Server Settings → Enable (port 4455), copy the password.
   Folder mode (no OBS websocket): sends every new video that appears in a folder
       python reelwright_relay.py --token TOKEN --watch "D:/Videos/OBS"
@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-DISCOVERY_PORT = 8766
+DISCOVERY_PORT = 38766  # Reelwright's receiver default (config.DEFAULT_LAN_PORT; this file can't import it). Was 8766
 DISCOVER_MAGIC = b"REELWRIGHT_DISCOVER_V1"
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mts", ".ts", ".flv", ".wmv"}
 EVENT_OUTPUTS = 1 << 6  # obs-websocket v5 subscription bit: record / replay-buffer / stream output events
@@ -39,6 +39,14 @@ EVENT_OUTPUTS = 1 << 6  # obs-websocket v5 subscription bit: record / replay-buf
 
 class OBSError(RuntimeError):
     pass
+
+
+class OBSAuthError(OBSError):
+    """OBS answered but refused the password (or needs one): retrying soon won't help until it's fixed."""
+
+
+class OBSNotRunning(OBSError):
+    """Nothing listens on the websocket port: OBS is closed (or its WebSocket server is off)."""
 
 
 def obs_auth(password: str, salt: str, challenge: str) -> str:
@@ -70,7 +78,7 @@ class OBS:
             auth = hello["d"].get("authentication")
             if auth:
                 if not self.password:
-                    raise OBSError("OBS requires a password (Tools → WebSocket Server Settings → Show Connect Info).")
+                    raise OBSAuthError("OBS requires a password (Tools → WebSocket Server Settings → Show Connect Info).")
                 ident["authentication"] = obs_auth(self.password, auth["salt"], auth["challenge"])
             self.ws.send(json.dumps({"op": 1, "d": ident}))
             if json.loads(self.ws.recv(timeout=self.timeout)).get("op") != 2:
@@ -78,18 +86,30 @@ class OBS:
         except ConnectionClosed as e:
             self.close()
             code = getattr(getattr(e, "rcvd", None), "code", None)
-            raise OBSError("Wrong OBS websocket password." if code == 4009 else f"OBS closed the connection ({code}).") from None
+            if code == 4009:
+                raise OBSAuthError("Wrong OBS websocket password.") from None
+            raise OBSError(f"OBS closed the connection ({code}).") from None
         except ConnectionRefusedError:
             self.close()
-            raise OBSError(f"Nothing is listening at {self.url}: is OBS running with Tools → WebSocket Server "
+            raise OBSNotRunning(f"Nothing is listening at {self.url}: is OBS running with Tools → WebSocket Server "
                            "Settings → Enable turned on (and the port right)?") from None
         except (OSError, TimeoutError) as e:
             self.close()
             raise OBSError(f"Can't reach OBS at {self.url} ({e}). Check the address, and that the OBS PC's firewall "
                            "allows the websocket port.") from None
+        except BaseException:  # a refusal raised above (password, not v5), bad JSON...: no `with` yet, so close it here
+            self.close()
+            raise
         return self
 
     def request(self, kind: str, data: dict | None = None) -> dict:
+        from websockets.exceptions import ConnectionClosed
+        try:
+            return self._request(kind, data)
+        except ConnectionClosed:  # OBS closed or restarting mid-request: an expected end, not a crash
+            raise OBSNotRunning("OBS closed the connection (OBS was closed or restarted).") from None
+
+    def _request(self, kind: str, data: dict | None) -> dict:
         rid = uuid.uuid4().hex
         self.ws.send(json.dumps({"op": 6, "d": {"requestType": kind, "requestId": rid, **({"requestData": data} if data else {})}}))
         deadline = time.monotonic() + self.timeout
@@ -107,10 +127,13 @@ class OBS:
     def next_event(self, timeout: float = 1.0) -> tuple[str, dict] | None:
         if self._pending:
             return self._pending.pop(0)
+        from websockets.exceptions import ConnectionClosed
         try:
             msg = json.loads(self.ws.recv(timeout=timeout))
         except TimeoutError:
             return None
+        except ConnectionClosed:  # OBS was closed or restarted: an expected end, not a crash
+            raise OBSNotRunning("OBS closed the connection (OBS was closed or restarted).") from None
         return (msg["d"]["eventType"], msg["d"].get("eventData") or {}) if msg.get("op") == 5 else None
 
     def close(self):
@@ -340,7 +363,7 @@ def main(argv=None):
             stream.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description="Send OBS clips from this PC to Reelwright on your network.")
     ap.add_argument("--token", default=os.environ.get("REELWRIGHT_TOKEN"), help="pairing token from Reelwright → OBS")
-    ap.add_argument("--server", help="Reelwright receiver, e.g. http://192.168.1.20:8766 (found automatically if omitted)")
+    ap.add_argument("--server", help="Reelwright receiver, e.g. http://192.168.1.20:38766 (found automatically if omitted)")
     ap.add_argument("--name", default=socket.gethostname(), help="how this PC is labelled in Reelwright")
     ap.add_argument("--obs", default="ws://127.0.0.1:4455", help="OBS websocket URL on this PC")
     ap.add_argument("--obs-password", default=os.environ.get("OBS_PASSWORD", ""))
@@ -355,7 +378,7 @@ def main(argv=None):
         args.server = discover()
         if not args.server:
             raise SystemExit("Couldn't find Reelwright. Turn on 'Receive clips from other PCs' there, allow it through the "
-                             "firewall, or pass --server http://THAT-PC-IP:8766")
+                             "firewall, or pass --server http://THAT-PC-IP:38766")
         print(f"Found {args.server} (it must prove it knows the token before anything is sent).")
     try:
         info = ping(args.server, args.token)

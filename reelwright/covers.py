@@ -66,6 +66,6 @@ def make(video, out, samples: int = 24, faces: bool = True) -> float | None:
     if t is None:
         return None
     Path(out).parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run([media.FFMPEG, "-v", "error", "-y", "-ss", f"{t:.2f}", "-i", str(video), "-frames:v", "1", "-q:v", "2", str(out)],
+    r = subprocess.run([media.FFMPEG, "-v", "error", "-y", "-ss", f"{t:.2f}", *media.LOCAL_ONLY, "-i", str(video), "-frames:v", "1", "-q:v", "2", str(out)],
                        capture_output=True, creationflags=media.NO_WINDOW)
     return t if r.returncode == 0 and Path(out).exists() else None
