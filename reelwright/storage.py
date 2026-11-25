@@ -149,7 +149,9 @@ def _setting(p: Path) -> str:
 
 
 def usage() -> dict:
-    """Bytes Reelwright keeps in the storage folder: sources (videos + camera angles), renders (exports/), other."""
+    """Bytes Reelwright keeps in the storage folder: sources (videos + camera angles), renders (exports/), other; plus the
+    live chat logs (chatlogs, in the app's data folder: not part of total, which is what a folder move copies)."""
+    from . import chatlog
     out = {"sources": 0, "renders": 0, "other": 0}
     if not missing():
         for proj in store.find("project"):
@@ -165,7 +167,14 @@ def usage() -> dict:
                     kind = ("renders" if top == ("exports",) else
                             "sources" if (not top and f == proj.get("source")) or (top == ("angles",) and video) else "other")
                     out[kind] += n
-    return {**out, "total": sum(out.values())}
+    return {**out, "total": sum(out.values()), "chatlogs": _chat_size(chatlog.DIR)}
+
+
+def _chat_size(d: Path) -> int:
+    try:
+        return _size(d) if d.is_dir() else 0
+    except OSError:  # a log pruned or rotated mid-walk: shown next time
+        return 0
 
 
 def status(with_usage: bool = False) -> dict:
@@ -420,7 +429,8 @@ def _files(it: dict, scope: dict) -> tuple[list[tuple[Path, str]], list[Path]]:
             f = multicam.angle_path(p["id"], a)
             if f and f.is_file():
                 keep.append((f, f"angle {a.get('name') or ''}".strip()))
-        return [(f, t) for f, t in keep if f.is_file()], []
+        prox = d / Path(p.get("proxy") or "proxy.mp4").name  # the preview copy (pipeline._proxy) only goes with it
+        return [(f, t) for f, t in keep if f.is_file()], [prox] if prox.is_file() else []
     exp = (store.get(it["kind"], it["id"]) or {}).get("export") or {}
 
     def inside(rel):  # a render path can never reach outside its project folder
@@ -514,7 +524,7 @@ def _expire(it: dict, pol: dict, now: float) -> dict:
                 size += n
             mark = {"at": _iso(now), "mode": pol["mode"], "archive": str(written[0]) if written else None, "bytes": size,
                     **({"error": problem} if problem else {})}
-            store.update(kind, it["id"], {"source_removed": mark} if kind == "project" else {"expired": mark, "export": None})
+            store.update(kind, it["id"], {"source_removed": mark, "proxy": None} if kind == "project" else {"expired": mark, "export": None})
     except Exception:
         if not gone:  # nothing was deleted: the archive copies would only be duplicates
             for w in written:
@@ -552,6 +562,11 @@ def cleanup(job: dict | None = None, now: float | None = None) -> dict:
     """Clean up everything due. Never raises for one item: it is skipped (with the reason) and retried next run."""
     pol, now = policy(), now or time.time()
     done, skipped = [], []
+    if pol["mode"]:
+        try:
+            _prune_chatlogs(pol, now)  # in the app's data folder: not held by a missing storage drive
+        except OSError:
+            log.error("retention", "chat logs")
     if not pol["mode"] or hold_reason():
         return {"done": done, "skipped": skipped}
     due = [i for i in _items(pol) if i["due"] <= now]
@@ -574,6 +589,26 @@ def cleanup(job: dict | None = None, now: float | None = None) -> dict:
         store.update("job", job["id"], {"message": f"{'Archived' if pol['mode'] == 'archive' else 'Freed'} {gb(freed)} "
                                                    f"({len(done)} item(s)){f'; {len(skipped)} skipped' if skipped else ''}"})
     return {"done": done, "skipped": skipped}
+
+
+def _prune_chatlogs(pol: dict, now: float) -> None:
+    """Delete live chat logs (chatlog.py, one <UTC date>.jsonl per channel and day) past the space saver's days, counted
+    from the end of their day and never before the space saver was switched on. Deleted in archive mode too."""
+    from . import chatlog
+    gone = 0
+    for f in chatlog.DIR.glob("*/*.jsonl") if chatlog.DIR.is_dir() else []:
+        try:
+            end = datetime.strptime(f.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + DAY
+        except ValueError:
+            continue
+        if max(end, pol["since"]) + pol["days"] * DAY <= now:
+            try:
+                f.unlink()
+                gone += 1
+            except OSError:  # open (today's capture) or locked: next run
+                pass
+    if gone:
+        log.event("retention", f"deleted {gone} chat log(s) older than {pol['days']:.0f} days")
 
 
 def tick() -> None:

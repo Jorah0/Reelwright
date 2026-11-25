@@ -27,9 +27,9 @@ def test_classification_is_stored_and_runs_before_transcription(monkeypatch, tmp
     monkeypatch.setattr(pipeline.media, "probe", lambda src: meta)
     monkeypatch.setattr(pipeline.media, "poster", lambda *a, **k: None)
     monkeypatch.setattr(pipeline.media, "sprite", lambda *a, **k: None)
-    monkeypatch.setattr(pipeline.media, "audio_signals", lambda src: ([1.0] * 100, []))
+    monkeypatch.setattr(pipeline.media, "audio_signals", lambda src, silences_out=None: ([1.0] * 100, []))
     monkeypatch.setattr(pipeline.media, "silences", lambda src: [])
-    monkeypatch.setattr(pipeline.vision, "analyze", lambda src, meta, prog=None, faces=True, scenes=False:
+    monkeypatch.setattr(pipeline.vision, "analyze", lambda src, meta, prog=None, faces=True, scenes=False, sprite=None:
                         order.append(f"vision faces={faces}") or {"motion": [], "face": [], "spikes": [], "scenes": []})
     monkeypatch.setattr(pipeline.vision, "frames", lambda src, a, b, n=4, width=384: order.append("frame") or [b"jpg"])
     monkeypatch.setattr(pipeline.config, "api_key", lambda: "k")
@@ -192,3 +192,27 @@ def test_classify_retries_once_with_the_main_model_when_the_classify_model_fails
     with pytest.raises(RuntimeError):
         ai.classify_video("Episode 12", [])
     assert len(calls) == 2
+
+
+def test_classify_follows_the_provider_routing_and_the_models_release(monkeypatch):
+    s = {**ai.config.load(), "model": "claude-opus-5-5", "classify_model": "claude-haiku-5-5"}
+    monkeypatch.setattr(ai.config, "load", lambda: s)
+    calls = []
+
+    def ask(system, user, schema, effort="high", model=None, provider=None):
+        calls.append(model)
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(ai, "_ask", ask)
+    # routed to another provider: one call there (its own model), never a retry dressed up as "the main Claude model"
+    monkeypatch.setattr(ai, "_release", lambda task: None)
+    s["ai_routes"] = {"classify": "ollama"}
+    with pytest.raises(RuntimeError):
+        ai.classify_video("Episode 12", [])
+    assert calls == [None]
+    # a Models-page release pins the anthropic model: Settings' classify_model must not override it
+    s["ai_routes"], calls[:] = {}, []
+    monkeypatch.setattr(ai, "_release", lambda task: {"provider": "anthropic", "model": "claude-rel"} if task == "classify" else None)
+    monkeypatch.setattr(ai, "_ask", lambda *a, model=None, **k: calls.append(model) or _fake_vt())
+    ai.classify_video("Episode 12", [])
+    assert calls == [None]  # _ask then takes the release's model

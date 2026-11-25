@@ -152,7 +152,7 @@ o.f2997 = T.fpsExact(29.97); o.f60 = T.fpsExact(60); o.f25 = T.fpsExact(25);
 o.ft = T.frameTime(31, 29.97); o.back = T.toFrame(T.frameTime(31, 29.97), 29.97);
 o.snapF = T.snapFrame(1.016, 60);
 o.tc = T.timecode(62.5, 30); o.tcH = T.timecode(3725.0, 25);
-o.snapPt = T.snap(5.03, { fps: 30, points: [5.0, 9], tol: 0.05 }); o.snapNo = T.snap(5.03, { fps: 30, points: [9], tol: 0.05 });
+o.snapPt = T.snap(5.03, { fps: 30, points: [5.0, 9], tol: 0.05 }); o.snapPtNtsc = T.snap(3.01, { fps: 29.97, points: [3.0], tol: 0.05 }); o.snapNo = T.snap(5.03, { fps: 30, points: [9], tol: 0.05 });
 o.snapOff = T.snap(5.03, { fps: 30, points: [5.0], tol: 0.05, on: false });
 o.split = T.splitItem({ id: "a", t: 1, d: 4, keys: [[0, 1], [3, 2]] }, 3, "b");
 o.splitOut = T.splitItem({ id: "a", t: 1, d: 4 }, 9, "b");
@@ -160,7 +160,7 @@ o.addCut = T.addCut([[12, 13], [15, 16]], 12.5, 15.2, 10, 20);
 o.ripple = T.rippleDelete([[12, 13]], 14, 15, 10, 20);
 o.restore = T.removeCutAt([[12, 13], [15, 16]], 15.5);
 o.segs = T.segments(10, 20, [[12, 13]], [11, 16]);
-o.nudge = T.nudge([{ t: 1, d: 2 }, { t: 7.9, d: 2 }], 1, 30, 10);
+o.nudge = T.nudge([{ t: 1, d: 2 }, { t: 7.99, d: 2 }], 1, 30, 10);
 o.nudgeBack = T.nudge([{ t: 0.01, d: 2 }], -10, 30, 10);
 o.lanes = T.packLanes([{ t: 0, d: 2 }, { t: 1, d: 2 }, { t: 2.5, d: 1 }, { t: 1.5, d: 0.2 }]);
 o.interp = [T.interp([[0, 1], [2, 3]], -1), T.interp([[0, 1], [2, 3]], 1), T.interp([[0, 1], [2, 3]], 5)];
@@ -175,6 +175,7 @@ console.log(JSON.stringify(o));
     assert o["ft"] == 31 * 1001 / 30000 and o["back"] == 31
     assert o["snapF"] == 61 / 60
     assert o["tc"] == "0:01:02:15 · f1875" and o["tcH"] == "1:02:05:00 · f93125"
+    assert o["snapPtNtsc"] == 90 * 1001 / 30000  # a word edge at 3.0 s lands on frame 90
     assert o["snapPt"] == 5.0 and o["snapNo"] == 151 / 30 and o["snapOff"] == 151 / 30
     left, right = o["split"]
     assert left == {"id": "a", "t": 1, "d": 2, "keys": [[0, 1], [2, 1 + 2 / 3]]}
@@ -208,3 +209,98 @@ def test_cancel_a_queued_job_only():
     assert store.get("job", q["id"])["status"] == "canceled"
     assert _client().post(f"/api/jobs/{r['id']}/cancel").status_code == 409
     assert _client().post("/api/jobs/nope/cancel").status_code == 404
+
+
+# ---------- integration with the existing paths ----------
+
+def _project_clip(edit):
+    p = pipeline.new_project("tl")
+    pipeline.save_json(p["id"], "transcript.json", {"segments": [{"start": 0, "end": 60, "text": "", "words": []}]})
+    store.update("project", p["id"], {"source": "source.mp4", "status": "ready",
+                                      "meta": {"width": 1920, "height": 1080, "fps": 30, "duration": 60.0, "has_audio": True}})
+    c = pipeline.new_clip(p["id"], {"start": 10.0, "end": 20.0, "title": "Clip"})
+    return store.update("clip", c["id"], fn=lambda d: d["edit"].update(edit))
+
+
+def test_keeps_endpoint_and_markers_reach_the_nle_export():
+    from reelwright import nle
+    c = _project_clip({"cuts": [[12.0, 13.0]], "markers": [{"t": 4.0, "label": "laugh"}, {"t": 2.5, "label": "gone"}]})
+    assert _client().get(f"/api/clips/{c['id']}/keeps").json() == {"keeps": [[10.0, 12.0], [13.0, 20.0]]}
+    assert ("laugh" in [m[1] for m in nle.clip_timeline(c)["markers"]]
+            and (3.0, "laugh", "marker") in nle.clip_timeline(c)["markers"])  # 14 s source = 3 s after the 1 s cut
+    assert "gone" not in [m[1] for m in nle.clip_timeline(c)["markers"]]  # inside the cut
+
+
+def test_effects_and_markers_go_through_patch_and_undo_to_none():
+    c = _project_clip({})
+    fx = [{"kind": "blur", "t": 1, "d": 2, "amount": 5}]
+    r = _client().patch(f"/api/clips/{c['id']}", json={"edit": {"effects": fx, "markers": [{"t": 1}]}})
+    assert r.status_code == 200 and r.json()["edit"]["effects"][0]["amount"] == 5 and r.json()["rev"] == c["rev"] + 1
+    if shutil.which("node"):
+        res = subprocess.run(["node", "-e", "const U=require(process.argv[1]);console.log(JSON.stringify(U.inverse("
+                              "{edit:{effects:[1],markers:[1],layout_segments:[1]}},{edit:{}})))", str(STATIC / "undo.js")],
+                             capture_output=True, text=True, timeout=30)
+        assert json.loads(res.stdout) == {"edit": {"effects": None, "markers": None, "layout_segments": None}}
+    r = _client().patch(f"/api/clips/{c['id']}", json={"edit": {"effects": None, "markers": None}})
+    assert r.json()["edit"]["effects"] is None and r.json()["edit"]["markers"] is None
+
+
+# ---------- per-section layouts (edit.layout_segments) ----------
+
+def test_layout_segments_validate():
+    clip = {"start": 10.0, "end": 20.0}
+    assert server.clean_edit({"layout_segments": []}, clip) == {"layout_segments": None}
+    got = server.clean_edit({"layout_segments": [
+        {"s": 6, "e": 30, "layout": "pip", "pip_corner": "tl", "junk": 1},  # e clamped to the clip's 10 s
+        {"s": 2, "e": 4, "layout": "split", "split": 0.9, "crop_x": 0.25},  # split clamped to 0.7
+    ]}, clip)["layout_segments"]
+    assert got == [{"s": 2.0, "e": 4.0, "layout": "split", "split": 0.7, "crop_x": 0.25},
+                   {"s": 6.0, "e": 10.0, "layout": "pip", "pip_corner": "tl"}]
+    for bad in ("x", [{"s": 0, "e": 1}], [{"s": 0, "e": 1, "layout": "warp"}], [{"s": 3, "e": 2, "layout": "split"}],
+                [{"s": 0, "e": 2, "layout": "split"}, {"s": 1, "e": 3, "layout": "pip"}],  # overlap
+                [{"s": 11, "e": 12, "layout": "split"}], [{"s": i, "e": i + 0.1, "layout": "split"} for i in range(51)],
+                [{"s": 0, "e": 1, "layout": "split", "regions": "nope"}]):
+        with pytest.raises(HTTPException):
+            server.clean_edit({"layout_segments": bad}, clip)
+
+
+def test_layout_section_windows_follow_cuts_and_speed():
+    keeps = [(10.0, 11.0), (11.5, 20.0)]  # 0.5 s cut at clip 1..1.5
+    [w] = media.section_windows([{"s": 2.0, "e": 4.0, "layout": "split"}], 10.0, keeps, 1.0)
+    assert (w["a"], w["b"]) == (1.5, 3.5) and w["layout"] == "split"
+    assert media.section_windows([{"s": 1.1, "e": 1.4, "layout": "pip"}], 10.0, keeps, 1.0) == []  # all inside the cut
+    [w] = media.section_windows([{"s": 2.0, "e": 4.0, "layout": "split"}], 10.0, None, 2.0)
+    assert (w["a"], w["b"]) == (1.0, 2.0)
+
+
+def test_graphs_without_sections_are_byte_identical():
+    for e in ({"aspect": "9:16"}, {"aspect": "9:16", "layout": "split", "regions": [{"id": "cam", "role": "cam", "x": 0.7, "y": 0, "w": 0.3, "h": 0.3}]}):
+        base = media.build_filters(e, 1920, 1080, 10, True)
+        assert media.build_filters(e, 1920, 1080, 10, True, sections=None) == base
+        assert media.build_filters(e, 1920, 1080, 10, True, sections=[]) == base
+
+
+def test_section_graph_overlays_its_own_layout_under_the_captions():
+    wins = media.section_windows([{"s": 2.0, "e": 4.0, "layout": "split"}], 0.0, [(0.0, 1.0), (1.5, 6.0)], 1.0)
+    g, size = media.build_filters({"aspect": "9:16"}, 1920, 1080, 5.5, True, keeps_rel=[(0.0, 1.0), (1.5, 6.0)], sections=wins)
+    assert size == (1080, 1920) and "overlay=0:0:enable='between(t,1.500,3.500)'" in g
+    assert g.count("subtitles=captions.ass") == 1 and g.index("enable='between(t,1.500") < g.index("subtitles=")
+    assert g.count("[0:v]select='") == 2 and g.count("select='") == 3  # both pictures (and the audio) go through the same jump cuts
+
+
+def test_real_render_switches_layout_for_a_section(tmp_path):
+    _need_ffmpeg()
+    src = tmp_path / "src.mp4"  # black frame, a white box where the default cam region is (top right)
+    subprocess.run([media.FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "color=black:s=320x240:r=30:d=5,drawbox=x=224:y=12:w=90:h=77:c=white:t=fill",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
+    meta = {"width": 320, "height": 240, "fps": 30, "duration": 5.0, "has_audio": False}
+    edit = {"aspect": "1:1", "loudnorm": False, "layout": "single", "layout_segments": [{"s": 2.0, "e": 4.0, "layout": "split"}]}
+    out = tmp_path / "out.mp4"
+    media.render(src, out, 0.0, 5.0, edit, meta, None, None, [(0.0, 1.0), (1.5, 5.0)], None, [], [])  # 0.5 s cut before the section
+    p = media.probe(out)
+    assert abs(p["duration"] - 4.5) < 0.1
+    W, H = p["width"], p["height"]
+    assert _px(out, 0.75, W // 2, H // 12) < 40   # single: the top middle of the centre crop is black
+    assert _px(out, 2.5, W // 2, H // 12) > 200   # split (1.5..3.5 s out): the cam box fills the top tier
+    assert _px(out, 4.0, W // 2, H // 12) < 40    # back to single after the section

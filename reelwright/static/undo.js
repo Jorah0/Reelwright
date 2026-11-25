@@ -15,7 +15,7 @@
       if (k === "edit") {
         for (const ek of Object.keys(body.edit || {})) {
           let v = ek === "track_manual" ? (prev.edit?.track?.manual ?? []) : prev.edit?.[ek];
-          if (v === undefined && ek === "cuts") v = null; // not in DEFAULT_EDIT: a clip's first cut undoes to "no cuts"
+          if (v === undefined && ["cuts", "effects", "markers", "layout_segments"].includes(ek)) v = null; // not in DEFAULT_EDIT: the first one undoes to "none"
           if (ek === "framing" && v == null) v = { offset_y: 0, zoom: 1 }; // the server merges framing: null can't clear it
           if (v !== undefined) ed[ek] = clone(v);
         }

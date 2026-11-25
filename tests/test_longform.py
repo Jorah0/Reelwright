@@ -407,3 +407,17 @@ def test_overlays_and_cuts_land_on_the_right_part_in_sequence_time(monkeypatch):
     longform.render({**d, "edit": e}, lambda f: None)
     texts = [o for o in asses if o]
     assert len(texts) == 1 and texts[0][0]["t"] == pytest.approx(10.0) and texts[0][0]["d"] == pytest.approx(2.0)
+
+
+def test_render_part_bleeps_censors_and_animates_captions_like_a_clip(monkeypatch):
+    calls = _capture_render(monkeypatch)
+    p = project(100.0)
+    store.update("project", p["id"], {"source": "source.mp4"})
+    d = lf(p)
+    words = [{"s": 1.0, "e": 1.4, "w": "oh"}, {"s": 2.0, "e": 2.5, "w": "shit"}, {"s": 40.0, "e": 40.4, "w": "fuck"}]
+    e = {**media.DEFAULT_EDIT, **d["edit"], "captions": True, "bleep": "beep", "caption_anim": "pop", "caption_emphasis": True}
+    longform._render_part(d, store.get("project", p["id"]), [(0.0, 30.0)], e, words, pipeline.pdir(p["id"]) / "x.mp4", 0.0, None)
+    [c] = calls
+    assert c["bleeps"] == [(2.0, 2.5)]  # source time inside the part; media.render maps them through the cuts
+    assert "\\fscx125\\fscy125\\t(0,120,\\fscx100\\fscy100)" in c["ass"]  # the pop animation
+    assert "S***" in c["ass"].upper() and "SHIT" not in c["ass"].upper()

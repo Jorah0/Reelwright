@@ -117,7 +117,9 @@ def safe_zones(clip: dict, W: int, H: int) -> list[dict]:
     hl = media.headline_spec(e, (proj.get("video_type") or {}).get("type"),
                              (store.get("pref", "headline_theme") or {}).get("theme")) if e.get("headline") else None
     card = media.card_spec(e)
-    ass = media.build_ass([], 0, 1, 1, (W, H), e["title_text"], True, "#FFD400", False, e["caption_style"], e["caption_pos"],
+    # one probe word when captioned, so the card is placed clear of the caption band as in the render (media.card_place)
+    ass = media.build_ass([{"s": 0.0, "e": 0.5, "w": "x"}] if e["captions"] else [], 0, 1, 1, (W, H), e["title_text"], True,
+                          "#FFD400", bool(e["captions"]), e["caption_style"], e["caption_pos"],
                           e["sticker_text"], e["sticker_pos"], None, media.seam(e), text_style=e, headline=hl, card=card)
     st = {f[0][7:]: f for f in (line.split(",") for line in ass.splitlines() if line.startswith("Style: "))}
     boxes = ([("Captions", *_span(st["Cap"], 2, H))] if e["captions"] else []) + \

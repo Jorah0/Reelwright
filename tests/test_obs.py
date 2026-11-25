@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import socket
 import tempfile
 import threading
@@ -19,18 +20,36 @@ PASSWORD, SALT, CHALLENGE = "hunter2", "c2FsdA==", "Y2hhbGxlbmdl"
 
 def _free_port() -> int:
     """A port free for TCP *and* UDP: the receiver needs both, and a busy PC (or a parallel test run) often has the
-    UDP side of a TCP-free number taken, which silently turned discovery off and made the relay test flaky."""
-    for _ in range(50):
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
+    UDP side of a TCP-free number taken, which silently turned discovery off and made the relay test flaky.
+    Random candidates below Windows' dynamic range (49152+): Windows hands out ephemeral ports in sequence and Hyper-V/WSL
+    reserve UDP blocks of 100 (netsh int ipv4 show excludedportrange protocol=udp), so asking the OS for port 0 fifty
+    times could walk 50 consecutive numbers through one reserved block and fail every time."""
+    for _ in range(200):
+        port = random.randint(20000, 48000)
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u, socket.socket() as t:
                 u.bind(("", port))
+                t.bind(("0.0.0.0", port))  # where lan.apply's receiver binds
             return port
         except OSError:
             continue
     raise RuntimeError("no port free for both TCP and UDP")
+
+
+def test_free_port_survives_a_reserved_udp_block(monkeypatch):
+    """Guard for the setup flake: 60 refused UDP binds in a row (a reserved block) still find a port, from spread candidates."""
+    tried, real = [], socket.socket
+
+    class S(real):
+        def bind(self, addr):
+            if self.type == socket.SOCK_DGRAM:
+                tried.append(addr[1])
+                if len(tried) <= 60:
+                    raise OSError(10013, "reserved by the OS")
+            return super().bind(addr)
+    monkeypatch.setattr(socket, "socket", S)
+    port = _free_port()
+    assert port == tried[-1] and max(tried) - min(tried) > 100
 
 
 @pytest.fixture

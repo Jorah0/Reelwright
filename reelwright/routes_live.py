@@ -2,7 +2,6 @@
 teach-a-screen-event modal (hud.py), and the small read-only views the Claude Desktop tools (mcp_server.py) use."""
 import math
 
-import cv2
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import FileResponse
 
@@ -97,6 +96,7 @@ def hud_frame(pid: str, t: float = 0.0):
     if not math.isfinite(t):
         raise HTTPException(400, "Bad time.")
     img = hud.grab(pipeline.source_file(proj), t, 1280 if int((proj.get("meta") or {}).get("width") or 0) > 1280 else None)
+    import cv2  # lazy: OpenCV is not needed to start the app
     return Response(cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes(), media_type="image/jpeg")
 
 

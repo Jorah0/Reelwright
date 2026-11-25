@@ -56,12 +56,14 @@ def _smooth(x, k: int):
     return np.convolve(x, np.ones(k) / k, mode="same") if len(x) >= k else x  # "same" would lengthen a tiny series
 
 
-def analyze(src, meta: dict, progress=None, faces: bool = True, scenes: bool = False, hud=None) -> dict:
+def analyze(src, meta: dict, progress=None, faces: bool = True, scenes: bool = False, hud=None, sprite=None) -> dict:
     """{"motion": [per s], "face": [per s, 0..1 or empty], "spikes": [{t, kind, strength}]}.
     scenes=True also returns "scenes" (cut times, exactly as media.scenes finds them) from the same decode: decoding is
     nearly all of the cost, so sharing it makes this analyzer almost free on top of scene detection.
     hud: taught screen events (hud.active()) matched in the same frames; adds "hud": [{t, kind: "hud:<name>", label,
-    strength, d}]. Without it nothing changes."""
+    strength, d}]. Without it nothing changes.
+    sprite: (count, out path): also writes media.sprite()'s timeline strip from these frames (the sample nearest each tile's
+    time, ≤ 0.25 s off) instead of a second full decode of the video, and returns "sprite": True."""
     import cv2
     import tempfile
 
@@ -81,7 +83,9 @@ def analyze(src, meta: dict, progress=None, faces: bool = True, scenes: bool = F
         hm, hs = hudmod.matchers(hud, w, h), []
     ours = f"fps={RATE},scale={w}:{h}:flags=area,format=bgr24"
     if scenes:  # media.scenes' exact filter chain on one branch, ours on the other
-        cmd = [media.FFMPEG, "-hide_banner", "-hwaccel", "auto", "-i", str(src), "-an", "-sn", "-dn", "-filter_complex",
+        # CPU decode: -hwaccel auto measured 258 s against 40 s on a 15-min 1080p60 H.264 (RTX 4090): every full-size frame
+        # comes back from the GPU for the CPU-side scale and select
+        cmd = [media.FFMPEG, "-hide_banner", "-i", str(src), "-an", "-sn", "-dn", "-filter_complex",
                f"[0:v]scale=320:-2,split[a][b];[a]select='gt(scene,{media.SCENE_THRESHOLD})',showinfo[s];[b]{ours}[v]",
                "-map", "[s]", "-f", "null", "-", "-map", "[v]", "-f", "rawvideo", "-"]
     else:
@@ -90,6 +94,10 @@ def analyze(src, meta: dict, progress=None, faces: bool = True, scenes: bool = F
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, creationflags=media.NO_WINDOW)
     size = w * h * 3
     diff, bright, sat, face, fmove = [], [], [], [], []
+    # each tile's sample: an fps filter's output frame k is the last input frame before (k + 0.5) / rate, for the sprite's
+    # count/dur and for our RATE alike, so tile k is the sample whose time is nearest the middle of its slot
+    at = [max(0, round((k + 0.5) * dur / sprite[0] * RATE - 0.5)) for k in range(sprite[0])] if sprite else []
+    tiles = dict.fromkeys(at)  # sample index -> its frame
     prev = box = None
     try:
         while True:
@@ -105,6 +113,8 @@ def analyze(src, meta: dict, progress=None, faces: bool = True, scenes: bool = F
             diff.append(float(d.mean()) / 255 if d is not None else 0.0)
             prev = gray
             i = len(bright) - 1
+            if i in tiles:
+                tiles[i] = frame.copy()
             if detect:
                 if i % FACE_EVERY == 0:
                     found, _ = track.candidates(frame, None, yunet, anime, mode="faces")
@@ -179,4 +189,24 @@ def analyze(src, meta: dict, progress=None, faces: bool = True, scenes: bool = F
         out["scenes"] = media.scene_times(err)
     if hud:
         out["hud"] = hudmod.events(hs, hm, RATE)
+    if sprite:
+        last = None
+        strip = []
+        for k in at:  # a tile past the last decoded sample repeats the last one, as ffmpeg's fps filter does
+            last = tiles[k] if tiles[k] is not None else last
+            strip.append(last)
+        if all(t is not None for t in strip):
+            cv2.imwrite(str(sprite[1]), np.hstack([_tile(t) for t in strip]), [cv2.IMWRITE_JPEG_QUALITY, 85])
+            out["sprite"] = True
     return out
+
+
+def _tile(frame, tw: int = 160, th: int = 90):
+    """media.sprite's scale=160:90:force_original_aspect_ratio=increase,crop=160:90 on one frame."""
+    import cv2
+    h, w = frame.shape[:2]
+    k = max(tw / w, th / h)
+    sw, sh = max(tw, round(w * k)), max(th, round(h * k))
+    img = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA if k < 1 else cv2.INTER_LINEAR)
+    x, y = (sw - tw) // 2, (sh - th) // 2
+    return img[y:y + th, x:x + tw]

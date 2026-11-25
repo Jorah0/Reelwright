@@ -8,7 +8,6 @@ import math
 import threading
 from typing import Literal, Optional
 
-import anthropic
 import numpy as np
 from pydantic import BaseModel, Field
 
@@ -173,6 +172,7 @@ def _ask(system: str, user: str | list | tuple[str, str | list], schema: type[Ba
     if not key:
         raise RuntimeError("Add your Anthropic API key in Settings to use Claude-powered features.")
     model = model or (provider_cfg("anthropic", routed).get("model") if _release(routed) else None) or config.load()["model"]
+    import anthropic  # lazy: the SDK is ~1.4 s of the app's start-up import
     client = anthropic.Anthropic(api_key=key, max_retries=4)  # rides out short 429/529 overload bursts
     if isinstance(user, tuple):
         context, task = user
@@ -294,7 +294,10 @@ def classify_video(about: str, shots: list[bytes], excerpt: str = "") -> dict:
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(j).decode()}}
         for j in shots]
     s = config.load()
-    cm = s.get("classify_model") or None
+    # Settings' cheap classify model is Claude-only and yields to a Models-page release (route/_release, as in _ask);
+    # None = _ask picks the routed provider's or the release's model, and there is no "main model" retry
+    rel = _release("classify")
+    cm = (s.get("classify_model") or None) if route("classify") == "anthropic" and not (rel or {}).get("model") else None
     try:
         vt = _ask(CLASSIFY_SYSTEM, user, VideoType, effort="low", model=cm)
     except RuntimeError as e:  # e.g. the cheap model rejects the effort setting: one retry on the main model
@@ -1095,6 +1098,7 @@ def research(prompt: str, max_uses: int = 8) -> tuple[str, list[dict]]:
         raise RuntimeError("Add your Anthropic API key in Settings to use live research.")
     model = config.load()["model"]
     tool = {"type": "web_search_20260209" if model in WEB_TOOL_NEW else "web_search_20250305", "name": "web_search", "max_uses": max_uses}
+    import anthropic  # lazy, as in _ask
     client = anthropic.Anthropic(api_key=key, max_retries=4)
     messages = [{"role": "user", "content": prompt}]
     kw = dict(model=model, max_tokens=16000, tools=[tool], output_config={"effort": "medium"})

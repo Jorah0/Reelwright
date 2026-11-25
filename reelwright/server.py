@@ -38,9 +38,13 @@ async def no_stale_ui(request: Request, call_next):
     if request.headers.get("host") not in LOCAL_HOSTS or (
             origin and request.method != "GET" and origin.split("://", 1)[-1] not in LOCAL_HOSTS):
         return JSONResponse({"detail": "Forbidden"}, status_code=403)
-    resp = await call_next(request)
-    if not request.url.path.startswith("/files/"):
-        resp.headers["Cache-Control"] = "no-cache"  # revalidate UI assets so updates show up immediately
+    scope = config._request.set({})  # settings are read once per request (config.load)
+    try:
+        resp = await call_next(request)
+    finally:
+        config._request.reset(scope)
+    if not request.url.path.startswith("/files/") or request.url.path.endswith(".json"):
+        resp.headers["Cache-Control"] = "no-cache"  # revalidate UI assets (and transcript.json etc.: the ETag makes it a 304)
     return resp
 
 
@@ -244,12 +248,15 @@ def _video_type(kind, sub=None) -> dict | None:
 @app.get("/api/projects")
 def list_projects():
     projects = store.find("project")
-    clips = [c for c in store.find("clip") if not c.get("expired")]  # expired clips: history, behind "Show expired"
+    by_project: dict[str, list] = {}  # project id -> its clip ids, newest first (two fields, not 3,000 whole clips)
+    for cid, pid, expired in store.fields("clip", "project_id", "expired"):
+        if not expired:  # expired clips: history, behind "Show expired"
+            by_project.setdefault(pid, []).append(cid)
     dues = storage.due_map()
     for p in projects:
-        mine = [c for c in clips if c["project_id"] == p["id"]]
+        mine = by_project.get(p["id"], [])
         p["clip_count"] = len(mine)
-        p["first_clip"] = mine[0]["id"] if mine else None  # an imported short opens straight in the Studio
+        p["first_clip"] = mine[0] if mine else None  # an imported short opens straight in the Studio
         p.update(storage.project_view(p, dues))
     return projects
 
@@ -694,6 +701,29 @@ def _markers(v, clip: dict) -> list | None:
     return sorted(out, key=lambda m: m["t"])
 
 
+def _layout_segments(v, clip: dict) -> list | None:
+    """Per-section layouts (≤ 50): {s, e} clip seconds (clamped into the clip, sorted, no overlaps) + layout overrides
+    (media.SECTION_KEYS, validated exactly like the clip's own). Outside every section the clip's layout shows."""
+    if v is None or v == []:
+        return None
+    if not isinstance(v, list) or len(v) > 50:
+        raise HTTPException(400, "layout_segments must be a list of up to 50 sections.")
+    length, out = clip["end"] - clip["start"], []
+    for sec in v:
+        if not isinstance(sec, dict) or sec.get("layout") not in media.LAYOUTS:
+            raise HTTPException(400, f"Each layout section needs a layout: {', '.join(media.LAYOUTS)}.")
+        a = max(_num(sec.get("s"), "section start", -1e9, 1e9), 0.0)
+        b = min(_num(sec.get("e"), "section end", -1e9, 1e9), length)
+        if b - a < 0.04:
+            raise HTTPException(400, "A layout section must lie inside the clip and end after it starts.")
+        keys = {k: sec[k] for k in media.SECTION_KEYS if k in sec}
+        out.append({"s": round(a, 3), "e": round(b, 3), **clean_edit(keys, clip)})
+    out.sort(key=lambda x: x["s"])
+    if any(x["s"] < y["e"] - 1e-6 for y, x in zip(out, out[1:])):
+        raise HTTPException(400, "Layout sections can't overlap.")
+    return out
+
+
 def _words(v, clip: dict) -> list | None:
     """Caption words override: up to 2000 {s, e, w} with s ≤ e inside the clip (absolute source seconds), w ≤ 40 chars."""
     if v is None or v == []:
@@ -751,8 +781,8 @@ def clean_edit(edit: dict, clip: dict) -> dict:
         if k == "cuts":  # text-based cuts (WP5): [[s, e], …] source seconds the render removes (pipeline.clip_keeps)
             out[k] = _cuts(v, clip)
             continue
-        if k in ("effects", "markers"):  # the timeline's effect items and markers (not in DEFAULT_EDIT, like cuts)
-            out[k] = (_effects if k == "effects" else _markers)(v, clip)
+        if k in ("effects", "markers", "layout_segments"):  # timeline items (not in DEFAULT_EDIT, like cuts)
+            out[k] = {"effects": _effects, "markers": _markers, "layout_segments": _layout_segments}[k](v, clip)
             continue
         if k not in media.DEFAULT_EDIT:
             continue
@@ -1090,7 +1120,22 @@ def _iso(ts) -> str | None:
     return datetime.fromtimestamp(ts, timezone.utc).isoformat() if isinstance(ts, (int, float)) else ts
 
 
-def _clip_item(c: dict, ups: list[dict]) -> dict:
+def _poster(pid: str, memo: dict) -> str | None:
+    """The project's poster URL if it exists. memo: one board's answers (one disk check per project, not per card)."""
+    if pid not in memo:
+        memo[pid] = f"/files/{pid}/poster.jpg" if (pipeline.pdir(pid) / "poster.jpg").exists() else None
+    return memo[pid]
+
+
+def _account_name(u: dict, memo: dict) -> str | None:
+    """The name of the account a post went to; memo as in _poster (accounts.json is read and opened once, not per post)."""
+    k = ("account", u["account_id"]) if "account_id" in u else ("legacy", u.get("platform", "youtube"))
+    if k not in memo:
+        memo[k] = (pipeline._account_of(u) or {}).get("name")
+    return memo[k]
+
+
+def _clip_item(c: dict, ups: list[dict], memo: dict | None = None) -> dict:
     """A clip card, in the furthest stage it has reached."""
     done = [u for u in ups if u["status"] == "done"]
     pending = [u for u in ups if u["status"] in PENDING]
@@ -1103,26 +1148,26 @@ def _clip_item(c: dict, ups: list[dict]) -> dict:
         stage = "preclipped"
     else:
         stage = "longform" if aspect in ("16:9", "source") else "shortform"
+    memo = {} if memo is None else memo
     exp, pid = c.get("export") or {}, c["project_id"]
-    thumb = f"/files/{pid}/{exp['cover']}" if exp.get("cover") else         (f"/files/{pid}/poster.jpg" if (pipeline.pdir(pid) / "poster.jpg").exists() else None)
+    thumb = f"/files/{pid}/{exp['cover']}" if exp.get("cover") else _poster(pid, memo)
     stamps = [exp.get("at"), *(u.get("uploaded_at") for u in ups)]
     return {"type": "clip", "id": c["id"], "project_id": pid, "title": c.get("title"), "stage": stage, "thumb": thumb,
             "duration": round(c["end"] - c["start"], 3), "aspect": aspect,
             "updated": max([s for s in stamps if s] or [_iso(c.get("created"))]),
             "posts": [{"upload_id": u["id"], "platform": u["platform"], "url": u.get("url"), "video_id": u.get("video_id"),
-                       "publish_at": u.get("publish_at"), "account": (pipeline._account_of(u) or {}).get("name")} for u in done],
+                       "publish_at": u.get("publish_at"), "account": _account_name(u, memo)} for u in done],
             "pending": [{"platform": u["platform"], "status": u["status"], "when": u.get("publish_at") or u.get("upload_at")}
                         for u in pending],
             "locked": bool(done), "edit_url": f"#/studio/{c['id']}"}
 
 
-@app.get("/api/pipeline")
 def pipeline_board(expired: bool = False):
     """Every project and clip on one board: each in exactly one stage, the furthest it has reached. Clips and long forms
     the space saver expired are left out unless ?expired=1; every card carries its Keep pin and due date."""
     stages = {k: [] for k, _ in STAGES}
     clips, ups, lfs = store.find("clip"), store.find("upload"), store.find("longform")
-    dues = storage.due_map()
+    dues, memo = storage.due_map(), {}
     by_clip: dict[str, list] = {}
     for u in ups:
         by_clip.setdefault(u.get("longform_id") or u.get("clip_id"), []).append(u)
@@ -1131,7 +1176,7 @@ def pipeline_board(expired: bool = False):
         if p.get("status") in ("importing", "queued", "analyzing") or p.get("status") == "ready" and p["id"] not in with_clips:
             stages["harvested"].append({
                 "type": "project", "id": p["id"], "project_id": p["id"], "title": p.get("name"), "stage": "harvested",
-                "thumb": f"/files/{p['id']}/poster.jpg" if (pipeline.pdir(p["id"]) / "poster.jpg").exists() else None,
+                "thumb": _poster(p["id"], memo),
                 "duration": (p.get("meta") or {}).get("duration"), "aspect": None, "updated": _iso(p.get("created")),
                 "posts": [], "pending": [], "locked": False, "edit_url": f"#/editor/{p['id']}",
                 "keep": bool(p.get("keep")), "due": dues.get(("source", p["id"]))})
@@ -1139,29 +1184,34 @@ def pipeline_board(expired: bool = False):
         for d in docs:
             if d.get("expired") and not expired:
                 continue
-            item = make(d, by_clip.get(d["id"], []))
+            item = make(d, by_clip.get(d["id"], []), memo)
             item.update(keep=bool(d.get("keep")), expired=d.get("expired"), due=dues.get((kind, d["id"])))
             stages[item["stage"]].append(item)
     return {"stages": [{"key": k, "label": label, "items": stages[k]} for k, label in STAGES]}
 
 
+@app.get("/api/pipeline")
+def pipeline_route(expired: bool = False):
+    return JSONResponse(pipeline_board(expired))  # plain JSON already: skips FastAPI's per-value encoder (~70 ms on 3,000 clips)
+
+
 LF_LANE = {"captured": "preclipped", "edited": "longform", "rendered": "ready", "uploaded": "uploaded"}
 
 
-def _longform_item(d: dict, ups: list[dict]) -> dict:
+def _longform_item(d: dict, ups: list[dict], memo: dict | None = None) -> dict:
     """A long-form card: captured → edited → rendered → uploaded, shown in the matching lane and marked Long form."""
     lf_stage = longform.stage(d, ups)
     done = [u for u in ups if u["status"] == "done"]
     pending = [u for u in ups if u["status"] in PENDING]
+    memo = {} if memo is None else memo
     exp, pid = d.get("export") or {}, d["project_id"]
-    thumb = f"/files/{pid}/{exp['cover']}" if exp.get("cover") else \
-        (f"/files/{pid}/poster.jpg" if (pipeline.pdir(pid) / "poster.jpg").exists() else None)
+    thumb = f"/files/{pid}/{exp['cover']}" if exp.get("cover") else _poster(pid, memo)
     stamps = [exp.get("at"), *(u.get("uploaded_at") for u in ups)]
     return {"type": "longform", "id": d["id"], "project_id": pid, "title": d.get("title"), "stage": LF_LANE[lf_stage],
             "lf_stage": lf_stage, "thumb": thumb, "duration": longform.length(d), "aspect": d["edit"].get("aspect"),
             "updated": max([s for s in stamps if s] or [_iso(d.get("created"))]),
             "posts": [{"upload_id": u["id"], "platform": u["platform"], "url": u.get("url"), "video_id": u.get("video_id"),
-                       "publish_at": u.get("publish_at"), "account": (pipeline._account_of(u) or {}).get("name")} for u in done],
+                       "publish_at": u.get("publish_at"), "account": _account_name(u, memo)} for u in done],
             "pending": [{"platform": u["platform"], "status": u["status"], "when": u.get("publish_at") or u.get("upload_at")}
                         for u in pending],
             "locked": bool(done), "edit_url": f"#/long/{d['id']}"}
@@ -1365,6 +1415,9 @@ def upload_clip(cid: str, body: dict):
             if not acc:
                 raise HTTPException(400, "One of the chosen accounts is no longer linked; reopen Publish.")
             accs.append(pipeline._pick_account(acc["platform"], aid))  # approved, or 400
+        clip = store.get("clip", cid)  # a QA error for any chosen platform refuses the lot, not the posts after the first
+        if clip and pipeline._current(clip) and (block := "; ".join(filter(None, (pipeline.qa_block(clip, p) for p in dict.fromkeys(a["platform"] for a in accs))))):
+            raise HTTPException(400, block)
         return [pipeline.request_upload(cid, {**body, "platform": a["platform"], "account_id": a["id"],
                                               "tiktok": (body.get("tiktok_by_account") or {}).get(a["id"]) or body.get("tiktok")})
                 for a in accs]
@@ -1464,7 +1517,11 @@ def retry(uid: str):
 
 @app.get("/api/jobs")
 def jobs():
-    return store.find("job")[:80]
+    out = store.newest("job", 80)
+    for j in out:  # the status indicator names what's running ("Analyzing 'Stream 11/24'")
+        if j.get("status") in ("queued", "running") and j.get("project_id"):
+            j["project_name"] = (store.get("project", j["project_id"]) or {}).get("name")
+    return out
 
 
 CANCELABLE = {"export", "find", "virality", "research", "results", "track"}  # no other doc waits on these jobs' status
@@ -2230,12 +2287,15 @@ class _ProjectFiles:
 app.include_router(remote.router)  # /api/remote*: before the mounts below, which would swallow it
 from .routes_live import router as _live_router  # noqa: E402  live & integrations (OBS marks, telemetry, HUD, MCP)
 app.include_router(_live_router)
-app.include_router(__import__(f"{__package__}.routes_signals", fromlist=["router"]).router)  # /api/signals* (WP1)
-app.include_router(__import__(f"{__package__}.routes_learn", fromlist=["router"]).router)  # /api/learn/* (WP4: Lab insights, evals)
-app.include_router(__import__(f"{__package__}.routes_render", fromlist=["router"]).router)  # proxies, encoders (WP2: render & QA)
-app.include_router(__import__(f"{__package__}.routes_publish", fromlist=["router"]).router)  # /api/vault*, templates (WP3)
-app.include_router(__import__(f"{__package__}.routes_editor", fromlist=["router"]).router)  # /api/triage, NLE export (WP5)
-app.include_router(__import__(f"{__package__}.routes_models", fromlist=["router"]).router)  # /api/models/* (model marketplace)
+# static imports only: PyInstaller can't follow __import__ strings, and a route it misses kills the .exe at startup
+from . import routes_editor, routes_learn, routes_models, routes_publish, routes_render, routes_signals  # noqa: E402
+
+app.include_router(routes_signals.router)  # /api/signals* (WP1)
+app.include_router(routes_learn.router)    # /api/learn/* (WP4: Lab insights, evals)
+app.include_router(routes_render.router)   # proxies, encoders (WP2: render & QA)
+app.include_router(routes_publish.router)  # /api/vault*, templates (WP3)
+app.include_router(routes_editor.router)   # /api/triage, NLE export (WP5)
+app.include_router(routes_models.router)   # /api/models/* (model marketplace)
 from .routes_training import router as _training_router  # noqa: E402  /api/training/* (Model Lab; static import: packaged)
 app.include_router(_training_router)
 app.mount("/files", _ProjectFiles(), name="files")

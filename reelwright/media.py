@@ -138,19 +138,38 @@ def sprite(src: Path, duration: float, out: Path, count: int) -> None:
           "-frames:v", "1", "-q:v", "4", str(out)])
 
 
-def audio_signals(src: Path) -> tuple[list[float], list[dict]]:
-    """Waveform peaks at 10/s (0..1) and the loudest moments (energy spikes ≈ laughs, shouts, hype)."""
-    r = subprocess.run([FFMPEG, "-v", "error", "-i", str(src), "-vn", "-ac", "1", "-ar", "4000", "-f", "s16le", "-"],
-                       capture_output=True, creationflags=NO_WINDOW)
-    x = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+def audio_signals(src: Path, silences_out: list | None = None) -> tuple[list[float], list[dict]]:
+    """Waveform peaks at 10/s (0..1) and the loudest moments (energy spikes ≈ laughs, shouts, hype).
+    The 4 kHz mono PCM is read a minute at a time, so a 6-hour VOD never sits in memory whole (it was ~1 GB of arrays).
+    silences_out: a list that also gets silences() from this same decode (the same silencedetect filter, on the same
+    decoded audio, ahead of the downmix), so analysis reads the audio once instead of twice."""
+    import tempfile
+
     win = 400  # 0.1 s
-    n = len(x) // win
-    if n == 0:
+    sd = ["-af", "silencedetect=noise=-35dB:d=0.7"] if silences_out is not None else []
+    errf = tempfile.TemporaryFile()  # silencedetect's lines; a file so ffmpeg never blocks on a full stderr pipe
+    proc = subprocess.Popen([FFMPEG, "-hide_banner", "-nostats", "-v", "info" if sd else "error", "-i", str(src), "-vn", *sd,
+                             "-ac", "1", "-ar", "4000", "-f", "s16le", "-"], stdout=subprocess.PIPE, stderr=errf,
+                            creationflags=NO_WINDOW)
+    peaks, rms = [], []
+    try:
+        while buf := proc.stdout.read(win * 2 * 600):  # 60 s; only the very last block can be short
+            x = np.frombuffer(buf[: len(buf) // (win * 2) * win * 2], dtype=np.int16).astype(np.float32) / 32768.0
+            x = x.reshape(-1, win)
+            peaks.append(np.abs(x).max(axis=1))
+            rms.append(np.sqrt((x ** 2).mean(axis=1)))
+    finally:
+        proc.stdout.close()
+        proc.wait()
+        errf.seek(0)
+        err = errf.read().decode("utf-8", "replace")
+        errf.close()
+    if silences_out is not None:
+        silences_out[:] = _silence_pairs(err)
+    peaks, rms = np.concatenate(peaks or [np.zeros(0, np.float32)]), np.concatenate(rms or [np.zeros(0, np.float32)])
+    if len(peaks) == 0:
         return [], []
-    x = x[: n * win].reshape(n, win)
-    peaks = np.abs(x).max(axis=1)
     peaks = peaks / (peaks.max() or 1)
-    rms = np.sqrt((x ** 2).mean(axis=1))
     smooth = np.convolve(rms, np.ones(20) / 20, mode="same")  # 2 s window
     return [round(float(p), 3) for p in peaks], energy_spikes(smooth)
 
@@ -180,7 +199,7 @@ def scene_times(showinfo_log: str) -> list[float]:
 
 def scenes(src: Path, threshold: float = SCENE_THRESHOLD) -> list[float]:
     """Hard-cut times. (Analysis normally gets these from vision.analyze's shared decode; this is the fallback.)"""
-    r = subprocess.run([FFMPEG, "-hide_banner", "-hwaccel", "auto", "-i", str(src), "-an", "-vf",
+    r = subprocess.run([FFMPEG, "-hide_banner", "-i", str(src), "-an", "-vf",  # CPU decode: see vision.analyze
                         f"scale=320:-2,select='gt(scene,{threshold})',showinfo", "-f", "null", "-"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     return scene_times(r.stderr)
@@ -189,8 +208,12 @@ def scenes(src: Path, threshold: float = SCENE_THRESHOLD) -> list[float]:
 def silences(src: Path, noise_db: int = -35, min_dur: float = 0.7) -> list[list[float]]:
     r = subprocess.run([FFMPEG, "-hide_banner", "-i", str(src), "-vn", "-af", f"silencedetect=noise={noise_db}dB:d={min_dur}",
                         "-f", "null", "-"], capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
-    starts = [float(s) for s in re.findall(r"silence_start: ([\d.]+)", r.stderr)]
-    ends = [float(s) for s in re.findall(r"silence_end: ([\d.]+)", r.stderr)]
+    return _silence_pairs(r.stderr)
+
+
+def _silence_pairs(log: str) -> list[list[float]]:
+    starts = [float(s) for s in re.findall(r"silence_start: ([\d.]+)", log)]
+    ends = [float(s) for s in re.findall(r"silence_end: ([\d.]+)", log)]
     return [[round(s, 2), round(e, 2)] for s, e in zip(starts, ends)]
 
 
@@ -730,6 +753,77 @@ def overlay_window(t: float, d: float, start: float, keeps, speed: float) -> tup
     return a, max(b, a + 0.04)
 
 
+# ---------- timeline effects (edit.effects, validated by server._effects) ----------
+
+def effect_windows(effects, start: float, keeps, speed: float) -> list[dict]:
+    """edit.effects (clip time) -> output time: each window through jump cuts and speed like an overlay's, and each
+    keyframe's time with it (absolute output seconds)."""
+    m = (lambda x: remap(start + x, keeps)) if keeps else (lambda x: x)
+    out = []
+    for fx in effects or []:
+        a, b = overlay_window(float(fx["t"]), float(fx["d"]), start, keeps, speed)
+        keys = [[round(m(float(fx["t"]) + float(k[0])) / speed, 3), *k[1:]] for k in fx.get("keys") or []]
+        out.append({**fx, "a": round(a, 3), "b": round(b, 3), "keys": keys})
+    return out
+
+
+SECTION_KEYS = ("layout", "regions", "split", "split2", "pip_corner", "pip_size", "pip_radius", "pip_border",
+                "crop_x", "crop_y", "zoom")  # what a timeline layout section (edit.layout_segments) may override
+
+
+def section_windows(sections, start: float, keeps, speed: float) -> list[dict]:
+    """edit.layout_segments ({s, e} clip time + layout overrides) -> output time {a, b, **overrides}, through jump cuts and
+    speed like an overlay's window."""
+    out = []
+    for sec in sections or []:
+        if keeps and not any(k0 < start + float(sec["e"]) and k1 > start + float(sec["s"]) for k0, k1 in keeps):
+            continue  # wholly inside a cut: nothing of it is in the output
+        a, b = overlay_window(float(sec["s"]), float(sec["e"]) - float(sec["s"]), start, keeps, speed)
+        out.append({**{k: v for k, v in sec.items() if k in SECTION_KEYS}, "a": round(a, 3), "b": round(b, 3)})
+    return out
+
+
+def _relabel(g: str, tag: str) -> str:
+    """Every [label] of a graph made unique with `tag` (input pads like [0:v] start with a digit and stay as they are)."""
+    return re.sub(r"\[([A-Za-z]\w*)\]", lambda m: f"[{m[1]}{tag}]", g)
+
+
+def _lerp(keys: list, var: str, i: int = 1) -> str:
+    """Keyframes [[t, v1, v2…], …] (sorted, output s) as a piecewise-linear expression of `var` for value i; flat outside."""
+    expr = f"{keys[-1][i]:g}"
+    for k0, k1 in reversed(list(zip(keys, keys[1:]))):
+        (t0, a), (t1, b) = (k0[0], k0[i]), (k1[0], k1[i])
+        seg = f"{a:g}+({b - a:g})*({var}-{t0:.3f})/{t1 - t0:.3f}" if t1 - t0 >= 0.001 else f"{b:g}"
+        expr = f"if(lt({var},{t1:.3f}),{seg},{expr})"
+    return f"if(lt({var},{keys[0][0]:.3f}),{keys[0][i]:g},{expr})"
+
+
+def _effect_filters(effects: list, W: int, H: int, rate: float) -> tuple[list[str], list[str]]:
+    """(picture filters: zoom + blur, under the overlays; dip filters: opacity, over them and under the captions).
+    Zoom x/y place the zoomed window (0 = left/top edge, 0.5 = centred, 1 = right/bottom), so it never leaves the frame.
+    ponytail: zoompan re-times frames at `rate` (CFR); a variable-frame-rate source drifts slightly while zoomed."""
+    on = lambda fx, v: f"between({v},{fx['a']:.3f},{fx['b']:.3f})"  # noqa: E731
+    pic, dip = [], []
+    zs = [fx for fx in effects if fx["kind"] == "zoom" and fx.get("keys")]
+    if zs:
+        z = "1" + "".join(f"+if({on(fx, 'it')},{_lerp(fx['keys'], 'it')}-1,0)" for fx in zs)
+        cx = cy = "0.5"
+        for fx in reversed(zs):  # the earliest active zoom places the window
+            cx, cy = (f"if({on(fx, 'it')},{_lerp(fx['keys'], 'it', i)},{prev})" for i, prev in ((2, cx), (3, cy)))
+        pic.append(f"zoompan=z='max(1,min(4,{z}))':x='(iw-iw/zoom)*({cx})':y='(ih-ih/zoom)*({cy})':d=1:s={W}x{H}:fps={rate:g}")
+    pic += [f"{_blur(int(fx['amount']), 2)}:enable='{on(fx, 't')}'" for fx in effects if fx["kind"] == "blur"]
+    ops = [fx for fx in effects if fx["kind"] == "opacity" and fx.get("keys")]
+    if ops:
+        k = "*".join(f"if({on(fx, '{v}')},{_lerp(fx['keys'], '{v}')},1)" for fx in ops)
+        if has_filter("eq"):  # y·k: contrast k around 0.5 plus brightness (k-1)/2; saturation k greys the chroma with it
+            k = k.replace("{v}", "t")
+            dip.append(f"eq=contrast='{k}':brightness='({k}-1)/2':saturation='{k}':eval=frame")
+        else:  # LGPL builds lack eq: the same multiply per pixel (slow, but only on clips that use it)
+            k = k.replace("{v}", "T")
+            dip.append(f"geq=lum='lum(X,Y)*{k}':cb='128+(cb(X,Y)-128)*{k}':cr='128+(cr(X,Y)-128)*{k}'")
+    return pic, dip
+
+
 def _overlay_chain(o: dict, i: int, W: int, H: int) -> str:
     """[b{i}] + overlay input -> [b{i+1}]: sized, shifted to its window, animated with per-frame expressions."""
     a, b = o["a"], o["b"]
@@ -760,29 +854,8 @@ def _overlay_chain(o: dict, i: int, W: int, H: int) -> str:
             f"enable='between(t,{a:.3f},{b:.3f})'[b{i + 1}]")
 
 
-def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, keeps_rel=None,
-                  has_audio: bool = True, music: bool = False, fps: float = 30, overlays=None,
-                  fontsdir: bool = False, feeds: dict | None = None, headline: dict | None = None,
-                  bleeps: list | None = None) -> tuple[str, tuple[int, int]]:
-    """One filter_complex producing [v] (and [a] when there is any audio). keeps_rel = jump-cut ranges relative to the clip.
-    feeds = extra camera-angle inputs for split-screen regions, {angle id: (input index, offset s, width, height)}.
-    headline = a headline_spec(...): its band (push) letterboxes the picture, a glass theme blurs the video under its bar;
-    the bar and text themselves are drawn by the ASS file (build_ass). bleeps = output-time spans the voice is muted
-    (and beeped, edit "bleep") over."""
-    e = {**DEFAULT_EDIT, **edit}
-    speed = float(e["speed"])
-    W, H = output_size(e["aspect"], sw, sh)
-    lay = headline_layout(headline, W, H, seam(e)) if headline else None
-    full_h, band = H, lay and lay["band"]
-    if band:
-        H -= band[1]  # every layout below composes into the area left under/over the banner
-    pre = []
-    if keeps_rel:
-        pre += [f"select='{_between(keeps_rel)}'", "setpts=N/FRAME_RATE/TB"]
-    if abs(speed - 1) > 1e-3:
-        pre.append(f"setpts=PTS/{speed:g}")
-    reframed = e["aspect"] != "source"
-    plan = switch_windows(e, keeps_rel, speed, {**(feeds or {}), "main": None}) if feeds and e.get("switches") else {}
+def _picture(e: dict, sw: int, sh: int, W: int, H: int, pre: list, fps: float, feeds, plan: dict, reframed: bool) -> str:
+    """The framed picture (W×H, unlabelled) for one layout: build_filters' video before its look, overlays and captions."""
     if reframed and e["layout"] == "split" and not e.get("regions"):  # a split clip from before regions: its graph as it was
         th = _even(H * float(e["split"]))
         bh = H - th
@@ -814,6 +887,39 @@ def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, 
             chain.append(f"crop={cw}:{ch}:{cx}:{cy}")
         chain.append(f"scale={W}:{H}")
         g = "[0:v]" + ",".join(chain)
+    return g
+
+
+def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, keeps_rel=None,
+                  has_audio: bool = True, music: bool = False, fps: float = 30, overlays=None,
+                  fontsdir: bool = False, feeds: dict | None = None, headline: dict | None = None,
+                  bleeps: list | None = None, effects: list | None = None,
+                  sections: list | None = None) -> tuple[str, tuple[int, int]]:
+    """One filter_complex producing [v] (and [a] when there is any audio). keeps_rel = jump-cut ranges relative to the clip.
+    feeds = extra camera-angle inputs for split-screen regions, {angle id: (input index, offset s, width, height)}.
+    headline = a headline_spec(...): its band (push) letterboxes the picture, a glass theme blurs the video under its bar;
+    the bar and text themselves are drawn by the ASS file (build_ass). bleeps = output-time spans the voice is muted
+    (and beeped, edit "bleep") over."""
+    e = {**DEFAULT_EDIT, **edit}
+    speed = float(e["speed"])
+    W, H = output_size(e["aspect"], sw, sh)
+    lay = headline_layout(headline, W, H, seam(e)) if headline else None
+    full_h, band = H, lay and lay["band"]
+    if band:
+        H -= band[1]  # every layout below composes into the area left under/over the banner
+    pre = []
+    if keeps_rel:
+        pre += [f"select='{_between(keeps_rel)}'", "setpts=N/FRAME_RATE/TB"]
+    if abs(speed - 1) > 1e-3:
+        pre.append(f"setpts=PTS/{speed:g}")
+    reframed = e["aspect"] != "source"
+    plan = switch_windows(e, keeps_rel, speed, {**(feeds or {}), "main": None}) if feeds and e.get("switches") else {}
+    g = _picture(e, sw, sh, W, H, pre, fps, feeds, plan, reframed)
+    for i, sec in enumerate(sections or []):  # a timeline section's own layout, laid over the clip's while it runs
+        # ponytail: each section composes its picture for the whole clip and shows it in its window (simple, exact frames);
+        # trim each branch to its window if many sections on long clips get slow
+        sub = _picture({**e, **{k: v for k, v in sec.items() if k in SECTION_KEYS}}, sw, sh, W, H, pre, fps, feeds, plan, reframed)
+        g = f"{g}[lsb{i}];{_relabel(sub, f'_s{i}')}[lss{i}];[lsb{i}][lss{i}]overlay=0:0:enable='between(t,{sec['a']:.3f},{sec['b']:.3f})'"
     if band:
         g += f",pad={W}:{full_h}:0:{band[1] if band[0] == 0 else 0}:color=black"
         H = full_h
@@ -831,6 +937,9 @@ def build_filters(edit: dict, sw: int, sh: int, out_dur: float, has_subs: bool, 
     if e["sharpen"]:
         post.append("unsharp=5:5:0.8")
     look, post = post, []  # overlays go on the finished picture, under fades and captions
+    if effects:  # timeline effects = effect_windows(...): zoom/blur with the look, opacity over the overlays
+        pic, post = _effect_filters(effects, W, H, (fps or 30) * speed)
+        look += pic
     fi, fo = float(e["fade_in"]), float(e["fade_out"])
     if fi > 0:
         post.append(f"fade=t=in:st=0:d={fi:.2f}")
@@ -1258,7 +1367,9 @@ def _card_shape(sp: dict, k: float) -> tuple[int, int, list[dict], int | None]:
             shape(_rrect(0, 0, w, h, h // 2), sp["bg"], a=sp["bg_opacity"])
             text(aw + pad, h // 2, 4, sp["sub_font"], fs, sp["fg"], url or name, b=1)
         shape(_rrect(0, 0, aw, h, h // 2), sp["accent"])
-        shape(_rrect(pad, (h - dot) // 2, dot, dot, dot // 2), sp["dot"], layer=9, pulse=True)
+        # a ring in the pill's text colour (white on Twitch/YouTube, near-black on Kick's green and the white pill) keeps
+        # the red dot readable on every pill, also the red one; only its fill pulses
+        shape(_rrect(pad, (h - dot) // 2, dot, dot, dot // 2), sp["dot"], layer=9, pulse=True, bord=max(R(3), 1), bc=sp["on_accent"])
         text(pad + dot + R(10), h // 2, 4, sp["font"], fs, sp["on_accent"], "LIVE")
         return w, h, items, None
     if sp["kind"] == "minimal":
@@ -1266,10 +1377,12 @@ def _card_shape(sp: dict, k: float) -> tuple[int, int, list[dict], int | None]:
         tag = PLATFORM_NAMES.get(sp["platform"], "Live").upper()
         tag_w = _tw(tag, tfs, 0.66) + 2 * tp
         who = (f"/{handle}" if sp["platform"] in ("twitch", "kick") else f"@{handle}") if handle else name
-        w = tag_w + R(12) + _tw(who, hfs)
+        w = tag_w + R(12) + _tw(who, hfs) + R(14)
+        # the handle on a soft see-through dark chip tucked under the tag: clean on any frame, no heavy outline
+        shape(_rrect(tag_w - R(8), 0, w - tag_w + R(8), h, R(8)), sp["bg"], a=0.78)
         shape(_rrect(0, 0, tag_w, h, R(8)), sp["accent"])
         text(tag_w // 2, h // 2, 5, sp["font"], tfs, sp["on_accent"], tag)
-        text(tag_w + R(12), h // 2, 4, sp["font"], hfs, sp["fg"], who, bord=max(R(3), 1), shad=max(R(2), 1))
+        text(tag_w + R(12), h // 2, 4, sp["font"], hfs, sp["fg"], who)
         return w, h, items, None
     # card: avatar circle, then a plate with the name, the channel and a category line
     pad, nfs, hfs, cfs, gap = R(18), R(40), R(28), R(24), R(12)
@@ -1734,7 +1847,10 @@ def render(src: Path, out: Path, start: float, end: float, edit: dict, meta: dic
     spans = [(max(a, 0.0), min(b, out_dur)) for a, b in spans if b - a > 0.02 and b > 0 and a < out_dur]  # a cut word: gone
     graph, _ = build_filters(e, meta["width"], meta["height"], out_dur, bool(ass), keeps_rel, has_audio,
                              bool(music), meta.get("fps") or 30, placed, bool(ass and fonts), feeds=feeds, headline=headline,
-                             bleeps=spans)
+                             bleeps=spans, effects=[w for w in effect_windows(e.get("effects"), start, keeps, float(e["speed"]))
+                                                    if w["a"] < out_dur] or None,
+                             sections=[w for w in section_windows(e.get("layout_segments"), start, keeps, float(e["speed"]))
+                                       if w["a"] < out_dur] or None)
     work = out.parent / f".work_{out.stem}"
     work.mkdir(parents=True, exist_ok=True)
     try:

@@ -167,6 +167,11 @@ def clip_timeline(clip: dict) -> dict:
         t = float(mk.get("t", -1))
         if any(a <= t < b for a, b in keeps):
             tl["markers"].append((round(media.remap(t, keeps), 3), str(mk.get("label") or mk.get("kind") or "marker"), "marker"))
+    for mk in e.get("markers") or []:  # the creator's timeline markers (edit.markers, clip time)
+        t = clip["start"] + float(mk["t"])
+        if any(a <= t < b for a, b in keeps):
+            tl["markers"].append((round(media.remap(t, keeps), 3), str(mk.get("label") or "Marker"), "marker"))
+    tl["markers"].sort(key=lambda m: m[0])
     return tl
 
 

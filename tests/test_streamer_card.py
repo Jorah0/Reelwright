@@ -2,6 +2,8 @@
 collision avoidance (headline, captions, app safe zones), a real 9:16 render with a round avatar, and old renders
 unchanged."""
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 
@@ -15,6 +17,28 @@ from reelwright import assets, longform, media, pipeline, qa, server, store  # n
 V = (1080, 1920)
 WORDS = [{"s": 1.0, "e": 1.4, "w": "hello"}, {"s": 1.5, "e": 1.9, "w": "world"}]
 CLIP = {"start": 0, "end": 10}
+
+
+KINDS = ("project", "clip", "longform", "source", "asset", "job")
+
+
+@pytest.fixture(autouse=True)
+def clean():
+    """Every doc (and project folder / asset file) a test makes is removed afterwards, and the saved card pref restored."""
+    before, pref = {k: {d["id"] for d in store.find(k)} for k in KINDS}, store.get("pref", "streamer_card")
+    yield
+    for k in KINDS:
+        for d in store.find(k):
+            if d["id"] not in before[k]:
+                store.delete(k, d["id"])
+                if k == "project":
+                    shutil.rmtree(pipeline.pdir(d["id"]), ignore_errors=True)
+                if k == "asset" and d.get("file"):
+                    (assets.ASSETS / d["file"]).unlink(missing_ok=True)
+    if pref:
+        store.put("pref", pref)
+    else:
+        store.delete("pref", "streamer_card")
 
 
 def _card(**kw):
@@ -258,3 +282,50 @@ def test_real_9_16_render_with_a_round_avatar_and_card(tmp_path):
     assert g > 180 and r < 90 and b < 90  # the avatar's green at the circle's centre
     r, g, b = _pixel(out, 1.0, cx - d // 2 + 3, cy - d // 2 + 3)  # its square corner is cut away (round mask)
     assert not (g > 180 and r < 90 and b < 90)
+
+
+# ---------- review fixes ----------
+
+def test_autofill_ignores_clip_slugs_sanitizes_handles_and_keeps_foreign_names(monkeypatch):
+    monkeypatch.setattr(pipeline.accounts, "all_accounts", lambda platform=None: [{"platform": "youtube", "handle": "@me", "name": "Me"}])
+    g = pipeline.streamer_guess(_proj(source_url="https://clips.twitch.tv/FunnySlug-abc123", source_info={"channel": "NightOwl"}))
+    assert g == {"platform": "twitch", "handle": "nightowl", "name": "NightOwl"}  # the slug isn't the handle
+    g = pipeline.streamer_guess(_proj(source_url="https://www.youtube.com/@Cool%20Creator!/streams"))
+    assert g["handle"] == "Cool20Creator"  # only what clean_edit accepts
+    server.clean_edit({"streamer_card": g}, CLIP)
+    g = pipeline.streamer_guess(_proj(source_url="https://www.tiktok.com/@someone/video/1", source_info={"channel": "Someone"}))
+    assert g == {"name": "Someone"}  # not merged with an unrelated linked YouTube account
+
+
+def test_qa_places_the_card_clear_of_the_captions_like_the_render():
+    e = {**media.DEFAULT_EDIT, "aspect": "9:16", "captions": True, "caption_pos": "low",
+         "streamer_card": {"on": True, "name": "Night Owl", "handle": "nightowl", "style": "twitch_card", "position": "bottom"}}
+    spec = media.card_spec(e)
+    real = media.card_place(spec, *V, None, None, media.build_ass(WORDS, 0, 10, 1, V, pos="low", card=spec))["rect"]
+    seen = []
+    orig = media.card_place
+    media.card_place = lambda *a, **k: seen.append(orig(*a, **k)["rect"]) or orig(*a, **k)
+    try:
+        qa.safe_zones({"edit": e}, *V)
+    finally:
+        media.card_place = orig
+    assert seen and all(r == real for r in seen)
+
+
+# ---------- legibility on every pill and over bright frames ----------
+
+@pytest.mark.parametrize("bid", [b for b, t in media.BADGE_THEMES.items() if t["kind"] == "live"])
+def test_the_live_dot_has_a_ring_in_the_pill_text_colour_that_reads_on_every_pill(bid):
+    ev = _events(media.build_ass([], 0, 10, 1, V, captions=False, card=_card(style=bid)))
+    dot = next(x for x in ev if "\\t(" in x)  # the pulsing dot
+    ring = "\\3c" + media._ass_color(media.BADGE_THEMES[bid]["on_accent"])  # white on Twitch/YouTube, near-black on Kick
+    assert re.search(r"\\bord[1-9]", dot) and ring in dot  # the ring stays while only the fill pulses
+
+
+@pytest.mark.parametrize("bid", [b for b, t in media.BADGE_THEMES.items() if t["kind"] == "minimal"])
+def test_the_minimal_handle_sits_on_a_soft_dark_chip_without_a_heavy_outline(bid):
+    ev = _events(media.build_ass([], 0, 10, 1, V, captions=False, card=_card(style=bid)))
+    who = next(x for x in ev if "/nightowl" in x)
+    assert "\\bord0" in who
+    chip = [x for x in ev if "\\p1" in x and media._ass_color(media.BADGE_THEMES[bid]["bg"]) in x]
+    assert chip and all("\\1a&H00&" not in x for x in chip)  # see-through, not a solid block

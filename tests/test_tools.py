@@ -235,3 +235,16 @@ def test_desktop_moves_off_a_port_another_program_holds(monkeypatch):
     mine.clear()
     mine.add(8765)
     assert desktop.pick_port(8765) == (8765, True)
+
+
+def test_every_module_is_imported_statically_so_the_exe_bundles_it():
+    """PyInstaller can't follow __import__(f"...") strings: a route loaded that way is missing from the .exe and
+    the app dies at startup ('No module named reelwright.routes_signals')."""
+    import re
+    from pathlib import Path
+    root = Path(media.__file__).parent
+    dynamic = [f"{p.name}:{i}" for p in root.rglob("*.py") if p.name != "worker.py"
+               for i, line in enumerate(p.read_text("utf-8").splitlines(), 1) if re.search(r"__import__\(|import_module\(", line)]
+    assert not dynamic, f"dynamic imports the .exe won't bundle: {dynamic}"
+    build = (root.parent / "scripts" / "build_exe.py").read_text("utf-8")
+    assert '"--collect-submodules", "reelwright"' in build  # belt and braces for sub-packages (models/, training/)

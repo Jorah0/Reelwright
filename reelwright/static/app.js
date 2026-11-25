@@ -17,6 +17,19 @@ async function api(path, opts = {}) {
   return data;
 }
 
+// A project's transcript.json (10-20 MB on a long VOD), parsed once per file version: the server answers an unchanged file
+// with a 304 and the same ETag (mtime + size), so opening the Editor / Studio / Long form again skips the big JSON parse.
+const TRANSCRIPT = {};
+async function transcriptOf(pid) {
+  const r = await fetch(`/files/${pid}/transcript.json`).catch(() => null);
+  if (!r?.ok) return { segments: [] };
+  const tag = r.headers.get("etag");
+  if (tag && TRANSCRIPT.pid === pid && TRANSCRIPT.tag === tag) return TRANSCRIPT.data;
+  const data = await r.json().catch(() => ({ segments: [] }));
+  Object.assign(TRANSCRIPT, { pid, tag, data });
+  return data;
+}
+
 function toast(msg, kind = "info", ms = 4200) {
   const t = document.createElement("div");
   t.className = `toast ${kind}`;
@@ -373,6 +386,171 @@ function headlineEditor(box, { clip, set, compact = false }) {
   };
   loadHeadline().then(draw);
 }
+
+// ---------- streamer card / platform badges: styles from /api/streamer/badges; scShape/scLayout mirror media._card_shape/card_layout ----------
+const SC = { badges: null, platforms: {}, default: {}, saved: null, safe: { top: 0.1, bottom: 0.2, right: 0.12 }, assets: [] };
+let scP = null;
+const loadCard = (force = false) => { if (force) scP = null; return (scP ||= Promise.all([api("/api/streamer/badges").then((d) => Object.assign(SC, d)), api("/api/assets").then((a) => { SC.assets = Array.isArray(a) ? a.filter((x) => x.kind === "image") : []; })]).catch(() => SC)); };
+const scHandle = (h) => String(h || "").trim().replace(/^@+/, "");
+const scUrl = (p, h) => { h = scHandle(h); return !h ? "" : ({ twitch: `twitch.tv/${h}`, kick: `kick.com/${h}`, youtube: `youtube.com/@${h}` })[p] || `@${h}`; };
+const scAvatarUrl = (id) => { const a = id && SC.assets.find((x) => x.id === id); return a ? `/assets/${encodeURI(a.file)}` : ""; };
+function scSpec(e, force = false) { // force: draw even when off or empty (gallery cards)
+  const c = { ...SC.default, ...(e?.streamer_card || {}) };
+  if (!SC.badges || (!force && (!c.on || !(String(c.name || "").trim() || scHandle(c.handle))))) return null;
+  const style = SC.badges[c.style] ? c.style : "twitch_card", th = SC.badges[style];
+  return { ...th, ...c, style, accent: hexOr(c.accent, th.accent), platform: c.platform || th.platform };
+}
+function scShape(sp, k) {
+  const R = (v) => Math.round(v * k), tw = (s, fs, cw = 0.56) => Math.round(s.length * fs * cw), items = [];
+  const name = String(sp.name || "").trim(), handle = scHandle(sp.handle), url = scUrl(sp.platform, handle);
+  const shape = (x, y, w, h, r, c, o = {}) => items.push({ x, y, w, h, r, c, ...o });
+  const text = (x, y, an, font, fs, c, s, o = {}) => items.push({ t: 1, x, y, an, font, fs, c, s, b: 1, ...o });
+  if (sp.kind === "live") {
+    const h = R(60), fs = R(28), pad = R(20), dot = R(16), aw = pad + dot + R(10) + tw("LIVE", fs, 0.62) + pad, who = url || name;
+    const w = aw + (who ? tw(who, fs, 0.55) + 2 * pad : 0);
+    if (w > aw) { shape(0, 0, w, h, h / 2, sp.bg, { a: sp.bg_opacity }); text(aw + pad, h / 2, 4, sp.sub_font, fs, sp.fg, who, { f: url ? "handle" : "name" }); }
+    shape(0, 0, aw, h, h / 2, sp.accent);
+    shape(pad, (h - dot) / 2, dot, dot, dot / 2, sp.dot, { pulse: 1, ring: Math.max(R(3), 1), bc: sp.on_accent }); // ring in the pill's text colour: reads on every pill
+    text(pad + dot + R(10), h / 2, 4, sp.font, fs, sp.on_accent, "LIVE");
+    return { w, h, items, d: 0 };
+  }
+  if (sp.kind === "minimal") {
+    const h = R(46), tfs = R(24), hfs = R(34), tp = R(14), tag = (SC.platforms[sp.platform] || "Live").toUpperCase(), tagW = tw(tag, tfs, 0.66) + 2 * tp;
+    const who = handle ? (["twitch", "kick"].includes(sp.platform) ? `/${handle}` : `@${handle}`) : name;
+    const w = tagW + R(12) + tw(who, hfs) + R(14);
+    shape(tagW - R(8), 0, w - tagW + R(8), h, R(8), sp.bg, { a: 0.78 }); // the soft dark chip under the handle
+    shape(0, 0, tagW, h, R(8), sp.accent);
+    text(tagW / 2, h / 2, 5, sp.font, tfs, sp.on_accent, tag);
+    text(tagW + R(12), h / 2, 4, sp.font, hfs, sp.fg, who, { f: handle ? "handle" : "name" });
+    return { w, h, items, d: 0 };
+  }
+  const pad = R(18), nfs = R(40), hfs = R(28), cfs = R(24), gap = R(12), cat = String(sp.category || "").trim();
+  const lines = [[name || handle, sp.font, nfs, sp.fg, 1, name ? "name" : "handle"], ...(url && name ? [[url, sp.sub_font, hfs, sp.platform !== "generic" ? sp.accent : sp.sub, 1, "handle"]] : []),
+    ...(cat ? [[cat, sp.sub_font, cfs, sp.sub, 0, "category"]] : [])];
+  const raw = Math.round(2 * pad + lines.reduce((a, l) => a + l[2] * 1.22, 0)), h = Math.max(raw - (raw % 2), 2), d = h;
+  const pw = 2 * pad + Math.max(...lines.map(([s, , fs, , b]) => tw(s, fs, b ? 0.56 : 0.5)));
+  shape(d + gap, 0, pw, h, R(16), sp.bg, { a: sp.bg_opacity, bord: Math.max(R(3), 1), bc: sp.accent });
+  items.push({ av: 1, x: 0, y: 0, w: d, h: d, ring: Math.max(R(5), 2), c: sp.accent, letter: (name || handle || "?")[0].toUpperCase(), fs: Math.round(d * 0.45), font: sp.font, fc: sp.on_accent });
+  let y = pad;
+  for (const [s, font, fs, col, b, f] of lines) { text(d + gap + pad, y, 7, font, fs, col, s, { b, f }); y += Math.round(fs * 1.22); }
+  return { w: d + gap + pw, h, items, d };
+}
+// The card's spot in a W×H frame: corner/top/bottom inside the apps' safe zones (vertical), moved off the avoid bands [[y0, y1]].
+function scLayout(sp, W, H, avoid = []) {
+  const base = W / 1080, m = Math.round(36 * base), vert = H > W, z = SC.safe;
+  let k = base * (+sp.scale || 1), g = scShape(sp, k);
+  if (g.w > W - 2 * m) { k *= (W - 2 * m) / g.w; g = scShape(sp, k); }
+  const top = vert ? Math.round(z.top * H) : m, bottom = vert ? Math.round((1 - z.bottom) * H) : H - m, right = vert ? Math.round((1 - z.right) * W) : W - m, { w, h } = g, p = sp.position;
+  let x = p === "custom" ? sp.x * W - w / 2 : p.length === 2 ? (p[1] === "l" ? m : right - w) : (W - w) / 2;
+  let y = p === "custom" ? sp.y * H - h / 2 : ["tl", "tr", "top"].includes(p) ? top : bottom - h;
+  x = Math.round(Math.min(Math.max(x, 0), W - w)); y = Math.round(Math.min(Math.max(y, 0), H - h));
+  const gap = Math.round(H * 0.015), hit = (v) => avoid.some(([b0, b1]) => v < b1 + gap && b0 - gap < v + h);
+  if (hit(y)) {
+    const cands = avoid.flatMap(([b0, b1]) => [b1 + gap, b0 - gap - h]).map(Math.round).filter((v) => v >= 0 && v <= H - h && !hit(v));
+    const pool = cands.filter((v) => v >= top && v <= bottom - h).length ? cands.filter((v) => v >= top && v <= bottom - h) : cands;
+    if (pool.length) y = pool.reduce((a, b) => (Math.abs(b - y) < Math.abs(a - y) ? b : a));
+  }
+  return { ...g, k, x, y };
+}
+// Under an app's own UI (vertical): like qa.safe_zones' card check, against the most any app covers.
+const scUnsafe = (L, W, H) => H > W && (L.y < SC.safe.top * H || L.y + L.h > (1 - SC.safe.bottom) * H || (L.x + L.w > (1 - SC.safe.right) * W && L.y + L.h > 0.4 * H));
+// Draws the card into el (an absolutely-positioned layer over a W-wide frame); s = screen px per output px; rz = a resize handle.
+function scRender(el, sp, L, s, avatar, rz = false) {
+  const px = (v) => (v * s).toFixed(1) + "px", rgba = (hex, a = 1) => { const n = parseInt(hexOr(hex, "#000000").slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; };
+  const box = (it) => `left:${px(it.x)};top:${px(it.y)};width:${px(it.w)};height:${px(it.h)}`;
+  const tr = { 4: "translateY(-50%)", 5: "translate(-50%,-50%)", 7: "none" };
+  el.innerHTML = `<div class="sc-card" style="left:${px(L.x)};top:${px(L.y)};width:${px(L.w)};height:${px(L.h)}">${L.items.map((it, i) => it.t
+    ? `<span data-sci="${i}"${it.f ? ` data-scf="${it.f}" title="Double-click to edit"` : ""} style="left:${px(it.x)};top:${px(it.y)};transform:${tr[it.an]}">${esc(it.s)}</span>`
+    : it.av ? `<i class="sc-av" style="${box(it)};background:${rgba(it.c)};box-shadow:0 0 0 ${px(it.ring / 2)} ${rgba(it.c)}">${avatar ? `<img src="${esc(avatar)}" alt="">` : `<b>${esc(it.letter)}</b>`}</i>`
+    : `<i class="${it.pulse ? "sc-pulse" : ""}" style="${box(it)};border-radius:${px(it.r)};background:${rgba(it.c, it.a ?? 1)};${it.bord ? `border:${px(it.bord)} solid ${rgba(it.bc)}` : ""}${it.ring ? `;box-shadow:0 0 0 ${px(it.ring)} ${rgba(it.bc)}` : ""}"></i>`).join("")}${rz ? `<i class="sc-rz" title="Drag to resize"></i>` : ""}</div>`;
+  L.items.forEach((it, i) => {
+    if (it.t) styleText($(`[data-sci="${i}"]`, el), { font: it.font, size: it.fs * 0.72, weight: it.b ? "bold" : "normal", color: it.c, outline: it.bord || 0, outline_color: "#000000", shadow: it.shad || 0, spacing: 0 }, s);
+    else if (it.av && !avatar) styleText($(".sc-av b", el), { font: it.font, size: it.fs * 0.72, weight: "bold", color: it.fc, outline: 0, shadow: 0, spacing: 0 }, s);
+  });
+}
+// Style gallery card: the badge drawn live, fitted into the small tile.
+function scCard(el, id, cur) {
+  const sp = scSpec({ streamer_card: { ...cur, on: true, style: id, platform: "", name: cur.name || "Your Name", handle: cur.handle || "yourname" } }, true);
+  if (!sp) return;
+  const L = scLayout({ ...sp, position: "custom", x: 0.5, y: 0.5, scale: 1 }, 1080, 1080), cw = el.clientWidth || 120, ch = el.clientHeight || 54;
+  const s = Math.min((cw - 8) / L.w, (ch - 8) / L.h);
+  scRender(el, sp, { ...L, x: (cw / s - L.w) / 2, y: (ch / s - L.h) / 2 }, s, scAvatarUrl(cur.avatar_asset_id));
+}
+// The streamer-card controls (Studio section, or compact in the Editor). clip() = the live clip; set(editPatch, delay) saves
+// edit keys; avoid() = the bands the card keeps clear of in the preview (Studio), for the safe-zone warning. Returns draw().
+function streamerCardEditor(box, { clip, set, compact = false, avoid = () => [] }) {
+  if (!box) return () => {};
+  const cur = () => ({ ...SC.default, ...(clip().edit.streamer_card || {}) });
+  const put = (p, d = 250) => set({ streamer_card: { ...(clip().edit.streamer_card || {}), ...p } }, d);
+  const draw = () => {
+    if (!SC.badges) return;
+    const C = cur(), e = clip().edit, sp = scSpec(e), [OW, OH] = SIZES[e.aspect] || [1920, 1080];
+    const seg = (key, opts) => `<div class="seg">${opts.map(([v, l]) => `<button type="button" class="${String(C[key]) === v ? "on" : ""}" data-scset="${key}" data-v="${v}">${l}</button>`).join("")}</div>`;
+    const field = (k, l, ph) => `<label class="field">${l}<input type="text" data-sc="${k}" maxlength="40" value="${esc(C[k] || "")}" placeholder="${esc(ph)}"></label>`;
+    const warn = sp && scUnsafe(scLayout(sp, OW, OH, avoid()), OW, OH);
+    box.innerHTML = `<label class="switch"><input type="checkbox" data-sc="on" ${C.on ? "checked" : ""}> Show a streamer card (badge)</label>
+      ${compact ? `<label class="field">Style<select data-sc="style">${Object.entries(SC.badges).map(([id, b]) => `<option value="${esc(id)}" ${C.style === id ? "selected" : ""}>${esc(b.label)}</option>`).join("")}</select></label>`
+        : `<div class="hl-gallery" role="listbox" aria-label="Badge styles">${Object.entries(SC.badges).map(([id, b]) => `<button type="button" role="option" class="hl-card" aria-selected="${C.style === id}" data-sct="${esc(id)}" title="${esc(b.label)}"><div class="sc-mini" data-scmini="${esc(id)}"></div><span>${esc(b.label)}</span></button>`).join("")}</div>`}
+      <div class="two">${field("name", "Display name", "Night Owl")}${field("handle", "Handle", "nightowl")}</div>
+      ${compact ? "" : `<div class="two">${field("category", "Category / game", "Just Chatting")}<label class="field">Platform<select data-sc="platform">${[["", "From the style"], ...Object.entries(SC.platforms)].map(([v, l]) => `<option value="${esc(v)}" ${C.platform === v ? "selected" : ""}>${esc(v === "generic" ? "Other (@handle)" : l)}</option>`).join("")}</select></label></div>
+        <div class="row wrap"><button type="button" class="btn xs" data-sca="guess" title="From the video's link or channel, a connected source or a linked account">✦ Auto-fill from the source</button>
+          <label class="field" style="flex-direction:row;align-items:center;gap:6px">Avatar<select data-sc="avatar_asset_id"><option value="">Lettered circle</option>${SC.assets.map((a) => `<option value="${esc(a.id)}" ${C.avatar_asset_id === a.id ? "selected" : ""}>${esc(a.name || a.file)}</option>`).join("")}</select></label>
+          <label class="field" style="flex-direction:row;align-items:center;gap:6px">Colour<input type="color" data-sc="accent" value="${esc(hexOr(C.accent, SC.badges[C.style]?.accent || "#9146FF"))}"></label>${C.accent ? `<button type="button" class="btn xs ghost" data-sca="accent-reset">Style colour</button>` : ""}</div>`}
+      ${seg("position", [["tl", "↖"], ["tr", "↗"], ["top", "Top"], ["bottom", "Bottom"], ["bl", "↙"], ["br", "↘"], ...(C.position === "custom" ? [["custom", "Dragged"]] : [])])}
+      ${compact ? `<a class="btn xs ghost" href="#/studio/${esc(clip().id)}">Styles, avatar, timing &amp; dragging in Studio</a>` : `<label class="slider"><span>Size</span><input type="range" data-sc="scale" min="0.5" max="2" step="0.05" value="${+C.scale || 1}"><output>${(+C.scale || 1).toFixed(2)}×</output></label>
+        <div class="row wrap">${seg("show", [["whole", "Whole clip"], ["first_n_seconds", "First seconds"]])}${C.show !== "whole" ? `<label class="field" style="flex-direction:row;align-items:center;gap:6px">for <input type="number" data-sc="seconds" min="0.5" max="30" step="0.5" value="${+C.seconds}" style="width:72px"> s</label>` : ""}</div>
+        ${seg("anim", [["none", "No motion"], ["slide", "Slide in"], ["pop", "Pop up"], ["fade", "Fade"]])}
+        <div class="row wrap"><button type="button" class="btn xs" data-sca="save" title="Keep this card (style, name, avatar, spot) as yours">★ Save as my streamer card</button>
+          <label class="switch" style="font-size:12px"><input type="checkbox" data-sca="auto" ${SC.saved?.auto ? "checked" : ""}> Add to new clips</label></div>
+        <div class="muted" style="font-size:12px">In Output view: drag the card to move it, its corner to resize, double-click its text to edit.</div>`}
+      ${warn ? `<div class="ang-note warn">The card sits where TikTok, Shorts or Reels draw their own buttons or caption — move it (a corner spot stays clear).</div>` : ""}`;
+    $$("[data-scmini]", box).forEach((el) => scCard(el, el.dataset.scmini, C));
+  };
+  box.oninput = (ev) => {
+    ev.stopPropagation();
+    const t = ev.target, k = t.dataset.sc;
+    if (["name", "handle", "category"].includes(k)) put({ [k]: k === "handle" ? scHandle(t.value).replace(/[^\w.-]/g, "") : t.value, ...(t.value.trim() && k !== "category" ? { on: true } : {}) }, 600);
+    else if (k === "scale") { t.nextElementSibling.textContent = (+t.value).toFixed(2) + "×"; put({ scale: +t.value }, 300); }
+  };
+  box.onchange = async (ev) => {
+    ev.stopPropagation();
+    const t = ev.target, k = t.dataset.sc;
+    if (k === "on") put({ on: t.checked });
+    else if (["style", "platform"].includes(k)) put({ [k]: t.value, ...(k === "style" ? { platform: "" } : {}) });
+    else if (k === "avatar_asset_id") put({ avatar_asset_id: t.value || null });
+    else if (k === "accent") put({ accent: t.value.toUpperCase() });
+    else if (k === "seconds") put({ seconds: Math.min(Math.max(+t.value || 4, 0.5), 30) });
+    else if (t.dataset.sca === "auto") {
+      try { await new Promise((r) => setTimeout(r, 700)); SC.saved = await api(`/api/clips/${clip().id}/streamer/save`, { body: { auto: t.checked } }); toast(t.checked ? "New clips get your streamer card." : "New clips start without a streamer card.", "ok"); }
+      catch (err) { t.checked = !t.checked; fail(err); }
+      return;
+    } else return; // text and the size slider are saved on input; a redraw here would swallow the click that blurred them
+    draw();
+  };
+  box.onclick = async (ev) => {
+    ev.stopPropagation();
+    const b = ev.target.closest("[data-sct],[data-scset],[data-sca]");
+    if (!b) return;
+    if (b.dataset.sct) { put({ style: b.dataset.sct, platform: "", on: true }); return draw(); }
+    if (b.dataset.scset) { put({ [b.dataset.scset]: b.dataset.v }); return draw(); }
+    if (b.dataset.sca === "accent-reset") { put({ accent: null }); return draw(); }
+    if (b.dataset.sca === "guess") {
+      b.disabled = true;
+      try {
+        const g = await api(`/api/clips/${clip().id}/streamer/guess`);
+        if (!Object.keys(g).length) toast("Nothing to go on: this video has no channel link. Type the name and handle.");
+        else { const st = SC.badges[`${g.platform}_card`] && !String(cur().style).startsWith(g.platform) ? { style: `${g.platform}_card` } : {}; put({ ...g, ...st, platform: "", on: true }); draw(); }
+      } catch (err) { fail(err); } finally { b.disabled = false; }
+    }
+    if (b.dataset.sca === "save") {
+      b.disabled = true;
+      try { await new Promise((r) => setTimeout(r, 700)); SC.saved = await api(`/api/clips/${clip().id}/streamer/save`, { body: { auto: !!SC.saved?.auto } }); toast("Saved as your streamer card.", "ok"); } // ponytail: waits out the debounced edit saves, like the headline theme
+      catch (err) { fail(err); } finally { b.disabled = false; }
+    }
+  };
+  loadCard().then(draw);
+  return draw;
+}
 // Caption chunks as the renderer groups them: up to 3 words (vertical) or 6, broken at pauses and sentence ends.
 function chunkWords(words, vertical) {
   const max = vertical ? 3 : 6, out = [];
@@ -434,18 +612,21 @@ async function route() {
   current = new View(arg);
   try { await current.mount(); } catch (e) { fail(e); }
   if (nav !== S.nav) return; // the user navigated away while this page was loading
-  if (current.refresh) S.timers.push(setInterval(() => current.refresh().catch(() => {}), current.every || 1500));
+  if (current.refresh) S.timers.push(setInterval(() => !document.hidden && current.refresh().catch(() => {}), current.every || 1500)); // hidden tab: no page polling
 }
 window.addEventListener("hashchange", route);
 
 async function sideStatus() {
   try {
-    const [settings, conn, jobs] = await Promise.all([api("/api/settings"), api("/api/connections"), api("/api/jobs")]);
+    S.polled = Date.now();
+    const [settings, conn, jobs, train] = await Promise.all([api("/api/settings"), api("/api/connections"), api("/api/jobs"),
+      api("/api/training/active").catch(() => [])]); // the one extra request: training isn't a /api/jobs job
     S.settings = settings; S.conn = conn;
     storageNotice(settings); // unplugged storage drive banner; the first-run space saver choice
     if (!S.uiLoaded) { S.uiLoaded = true; applyUi(settings.ui_scale); } // once at boot; afterwards this page is the source of truth
     const running = jobs.filter((j) => j.status === "running" || j.status === "queued").length;
     const b = $("#jobs-badge"); b.hidden = !running; b.textContent = running;
+    activity(jobs, train);
     const row = (ok, label, text, href) => `<div class="row"><span class="pill ${ok ? "ok" : "warn"}">${label}</span><span>${ok ? esc(text) : `<a href="${href}">connect</a>`}</span></div>`;
     $("#side-status").innerHTML = `<button class="btn sm ${settings.autopilot_paused ? "danger" : ""}" id="ap-pause" style="width:100%;margin-bottom:8px"
         title="${settings.autopilot_paused ? "Autopilot is paused everywhere: nothing new is scheduled and its queued posts are held. Click to resume." : "Pause Autopilot everywhere: stops new scheduling and holds its queued posts (nothing is deleted)."}">
@@ -456,6 +637,63 @@ async function sideStatus() {
       + row(conn.instagram.connected, "Instagram", conn.instagram.name || "connected", "#/publish");
   } catch { /* server restarting */ }
 }
+
+// ---------- status indicator (top of the sidebar): busy + what, or Ready; click = running/queued tasks ----------
+const ACT_CANCEL = new Set(["export", "find", "virality", "research", "results", "track"]); // mirrors server.CANCELABLE
+const pct = (p) => (p > 0 ? ` ${Math.round(p * 100)}%` : "");
+function actLabel(j) { // short, for the indicator: "Analyzing 'Stream 11/24' 42%"
+  const name = j.project_name ? ` '${j.project_name.length > 22 ? j.project_name.slice(0, 21) + "…" : j.project_name}'` : "";
+  if (j.train) return `Training${pct(j.progress)}`;
+  return ({ analyze: `Analyzing${name}`, import_url: `Importing${name}`, ingest_file: `Importing${name}`, export: "Rendering a clip",
+    upload: `Uploading to ${PLATFORM[j.platform] || "your channel"}`, find: `Finding clips${name}`, track: "Tracking a subject",
+  }[j.kind] || JOB_LABEL[j.kind] || j.kind) + (j.status === "running" ? pct(j.progress) : " (queued)");
+}
+function activity(jobs, train) {
+  const live = [...jobs.filter((j) => j.status === "running" || j.status === "queued"),
+    ...train.map((t) => ({ ...t, train: true, status: t.status === "paused" ? "running" : t.status }))]
+    .sort((a, b) => (a.status === "running" ? 0 : 1) - (b.status === "running" ? 0 : 1));
+  const run = live.filter((j) => j.status === "running"), renders = live.filter((j) => j.kind === "export" && !j.train);
+  if (S.actBusy && !live.length) S.actDone = Date.now(); // just finished: "All done" for a little while
+  S.actBusy = live.length > 0; S.actLive = live;
+  let label = "Ready";
+  if (live.length) label = renders.length > 1 && renders.length === live.length ? `Rendering ${renders.length} clips` : actLabel(run[0] || live[0]);
+  else if (Date.now() - (S.actDone || 0) < 20000) label = "All done";
+  const btn = $("#act-btn");
+  btn.classList.toggle("busy", live.length > 0);
+  if ($("#act-label").textContent !== label) $("#act-label").textContent = label;
+  const n = $("#act-n"); n.hidden = live.length < 2; n.textContent = live.length;
+  btn.setAttribute("aria-label", live.length ? `Busy: ${label}${live.length > 1 ? `, ${live.length} tasks` : ""}. Show tasks.` : `${label}: nothing running. Show tasks.`);
+  if (!$("#act-pop").hidden) actPop();
+}
+function actPop() {
+  const pop = $("#act-pop"), live = S.actLive || [];
+  const r = $("#act-btn").getBoundingClientRect(), below = r.top < 80 || innerWidth <= 720; // phone: the sidebar is a top bar
+  Object.assign(pop.style, below ? { left: Math.max(8, Math.min(r.left, innerWidth - 330)) + "px", top: r.bottom + 6 + "px" } : { left: r.right + 8 + "px", top: r.top + "px" });
+  const html = `<div class="row"><b class="grow">${live.length ? `${live.length} task${live.length > 1 ? "s" : ""}` : "Nothing running"}</b><a href="#/jobs" data-act-close>Activity →</a></div>
+    ${live.length ? live.map((j) => `<div class="act-job"><div class="row"><span class="grow">${esc(j.train ? `Model training (${j.kind})` : JOB_LABEL[j.kind] || j.kind)}${j.project_name ? ` <span class="dim">· ${esc(j.project_name)}</span>` : ""}</span>
+        ${(j.train ? j.status === "queued" || j.status === "running" : j.status === "queued" && ACT_CANCEL.has(j.kind)) ? `<button class="btn xs ghost" data-act-cancel="${esc(j.id)}" data-train="${j.train ? 1 : ""}" title="Cancel this task">✕ Cancel</button>` : ""}</div>
+      ${j.status === "running" ? bar(j.progress) : ""}<div class="dim act-msg">${j.status === "queued" ? "Queued" : esc(j.message || "Running")}</div></div>`).join("")
+      : `<div class="dim act-msg">Reelwright is free: start an import, a render or a post and it shows here.</div>`}`;
+  if (pop._h !== html) { pop._h = html; pop.innerHTML = html; }
+}
+function actToggle(open = $("#act-pop").hidden) {
+  $("#act-pop").hidden = !open; $("#act-btn").setAttribute("aria-expanded", open);
+  if (open) { actPop(); $("#act-pop").querySelector("a, button")?.focus(); }
+}
+$("#act-btn").addEventListener("click", () => actToggle());
+document.addEventListener("pointerdown", (e) => { if (!$("#act-pop").hidden && !e.target.closest("#act-pop, #act-btn")) actToggle(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#act-pop").hidden) { actToggle(false); $("#act-btn").focus(); } });
+$("#act-pop").addEventListener("click", async (e) => {
+  if (e.target.closest("[data-act-close]")) return actToggle(false);
+  const b = e.target.closest("[data-act-cancel]");
+  if (!b) return;
+  b.disabled = true;
+  try {
+    await api(b.dataset.train ? `/api/training/jobs/${b.dataset.actCancel}/cancel` : `/api/jobs/${b.dataset.actCancel}/cancel`, { method: "POST" });
+    toast("Canceled.", "ok");
+  } catch (err) { fail(err); }
+  sideStatus();
+});
 
 // ---------- autopilot form (shared) ----------
 const AP_DEFAULT = { enabled: false, top_n: 3, first_publish: "", interval_hours: 24, privacy: "public", aspect: "9:16", captions: true, jump_cuts: false, mode: "publish_at", platforms: ["youtube"], timing: "best" };
@@ -710,7 +948,7 @@ function storageCards() { // Settings › Storage + Space saver, inserted above 
       <div class="row wrap"><div class="grow"><div class="mono" style="word-break:break-all">${esc(st.path)}</div><div class="dim" style="font-size:12px">${st.custom ? "Your chosen folder" : "The default folder"}</div></div>
         <button class="btn sm" id="st-change" ${m.active ? "disabled" : ""}>Change folder…</button></div>
       ${st.missing ? `<div style="color:var(--err);font-size:12.5px">This folder isn't available (is the drive connected?). Renders, imports and uploads wait until it's back; nothing was moved or deleted. Reconnect it, or pick another folder (projects stored here stay here).</div>`
-        : `<div style="font-size:13px">Free: <b>${gb(st.free)}</b>${u ? ` · Reelwright uses <b>${gb(u.total)}</b> — sources ${gb(u.sources)}, renders ${gb(u.renders)}, other ${gb(u.other)}` : ""}</div>`}
+        : `<div style="font-size:13px">Free: <b>${gb(st.free)}</b>${u ? ` · Reelwright uses <b>${gb(u.total)}</b> — sources ${gb(u.sources)}, renders ${gb(u.renders)}, other ${gb(u.other)}${u.chatlogs ? `; live chat logs ${gb(u.chatlogs)} (app data)` : ""}` : ""}</div>`}
       ${m.active ? `<div style="font-size:12.5px">${esc(m.message || "Moving…")} → <span class="mono">${esc(m.to)}</span></div>${bar(m.progress)}
           <div class="dim" style="font-size:12px">Renders, imports and uploads wait until the move finishes. Closing Reelwright is safe: the move continues next time.</div>`
         : m.error ? `<div style="color:var(--err);font-size:12.5px">The move stopped: ${esc(m.error)} ${m.phase === "cleanup"
@@ -844,8 +1082,8 @@ function Library() {
     const list = await api("/api/projects");
     const el = $("#projects");
     if (!el) return;
-    if (!list.length) { el.innerHTML = `<div class="empty card" style="grid-column:1/-1"><b>No projects yet</b>Add a video above to get started.</div>`; return; }
-    el.innerHTML = list.map((p) => `
+    // rebuilt only when something changed: a 1.5 s poll of an unchanged library no longer re-lays-out every card
+    const html = !list.length ? `<div class="empty card" style="grid-column:1/-1"><b>No projects yet</b>Add a video above to get started.</div>` : list.map((p) => `
       <div class="proj" data-id="${p.id}">
         <div class="thumb" style="background-image:url('/files/${p.id}/poster.jpg')">${p.meta ? `<span class="dur">${fmt(p.meta.duration, 0)}</span>` : ""}</div>
         <button class="btn xs danger del" data-del="${p.id}">Delete</button>
@@ -861,7 +1099,9 @@ function Library() {
           <div class="row wrap" style="gap:6px">${keepBtn("project", p.id, p.keep)}${dueChip(p.source_due, true)}
             ${p.origin?.kind === "imported_short" && p.status === "ready" && p.first_clip ? `<a class="btn xs primary" href="#/studio/${esc(p.first_clip)}">Open in Studio</a>` : ""}</div>
         </div></div>`).join("");
+    if (el._h !== html) { el._h = html; el.innerHTML = html; }
     el.onclick = async (e) => {
+      el._h = null; // a click may change a card in place (spinner, disabled button): the next refresh redraws
       const kb = e.target.closest("[data-keep]");
       if (kb) { e.stopPropagation(); await toggleKeep(kb); return this.refresh(); }
       if (e.target.closest("a")) return; // "Open in Studio"
@@ -940,7 +1180,7 @@ function Editor(pid) {
 
   async function loadAnalysis() {
     const [tr, sig] = await Promise.all([
-      fetch(`/files/${pid}/transcript.json`).then((r) => (r.ok ? r.json() : { segments: [] })),
+      transcriptOf(pid),
       fetch(`/files/${pid}/signals.json`).then((r) => (r.ok ? r.json() : {})),
     ]);
     E.segs = tr.segments || [];
@@ -1543,7 +1783,8 @@ function Editor(pid) {
       </div>
       <div class="sec"><h3>Text style</h3>
         <div class="seg">${[["caption", "Captions"], ["title", "Title card"], ["sticker", "Sticker"], ["headline", "Headline"]].map(([v, l]) => `<button class="${(E.tsk || "caption") === v ? "on" : ""}" data-act="tsk" data-v="${v}">${l}</button>`).join("")}</div>
-        ${E.tsk === "headline" ? `<div id="ed-hl" class="stack" style="gap:8px"></div><a class="btn xs ghost" href="#/studio/${c.id}">Theme gallery, timing &amp; more in Studio</a>` : ""}
+        ${E.tsk === "headline" ? `<div id="ed-hl" class="stack" style="gap:8px"></div><a class="btn xs ghost" href="#/studio/${c.id}">Theme gallery, timing &amp; more in Studio</a>
+          <h3 style="margin-top:6px">Streamer card</h3><div id="ed-sc" class="stack" style="gap:8px"></div>` : ""}
         <div id="ed-ts" class="stack" style="gap:8px"></div>
       </div>
       <div class="sec"><h3>Look</h3>
@@ -1595,6 +1836,7 @@ function Editor(pid) {
     textStyleEditor($("#ed-ts"), { get: (k) => cur().edit[`${kind}_${k}`], set: (k, v) => patchClip(cur().id, { edit: { [`${kind}_${k}`]: v } }, 450),
       def: tsDefaults(kind, e, OW, OH), sample: kind === "title" ? e.title_text || "Title card" : kind === "sticker" ? e.sticker_text || "@yourchannel" : kind === "headline" ? e.headline?.text || "Your headline" : "Captions look like this" });
     if (kind === "headline") headlineEditor($("#ed-hl"), { clip: cur, compact: true, set: (ed, d) => { const th = cur().edit.headline?.theme; patchClip(cur().id, { edit: ed }, d); if (ed.headline?.theme !== th) renderTab(); } });
+    if (kind === "headline") streamerCardEditor($("#ed-sc"), { clip: cur, compact: true, set: (ed, d) => patchClip(cur().id, { edit: ed }, d) });
     renderActions();
   }
 
@@ -1631,7 +1873,10 @@ function Editor(pid) {
 function openPublish(c, onDone, lf = null) { // lf: a long-form doc → a regular (not #Shorts) video; c = {id, title, edit, hook, hashtags}
   const vertical = !lf && ["9:16", "4:5"].includes(c.edit.aspect), conn = S.conn || {};
   const base = lf ? `/api/longform/${encodeURIComponent(lf.id)}` : `/api/clips/${c.id}`, secs = lf ? (lf.current && lf.export?.duration) || lf.length : 0;
-  const tooLong = (a) => (lf && a.platform === "instagram" && secs > 900 ? `Instagram Reels can be at most 15 minutes (this is ${Math.round(secs / 60)} min)` : "");
+  // the pre-publish check of the current render (clip.export.qa): an error rules its platform out, warnings ask "Post anyway"
+  const ex = c.export || {}, qaIssues = !lf && ex.status === "done" && ex.rev === c.rev && Array.isArray(ex.qa) ? ex.qa : [];
+  const qaWarn = qaIssues.filter((i) => i.level !== "error"), qaErr = (a) => qaIssues.filter((i) => i.level === "error" && (!i.platform || i.platform === a.platform)).map((i) => i.msg).join("; ");
+  const tooLong = (a) => (lf && a.platform === "instagram" && secs > 900 ? `Instagram Reels can be at most 15 minutes (this is ${Math.round(secs / 60)} min)` : "") || qaErr(a);
   const tags = (c.hashtags || []).map((h) => h.replace(/^#/, ""));
   // only accounts the user approved on the Publish page; tick several to post the clip to each (two channels = two uploads)
   const all = Object.keys(PLATFORM).flatMap((p) => conn[p]?.accounts || []), ok = all.filter((a) => a.approved);
@@ -1658,8 +1903,9 @@ function openPublish(c, onDone, lf = null) { // lf: a long-form doc → a regula
       <label class="switch" title="YouTube: altered or synthetic content label. TikTok: AI-generated content label. Instagram's API has no such label: add it in the Instagram app if it applies."><input type="checkbox" id="paic" ${c.ai_media?.length || S.settings?.ai_disclosure === "always" ? "checked" : ""}> Contains AI-generated or altered realistic content <span class="dim">(YouTube &amp; TikTok label; not available for Instagram)</span></label>
       <label class="switch"><input type="checkbox" id="ptpl" checked> Add each account's description template <span class="dim" id="ptpl-ex"></span></label>
       <div id="ptt" class="card stack" hidden style="padding:12px"></div>
+      ${qaIssues.length ? `${qaList(qaIssues)}${qaWarn.length ? `<p class="dim" style="font-size:11.5px;margin:0">The check found something worth a look; you can still post it.</p>` : ""}` : ""}
     </div>
-    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="pgo">Queue post</button></div>`, (m, close) => {
+    <div class="foot"><button class="btn" data-close>Cancel</button><button class="btn primary" id="pgo">${qaWarn.length ? "Post anyway" : "Queue post"}</button></div>`, (m, close) => {
     let mode = "now";
     if (!lf) api(`/api/publish/template?clip_id=${encodeURIComponent(c.id)}`).then((t) => { // what the template adds (edit on the Publish page)
       const v = t.vars || {};
@@ -1966,7 +2212,7 @@ function Studio(cid) {
     T.srv = structuredClone(T.clip); // the clip as the server has it: what undo goes back to
     $("#nav-editor").hidden = false;
     const [tr, track, assets] = await Promise.all([
-      fetch(`/files/${T.proj.id}/transcript.json`).then((r) => (r.ok ? r.json() : { segments: [] })).catch(() => ({ segments: [] })),
+      transcriptOf(T.proj.id),
       api(`/api/clips/${cid}/track`).catch(() => null), // backend may not have tracking yet: fall back to the clip's stored track
       api("/api/assets").catch(() => null),
     ]);
@@ -1975,7 +2221,7 @@ function Studio(cid) {
     setTrack(track || c().edit.track || {});
     T.job = track?.job || null;
     T.assets = Array.isArray(assets) ? assets : null;
-    T.ovs = structuredClone(c().edit.overlays || []);
+    T.ovs = structuredClone(c().edit.overlays || []); T.fx = structuredClone(c().edit.effects || []);
     if (track && "follow" in track) c().edit = { ...c().edit, follow: !!track.follow };
     if (track) { T.tmode = TRACK_MODES.some(([m]) => m === track.mode) ? track.mode : "auto"; T.target = track.target || null; }
     loadWords();
@@ -1988,6 +2234,9 @@ function Studio(cid) {
     if (T.frTimer) { clearTimeout(T.frTimer); saveFraming(); }
     if (T.rgTimer) { clearTimeout(T.rgTimer); patch({ edit: { regions: regs() } }).catch(fail); } // a region drag still waiting to save
     if (T.tsTimer) { clearTimeout(T.tsTimer); flushEdit(); }
+    if (T.fxTimer) { clearTimeout(T.fxTimer); patch({ edit: { effects: T.fx.length ? T.fx : null } }).catch(fail); } // a timeline effect still waiting to save
+    if (T.secTimer) flushSecs().catch(fail);
+    T.music?.pause(); $("#tl-menu")?.remove();
     T.sounds.forEach((au) => au.pause()); view.oninput = null;
     Object.values(T.av || {}).forEach((v) => { v.pause(); v.removeAttribute("src"); v.load(); });
   };
@@ -1999,7 +2248,7 @@ function Studio(cid) {
     T.custom = Array.isArray(e.words);
   }
   const setRange = () => { const m = Math.max(2, (c().end - c().start) * 0.25); T.full = [Math.max(0, c().start - m), Math.min(dur() || c().end + m, c().end + m)]; T.range = [...T.full]; };
-  const setView = (a, span) => { span = Math.min(Math.max(span, 1), T.full[1] - T.full[0]); a = Math.min(Math.max(a, T.full[0]), T.full[1] - span); T.range = [a, a + span]; }; // timeline zoom/pan
+  const setView = (a, span) => { span = Math.min(Math.max(span, 20 / RWTimeline.fpsExact(T.proj?.meta?.fps || 30)), T.full[1] - T.full[0]); a = Math.min(Math.max(a, T.full[0]), T.full[1] - span); T.range = [a, a + span]; }; // timeline zoom/pan
   const scrubS = scrubber(() => video);
   const seek = (t) => { if (video) video.currentTime = Math.min(Math.max(t, c().start), c().end); };
   const base = () => ({ cx: +c().edit.crop_x, cy: +c().edit.crop_y });
@@ -2036,6 +2285,8 @@ function Studio(cid) {
     if (T.ovTimer) { clearTimeout(T.ovTimer); T.ovTimer = null; jobs.push(patch({ edit: { overlays: T.ovs } })); }
     if (T.frTimer) jobs.push(saveFraming());
     if (T.rgTimer) jobs.push(flushRegions());
+    if (T.fxTimer) jobs.push(flushFx());
+    if (T.secTimer) jobs.push(flushSecs());
     if (T.tsTimer) { clearTimeout(T.tsTimer); flushEdit(); }
     await Promise.all(jobs);
   }
@@ -2045,7 +2296,7 @@ function Studio(cid) {
     const body = redo ? T.hist.redo(cid) : T.hist.undo(cid);
     if (!body) return toast(redo ? "Nothing to redo." : "Nothing to undo.");
     try { await patch(body, false); } catch (e) { T.hist.clear(); return fail(e); }
-    T.ovs = structuredClone(c().edit.overlays || []); T.osel = null; T.csel = null;
+    T.ovs = structuredClone(c().edit.overlays || []); T.osel = null; T.csel = null; T.fx = structuredClone(c().edit.effects || []); T.sel = new Set(); loadKeeps();
     setTrack(c().edit.track || {}); loadWords(); renderPanel(); buildFx();
   }
 
@@ -2071,22 +2322,43 @@ function Studio(cid) {
           <div class="grow"></div>
           <span class="muted" style="font-size:12px" id="st-hint"></span>
         </div>
-        <div class="timeline st-tl"><div class="tl-tip" id="st-tip" hidden></div><canvas id="stl"></canvas>
-          <div class="tl-foot"><span class="st-key"><i style="background:var(--accent)"></i>clip</span><span class="st-key"><i style="background:var(--info)"></i>AI path (↔ framing)</span><span class="st-key"><i style="background:var(--ok)"></i>your keyframes</span><span class="st-key"><i style="background:#b07cff"></i>effects</span>
-            <span class="grow"></span><span>Drag edges to trim · Shift-drag = fine scrub · Ctrl+wheel zoom</span><button class="btn xs" data-act="tzout" title="Zoom out">−</button><button class="btn xs" data-act="tzin" title="Zoom in">+</button></div>
+        <div class="timeline st-tl" id="st-tl">
+          <div class="tl-grip" id="st-grip" role="separator" aria-orientation="horizontal" tabindex="0" aria-label="Timeline height: drag up for more tracks, arrow keys resize, double-click resets"
+            title="Drag up for more tracks, down for a bigger preview · double-click resets"></div>
+          <div class="tl-tools" role="toolbar" aria-label="Timeline tools">
+            <span class="tc tl-tcf" id="st-tcf" title="Timecode (h:mm:ss:frames) · frame number, from the clip's start">0:00:00:00 · f0</span>
+            <button class="btn xs" data-tl="split" title="Split at the playhead (S)">✂ Split</button>
+            <button class="btn xs" data-tl="ripple" title="Ripple-delete the In–Out range (Shift+Delete)">⌫ Ripple</button>
+            <button class="btn xs ghost" data-tl="in" title="Mark in (I)">[ In</button><button class="btn xs ghost" data-tl="out" title="Mark out (O)">Out ]</button>
+            <button class="btn xs ghost" data-tl="trim-io" title="Trim the clip to the In–Out marks">Trim to marks</button>
+            <select id="st-tladd" class="tl-add" aria-label="Add at the playhead"><option value="">＋ Add at playhead…</option>${ADDS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
+            <span class="grow"></span>
+            <label class="switch tl-snap" title="Snap to frames always; plus the playhead, marks, words, markers and item edges (N; hold Alt while dragging to skip)"><input type="checkbox" id="st-snap" ${TP.snap ? "checked" : ""}> Snap</label>
+            <button class="btn xs ghost" data-tl="zout" title="Zoom out (-)">−</button><input type="range" id="st-tlz" class="tl-zoom" min="0" max="1000" value="0" aria-label="Timeline zoom: whole clip to single frames"><button class="btn xs ghost" data-tl="zin" title="Zoom in (=)">+</button>
+            <button class="btn xs ghost" data-tl="fit" title="Fit the clip (\\)">Fit</button><button class="btn xs ghost" data-tl="help" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+          </div>
+          <div class="tl-grid"><div class="tl-corner"><select id="st-tldens" aria-label="Track height preset" title="Track height preset (drag a row's lower edge to size one row)">${[["0.8", "Compact"], ["1", "Standard"], ["1.35", "Comfortable"]].map(([v, l]) => `<option value="${v}"${+v === TP.dens ? " selected" : ""}>${l}</option>`).join("")}</select></div><canvas id="st-ruler" class="tl-ruler" aria-label="Time ruler: drag to scrub"></canvas></div>
+          <div class="tl-tip" id="st-tip" hidden></div>
+          <div class="tl-body"><div class="tl-heads" id="st-heads"></div><div class="tl-lanes"><canvas id="stl" tabindex="0" aria-label="Timeline: one row per layer. Press ? for shortcuts."></canvas></div></div>
+          <div class="tl-foot"><input type="range" id="st-hs" class="tl-hs" min="0" max="1000" value="0" aria-label="Scroll the timeline"><span>Drag to move · edges trim · Ctrl+wheel zoom · right-click a row for more</span></div>
         </div>
       </div>
       <div class="panel"><div class="st-lock" id="st-lock" hidden>🔒 <span class="grow">Posted — editing locked.</span><button class="btn xs primary" data-act="version">Make a new version</button></div><div class="tab-body" id="st-panel"></div></div></div>`;
-    video = $("#svid"); ov = $("#sov"); octx = ov.getContext("2d"); tl = $("#stl"); tctx = tl.getContext("2d");
+    video = $("#svid"); ov = $("#sov"); octx = ov.getContext("2d"); tl = $("#stl"); tctx = tl.getContext("2d"); ruler = $("#st-ruler"); rctx = ruler.getContext("2d");
+    if (T.proj.sprite_count) { T.sprite = new Image(); T.sprite.src = `/files/${pid()}/sprite.jpg`; }
+    fetch(`/files/${pid()}/signals.json`).then((r) => (r.ok ? r.json() : null)).then((j) => { if (j) { T.sig = j; T.tlSig = null; } }).catch(() => {}); // waveform, markers, viewer clips
+    $("#st-tladd").onchange = (e) => { const v = e.target.value; e.target.value = ""; if (v) tlAdd(v); };
+    $("#st-snap").onchange = (e) => { TP.snap = e.target.checked; saveTP(); };
     video.addEventListener("loadedmetadata", () => { seek(c().start); });
     video.addEventListener("play", () => { $("[data-act=play]").textContent = "❚❚"; });
     video.addEventListener("pause", () => { $("[data-act=play]").textContent = "▶"; T.sounds.forEach((au) => au.pause()); });
-    bindFrame(); bindTimeline(); bindDrop();
-    bindBoxes(ov, () => (!multiOn() || T.tmode === "target" ? null : T.mode === "source" ? regs() : c().edit.layout === "free" ? freeOuts() : null),
+    bindFrame(); bindTimeline(); bindResize(); bindDrop(); loadKeeps();
+    bindBoxes(ov, () => (!multiOn() || T.tmode === "target" ? null : T.mode === "source" ? regs() : layE().layout === "free" ? freeOuts() : null),
       (i, b) => (T.mode === "source" ? Object.assign(regs()[i], b) : (regs()[i].out = b)));
     view.onclick = onClick; view.oninput = onInput; view.onchange = onChange;
     keyHandler = (e) => {
-      if (e.target.closest?.("input, textarea, select") || $("#modal-root").innerHTML) return;
+      if (e.target.closest?.("input, textarea, select") || $("#modal-root").innerHTML || $("#tl-menu")) return;
+      if (tlKey(e)) { e.preventDefault(); return; }
       const z = (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase();
       if (z === "z" || z === "y") { e.preventDefault(); undoRedo(z === "y" || e.shiftKey); }
       else if ((e.key === "Delete" || e.key === "Backspace") && T.csel) { e.preventDefault(); cutSel(); }
@@ -2101,7 +2373,7 @@ function Studio(cid) {
       }
     };
     document.addEventListener("keydown", keyHandler);
-    renderPanel(); buildFx(); setMode(T.mode); applyLock();
+    renderPanel(); buildFx(); setMode(T.mode); applyLock(); applyTrackPrefs();
     cancelAnimationFrame(raf);
     const loop = () => { frame(); raf = requestAnimationFrame(loop); }; // ponytail: redraws every frame; cheap at this size
     loop();
@@ -2122,18 +2394,19 @@ function Studio(cid) {
     if (!video || !c()) return;
     const k = c(), t = video.currentTime, rel = t - k.start;
     if (!video.paused && (t >= k.end || t < k.start - 0.25)) video.currentTime = k.start; // loop inside the clip
-    const cut = !video.paused && (k.edit.cuts || []).find(([a, b]) => t >= a && t < b - 0.02);
+    const cut = !video.paused && !TP.hidden.cuts && (k.edit.cuts || []).find(([a, b]) => t >= a && t < b - 0.02);
     if (cut) video.currentTime = cut[1]; // text cuts: the preview jumps over them like the render
     if (angs().length) { syncAngles(t); drawCompare(); }
     $("#stc").textContent = `${fmt(Math.max(0, rel))} / ${fmt(k.end - k.start)}`;
-    drawTimeline();
+    tlSync(); syncMusic(rel);
     const wi = T.words.findIndex((w) => t >= w.s && t <= w.e);
     if (wi !== T.wi) { $(`.wd[data-i="${T.wi}"]`)?.classList.remove("now"); $(`.wd[data-i="${wi}"]`)?.classList.add("now"); T.wi = wi; }
     const sw = video.videoWidth, sh = video.videoHeight;
     if (!sw) return;
     const f = framing(rel), win = winAt(f, sw, sh);
     T.win = win;
-    fxTick(rel);
+    fxTick(rel); fxPreview(rel);
+    if (secAt(playRel()) !== T.secShown && !T.rgTimer) { T.regs = null; T.rsel = null; renderLayout(); hint(); } // the layout changes at a section boundary
     const multi = multiOn();
     $("#st-frame").classList.toggle("multi", multi);
     if (multi) { // split-screen: region boxes on the source, the composition in the panel (and as the Output view)
@@ -2252,136 +2525,734 @@ function Studio(cid) {
     try { await patch({ edit: { track_manual: T.manual } }); } catch (e) { fail(e); }
   }
 
-  // ----- mini timeline of this clip -----
-  let TL_H, LANE_Y, LANE_H, KF_Y, FX_Y, FX_H; // scaled by the Timelines interface size
-  let SW_Y, SW_H; // angle-switch lane
-  const tlScale = () => { [TL_H, LANE_Y, LANE_H, KF_Y, FX_Y, FX_H, SW_Y, SW_H] = [T.proj?.angles?.length ? 116 : 100, 8, 40, 58, 76, 18, 99, 14].map((v) => v * S.ui.timeline); };
-  tlScale();
+  // ----- multi-layer timeline: one row per layer, frame-accurate (RWTimeline: frames, snapping, split, ripple, nudge) -----
+  // Writes go through the existing save paths (overlays, cuts, switches, start/end, effects, markers) so undo/redo works.
+  // Hide / mute / lock / collapse / order are this window's preview and layout only: the render always has every layer.
+  const TLM = RWTimeline;
+  const fps = () => T.proj?.meta?.fps || 30;
+  const TRACKS = { video: ["Video", "ml"], angles: ["Camera", "l"], layout: ["Layout", "l"], cuts: ["Cuts", "hl"], captions: ["Captions", "h"], titles: ["Headline", "h"],
+    overlays: ["Overlays", "hl"], sfx: ["SFX", "ml"], music: ["Music", "m"], effects: ["Effects", "hl"], markers: ["Markers", "hl"] };
+  const TCOL = { video: "#ff6a3d", angles: "#4fc3f7", layout: "#4db6ac", cuts: "#ff5a6a", captions: "#cfd3e6", titles: "#ffc247", overlays: "#b07cff", sfx: "#37d39a", music: "#6aa8ff", effects: "#f06292", markers: "#c6e86b" };
+  const FX_NAME = { zoom: "Zoom", opacity: "Dip to black", blur: "Blur" };
+  const TP = (() => { let p; try { p = JSON.parse(lsGet("studioTracks") || "{}"); } catch { p = {}; } return p; })();
+  TP.order = [...new Set([...(TP.order || []).filter((id) => TRACKS[id]), ...Object.keys(TRACKS)])];
+  for (const f of ["hidden", "muted", "locked", "collapsed"]) TP[f] = TP[f] || {};
+  if (TP.snap == null) TP.snap = true;
+  TP.rowH = TP.rowH || {}; TP.dens = [0.8, 1, 1.35].includes(+TP.dens) ? +TP.dens : 1; // per-row height multipliers, density preset; TP.bodyH = panel height
+  const saveTP = () => { lsSet("studioTracks", JSON.stringify(TP)); T.tlSig = null; };
+  T.fx = []; T.sel = new Set(); T.splits = []; T.mark = {}; T.clipb = null; T.autoCuts = [];
+  let ruler, rctx;
+  const rowBase = (id) => ({ video: 46, music: 26 }[id] || 18) * TP.dens * S.ui.timeline;
+  const tlH = (id) => (TP.collapsed[id] ? 8 * S.ui.timeline : rowBase(id) * (TP.rowH[id] || 1));
+  const zk = (el) => el.getBoundingClientRect().width / (el.offsetWidth || 1) || 1; // CSS zoom on <main>, as localXY measures it
+  function applyPanelH() { // the rows' scroll box: the saved height, clamped to ruler + 2 rows … 75% of the window (the preview gives way)
+    const body = $("#st-tl .tl-body"), box = $("#st-tl"); if (!body || !box) return;
+    if (TP.bodyH == null) { body.style.height = ""; body.style.maxHeight = ""; return; }
+    const lay = T.lay || [], min = lay.slice(0, 2).reduce((s, r) => s + r.h + 1, 0) || 40 * S.ui.timeline;
+    const chrome = box.offsetHeight - body.offsetHeight, max = Math.max(min, Math.min(T.layH || Infinity, (innerHeight * 0.75) / zk(box) - chrome)); // never taller than its rows
+    body.style.height = Math.round(Math.min(Math.max(TP.bodyH, min), max)) + "px"; body.style.maxHeight = "none";
+  }
+  function bindResize() { // the panel's top-edge grip and each row's lower edge (in the label column)
+    const grip = $("#st-grip"), heads = $("#st-heads"), body = () => $("#st-tl .tl-body");
+    grip.addEventListener("pointerdown", (ev) => { grip.setPointerCapture(ev.pointerId); T.grip = { y: ev.clientY, h: body().offsetHeight, k: zk(grip) }; grip.classList.add("on"); });
+    grip.addEventListener("pointermove", (ev) => { if (!T.grip) return; TP.bodyH = T.grip.h - (ev.clientY - T.grip.y) / T.grip.k; applyPanelH(); });
+    const gup = () => { if (!T.grip) return; T.grip = null; grip.classList.remove("on"); TP.bodyH = body().offsetHeight; saveTP(); };
+    grip.addEventListener("pointerup", gup); grip.addEventListener("pointercancel", gup);
+    grip.addEventListener("dblclick", () => { TP.bodyH = null; applyPanelH(); saveTP(); });
+    grip.addEventListener("keydown", (ev) => { if (ev.key !== "ArrowUp" && ev.key !== "ArrowDown") return; ev.preventDefault(); ev.stopPropagation();
+      TP.bodyH = body().offsetHeight + (ev.key === "ArrowUp" ? 24 : -24); applyPanelH(); TP.bodyH = body().offsetHeight; saveTP(); });
+    heads.addEventListener("pointerdown", (ev) => {
+      const h = ev.target.closest("[data-rz]"); if (!h) return;
+      ev.preventDefault(); heads.setPointerCapture(ev.pointerId);
+      const id = h.dataset.rz, r = T.lay.find((x) => x.id === id);
+      T.rowRz = { id, y: ev.clientY, m: TP.rowH[id] || 1, per: rowBase(id) * r.lanes, k: zk(heads) };
+    });
+    heads.addEventListener("pointermove", (ev) => { const R = T.rowRz; if (!R) return; TP.rowH[R.id] = Math.round(Math.min(Math.max(R.m + (ev.clientY - R.y) / R.k / R.per, 0.6), 4) * 100) / 100; T.tlSig = null; });
+    const rup = () => { if (T.rowRz) { T.rowRz = null; saveTP(); } };
+    heads.addEventListener("pointerup", rup); heads.addEventListener("pointercancel", rup);
+    heads.addEventListener("dblclick", (ev) => { const h = ev.target.closest("[data-rz]"); if (h) { delete TP.rowH[h.dataset.rz]; saveTP(); } });
+    $("#st-tldens").onchange = (e) => { TP.dens = +e.target.value; saveTP(); };
+  }
+  const RULER_H = () => 20 * S.ui.timeline;
   const tx = (t) => ((t - T.range[0]) / (T.range[1] - T.range[0])) * (tl.clientWidth || 1);
   const tAt = (px) => T.range[0] + (px / (tl.clientWidth || 1)) * (T.range[1] - T.range[0]);
-  function drawTimeline() {
-    tlScale();
-    const dpr = window.devicePixelRatio || 1, W = tl.clientWidth;
-    if (tl.width !== Math.round(W * dpr) || tl.height !== Math.round(TL_H * dpr)) { tl.width = Math.round(W * dpr); tl.height = Math.round(TL_H * dpr); tl.style.height = TL_H + "px"; }
-    const g = tctx, k = c();
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    g.clearRect(0, 0, W, TL_H);
-    const xs = tx(k.start), xe = tx(k.end);
-    g.fillStyle = "#ffffff06"; g.fillRect(0, LANE_Y, W, LANE_H);
-    g.fillStyle = "#ff6a3d1c"; g.fillRect(xs, LANE_Y, xe - xs, LANE_H);
-    if (T.points.length) { // AI path: horizontal framing centre over time (top = left of frame)
-      g.strokeStyle = "#6aa8ff"; g.lineWidth = 1.5; g.beginPath();
-      T.points.forEach((p, i) => { const X = tx(k.start + p[0]), Y = LANE_Y + p[1] * LANE_H; i ? g.lineTo(X, Y) : g.moveTo(X, Y); });
-      g.stroke();
+  const len = () => c().end - c().start;
+  const playRel = () => (T.scrubT ?? video.currentTime) - c().start;
+  const tlLocked = (track) => locked() || !!TP.locked[track];
+  const rows = () => TP.order.filter((id) => id !== "angles" || angs().length);
+
+  function tlItems() { // every item; t/d in clip time (seconds from the clip's start)
+    const k = c(), e = k.edit, L = len(), out = [], st = k.start;
+    for (const s of TLM.segments(st, k.end, e.cuts, T.splits)) out.push({ key: `video:${s.a}`, track: "video", t: s.a - st, d: s.b - s.a, cut: s.cut, label: s.cut ? "cut" : "", seg: s });
+    if (angs().length) out.push({ key: "angles:def", track: "angles", t: 0, d: cuts()[0]?.t ?? L, label: angName(swDefault()), color: angCol(swDefault()), ro: true });
+    cuts().forEach((q, i) => { const nx = cuts()[i + 1]; out.push({ key: `angles:${i}`, track: "angles", t: q.t, d: (nx ? nx.t : L) - q.t, label: angName(q.angle), color: angCol(q.angle), i }); });
+    (e.layout_segments || []).forEach((q, i) => out.push({ key: `layout:${i}`, track: "layout", t: +q.s, d: +q.e - q.s, label: `▦ ${(LAYOUTS.find(([v]) => v === q.layout) || [, q.layout])[1]}`, i }));
+    (e.cuts || []).forEach(([a, b], i) => out.push({ key: `cuts:${i}`, track: "cuts", t: a - st, d: b - a, label: "✂ cut", i }));
+    T.autoCuts.forEach(([a, b], i) => out.push({ key: `cuts:a${i}`, track: "cuts", t: a - st, d: b - a, label: "auto", ro: true }));
+    const [OW, OH] = outSize();
+    chunkWords(T.words, OH > OW).forEach((ch, i) => out.push({ key: `captions:${i}`, track: "captions", t: ch[0].s - st, d: Math.max(ch.at(-1).e - ch[0].s, 0.05), label: ch.map((w) => w.w).join(" "), ro: true, seek: true }));
+    const hs = hlSpec(e), sp = +e.speed || 1, card = e.streamer_card; // headline track: read-only views of the Headline / card sections
+    if (hs) out.push({ key: "titles:hl", track: "titles", t: 0, d: hs.show === "whole" ? L : Math.min(L, +hs.seconds * sp), label: `Headline: ${hs.text || ""}`, ro: true, jump: "#st-hl-ed" });
+    if (card && card.on) out.push({ key: "titles:card", track: "titles", t: 0, d: card.show === "whole" || !card.seconds ? L : Math.min(L, +card.seconds * sp), label: `Streamer card: ${card.name || card.handle || ""}`, ro: true, jump: "#st-hl-ed" });
+    if (e.title_text) out.push({ key: "titles:title", track: "titles", t: 0, d: L, label: `Title: ${e.title_text}`, ro: true });
+    if (e.sticker_text) out.push({ key: "titles:sticker", track: "titles", t: 0, d: L, label: `Sticker: ${e.sticker_text}`, ro: true });
+    for (const o of T.ovs) out.push({ key: `${o.kind === "sound" ? "sfx" : "overlays"}:${o.id}`, track: o.kind === "sound" ? "sfx" : "overlays", t: +o.t, d: +o.d, label: ovLabel(o), o });
+    if (e.music) out.push({ key: "music:0", track: "music", t: 0, d: L, label: `♪ ${String(e.music).replace(/^music\//, "")} · ${Math.round((+e.music_volume || 0) * 100)}%`, ro: true });
+    for (const f of T.fx) out.push({ key: `effects:${f.id}`, track: "effects", t: +f.t, d: +f.d, label: FX_NAME[f.kind] + (f.kind === "blur" ? ` ${f.amount}` : ""), f });
+    (e.markers || []).forEach((m, i) => out.push({ key: `markers:${i}`, track: "markers", t: +m.t, d: 0, label: m.label, i }));
+    for (const [i, m] of (T.sig?.markers || []).entries()) if (m.t >= st && m.t <= k.end) out.push({ key: `markers:s${i}`, track: "markers", t: m.t - st, d: 0, label: m.label || m.kind || "signal", ro: true, sig: true });
+    for (const [i, m] of (T.sig?.viewer_clips || []).entries()) if (m.t + m.d >= st && m.t <= k.end) out.push({ key: `markers:v${i}`, track: "markers", t: m.t - st, d: +m.d, label: "viewer clip", ro: true, sig: true });
+    for (const tr of ["overlays", "sfx", "effects"]) { const its = out.filter((x) => x.track === tr); TLM.packLanes(its).forEach((l, i) => { its[i].lane = Math.min(l, 3); }); }
+    const spp = (T.range[1] - T.range[0]) / (tl?.clientWidth || 1), mks = out.filter((x) => x.track === "markers"); // flags get their label's width so labels never overlap
+    TLM.packLanes(mks.map((m) => ({ t: m.t, d: Math.max(m.d, ((m.sig ? 0 : String(m.label).length * 6) + 14) * S.ui.timeline * spp) }))).forEach((l, i) => { mks[i].lane = Math.min(l, 3); });
+    return out;
+  }
+  function tlLayout() { // rows top to bottom: {id, y, h, lanes}
+    let y = 0;
+    T.items = tlItems();
+    T.lay = rows().map((id) => {
+      const lanes = TP.collapsed[id] ? 1 : Math.max(1, ...T.items.filter((x) => x.track === id).map((x) => (x.lane || 0) + 1)), h = tlH(id) * lanes, r = { id, y, h, lanes };
+      y += h + 1; return r;
+    });
+    T.layH = y;
+    return y;
+  }
+  function fitText(g, s, max) { // the label, cut with "…" to max px; "" when not even two characters fit
+    s = String(s || ""); if (max < 10 || !s) return "";
+    if (g.measureText(s).width <= max) return s;
+    let lo = 0, hi = s.length;
+    while (lo < hi) { const m = (lo + hi + 1) >> 1; if (g.measureText(s.slice(0, m) + "…").width <= max) lo = m; else hi = m - 1; }
+    return lo >= 2 ? s.slice(0, lo) + "…" : "";
+  }
+  const itemBox = (it, r) => { const lh = r.h / r.lanes, X0 = tx(c().start + it.t); return [X0, r.y + (it.lane || 0) * lh + 1, Math.max(it.d ? tx(c().start + it.t + it.d) - X0 : 0, 2), lh - 2]; };
+
+  function drawTimeline() { // only when something it shows changed (or the playhead moved): see frame()
+    const k = c(), H = tlLayout(), W = tl.clientWidth, dpr = window.devicePixelRatio || 1, g = tctx;
+    if (tl.width !== Math.round(W * dpr) || tl.height !== Math.round(H * dpr)) { tl.width = Math.round(W * dpr); tl.height = Math.round(H * dpr); tl.style.height = H + "px"; }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const xs = tx(k.start), xe = tx(k.end), fs = 10 * S.ui.timeline;
+    g.font = `600 ${fs}px Inter, sans-serif`; g.textBaseline = "middle";
+    for (const r of T.lay) {
+      g.fillStyle = T.lay.indexOf(r) % 2 ? "#ffffff05" : "#ffffff0a"; g.fillRect(0, r.y, W, r.h);
+      g.fillStyle = "#00000059"; g.fillRect(0, r.y, Math.max(0, xs), r.h); g.fillRect(xe, r.y, Math.max(0, W - xe), r.h); // outside the clip
+      if (TP.collapsed[r.id]) continue;
+      if (r.id === "video") drawVideoRow(g, r, xs, xe);
+      if (r.id === "music") drawMusic(g, r);
+      for (const it of T.items) {
+        if (it.track !== r.id || it.track === "video") continue;
+        const [X, Y, w, h] = itemBox(it, r);
+        if (X > W + 4 || X + w < -4) continue; // outside the view
+        const sel = T.sel.has(it.key), col = it.color || TCOL[it.track], hov = T.hover === it.key && !sel;
+        if (it.track === "markers" && !it.d) { // a flag
+          g.fillStyle = it.sig ? "#ff8a3d99" : sel ? "#ffc247" : col; g.fillRect(X - 1, Y, 2, h);
+          g.beginPath(); g.moveTo(X, Y); g.lineTo(X + 8, Y + 4); g.lineTo(X, Y + 8); g.fill();
+          if (!it.sig && h > 10) { g.fillStyle = "#eceef6"; g.fillText(it.label, X + 10, Y + h / 2 + 1); }
+          continue;
+        }
+        g.globalAlpha = TP.hidden[r.id] ? 0.35 : it.ro ? 0.55 : 1;
+        g.fillStyle = sel ? "#ffc247" : col + (it.track === "captions" ? "40" : "b0");
+        g.beginPath(); g.roundRect(X, Y, w, h, 3); g.fill();
+        if (hov) { g.strokeStyle = "#ffffffcc"; g.lineWidth = 1.5; g.beginPath(); g.roundRect(X + 0.75, Y + 0.75, w - 1.5, h - 1.5, 3); g.stroke(); g.lineWidth = 1; }
+        if (it.ro && it.track === "cuts") { g.strokeStyle = "#ff5a6a"; g.setLineDash([3, 3]); g.strokeRect(X + 0.5, Y + 0.5, w - 1, h - 1); g.setLineDash([]); }
+        g.globalAlpha = TP.hidden[r.id] ? 0.5 : 1; // labels stay readable on read-only / hidden rows
+        if (w > 18 && h > 9) { const s2 = fitText(g, it.label, w - 8); if (s2) { g.fillStyle = sel ? "#1b0b04" : "#f4f5fa"; g.fillText(s2, X + 4, Y + h / 2 + 1); } }
+        if (it.f?.keys) for (const kf of it.f.keys) { const KX = tx(k.start + it.t + kf[0]); g.fillStyle = "#fff"; g.beginPath(); g.moveTo(KX, Y + h - 6); g.lineTo(KX + 3, Y + h - 3); g.lineTo(KX, Y + h); g.lineTo(KX - 3, Y + h - 3); g.fill(); }
+        if (!it.ro && !tlLocked(it.track) && w > 10) { g.fillStyle = "#0006"; g.fillRect(X + w - 3, Y + 3, 2, h - 6); }
+        g.globalAlpha = 1;
+      }
+      if (r.id === "angles" && T.sugg) { g.fillStyle = "#ffc247"; for (const q of T.sugg.switches) g.fillRect(tx(k.start + q.t) - 1.5, r.y, 3, 5); } // suggested cuts
+      if (tlLocked(r.id)) { g.fillStyle = "#0b0c1066"; g.fillRect(0, r.y, W, r.h); }
+    }
+    if (T.mark.in != null || T.mark.out != null) { // in/out range over every row
+      const a = tx(T.mark.in ?? k.start), b = tx(T.mark.out ?? k.end);
+      g.fillStyle = "#6aa8ff1f"; g.fillRect(Math.min(a, b), 0, Math.abs(b - a), H);
+      g.fillStyle = "#6aa8ff"; if (T.mark.in != null) g.fillRect(a - 1, 0, 2, H); if (T.mark.out != null) g.fillRect(b - 1, 0, 2, H);
+    }
+    for (const p of T.splits) { if (p > k.start && p < k.end) { g.fillStyle = "#fff9"; g.fillRect(tx(p) - 0.5, 0, 1, H); } }
+    if (T.snapX != null) { g.fillStyle = "#ffc247"; g.fillRect(T.snapX - 0.5, 0, 1, H); }
+    if (T.marq) { const m = T.marq; g.strokeStyle = "#ffc247"; g.setLineDash([4, 3]); g.strokeRect(Math.min(m.x0, m.x1), Math.min(m.y0, m.y1), Math.abs(m.x1 - m.x0), Math.abs(m.y1 - m.y0)); g.setLineDash([]); }
+    const PX = tx(T.scrubT ?? video.currentTime); g.fillStyle = "#fff"; g.fillRect(PX - 1, 0, 2, H);
+    drawRuler(); renderHeads(); applyPanelH();
+  }
+  function drawVideoRow(g, r, xs, xe) { // thumbnails (the project's sprite), audio waveform, cut gaps, trim handles, framing keyframes
+    const k = c(), n = T.proj.sprite_count, d = dur(), th = r.h - 14 * S.ui.timeline, tw = th * 16 / 9, W = tl.clientWidth;
+    g.fillStyle = "#ff6a3d1c"; g.fillRect(xs, r.y, xe - xs, r.h);
+    if (T.sprite?.complete && T.sprite.naturalWidth && n && d) {
+      g.save(); g.beginPath(); g.rect(Math.max(xs, 0), r.y, Math.min(xe, W) - Math.max(xs, 0), r.h); g.clip(); g.globalAlpha = TP.hidden.video ? 0.3 : 0.8;
+      for (let X = Math.max(xs, 0) - (Math.max(xs, 0) - xs) % tw; X < Math.min(xe, W); X += tw) { // one tile per thumbnail width, tiles stay put while scrolling
+        const i = Math.max(0, Math.min(n - 1, Math.floor((tAt(X + tw / 2) / d) * n)));
+        g.drawImage(T.sprite, i * 160, 0, 160, 90, X, r.y + 1, tw - 1, th);
+      }
+      g.restore();
+    }
+    const wf = T.sig?.waveform || [], per = tx(k.start + 0.1) - tx(k.start), base = r.y + r.h - 1;
+    if (wf.length && per > 0) { // signals.waveform: one peak per 0.1 s of the source
+      g.fillStyle = TP.muted.video ? "#5d617866" : "#6aa8ffaa";
+      const i0 = Math.max(0, Math.floor(tAt(0) * 10)), i1 = Math.min(wf.length, Math.ceil(tAt(W) * 10)), step = Math.max(1, Math.floor(1 / Math.max(per, 1e-3)));
+      for (let i = i0; i < i1; i += step) { const h = Math.max(1, (wf[i] || 0) * 12 * S.ui.timeline); g.fillRect(tx(i / 10), base - h, Math.max(1, per * step - 0.5), h); }
+    }
+    for (const it of T.items) {
+      if (it.track !== "video") continue;
+      const X = tx(k.start + it.t), w = tx(k.start + it.t + it.d) - X, sel = T.sel.has(it.key);
+      if (it.cut) { g.fillStyle = "#0b0c10d0"; g.fillRect(X, r.y, w, r.h); g.strokeStyle = "#ff5a6a"; g.beginPath(); for (let q = X; q < X + w; q += 6) { g.moveTo(q, r.y + r.h); g.lineTo(Math.min(q + 6, X + w), r.y); } g.stroke(); }
+      if (sel) { g.strokeStyle = "#ffc247"; g.lineWidth = 2; g.strokeRect(X + 1, r.y + 1, w - 2, r.h - 2); g.lineWidth = 1; }
     }
     g.fillStyle = "#ff6a3d";
-    for (const X of [xs, xe]) { g.fillRect(X - 1.5, 2, 3, TL_H - 4); g.beginPath(); g.roundRect(X - 5, LANE_Y + LANE_H / 2 - 9, 10, 18, 3); g.fill(); }
-    for (const q of T.manual) {
-      const X = tx(k.start + q[0]);
-      g.fillStyle = "#37d39a"; g.beginPath(); g.moveTo(X, KF_Y - 6); g.lineTo(X + 6, KF_Y); g.lineTo(X, KF_Y + 6); g.lineTo(X - 6, KF_Y); g.fill();
-      g.fillRect(X - 0.5, LANE_Y + q[1] * LANE_H - 2, 1, 4);
+    for (const X of [xs, xe]) { g.fillRect(X - 1.5, r.y, 3, r.h); g.beginPath(); g.roundRect(X - 5, r.y + r.h / 2 - 9, 10, 18, 3); g.fill(); }
+    for (const q of T.manual) { const X = tx(k.start + q[0]); g.fillStyle = "#37d39a"; g.beginPath(); g.moveTo(X, r.y + 1); g.lineTo(X + 5, r.y + 6); g.lineTo(X, r.y + 11); g.lineTo(X - 5, r.y + 6); g.fill(); }
+    if (T.points.length) { g.strokeStyle = "#6aa8ff99"; g.lineWidth = 1; g.beginPath(); T.points.forEach((p, i) => { const X = tx(k.start + p[0]), Y = r.y + 2 + p[1] * (th - 4); i ? g.lineTo(X, Y) : g.moveTo(X, Y); }); g.stroke(); }
+  }
+  function drawMusic(g, r) {
+    const k = c(), e = k.edit, pk = T.wave?.file === e.music ? T.wave : null;
+    if (!e.music) return;
+    if (!pk && T.waveFor !== e.music) loadWave(e.music);
+    if (!pk?.peaks) return;
+    const mid = r.y + r.h / 2, W = tl.clientWidth, sp = +e.speed || 1;
+    g.fillStyle = TP.muted.music ? "#5d617888" : "#6aa8ffcc";
+    for (let X = Math.max(0, tx(k.start)); X < Math.min(W, tx(k.end)); X += 2) { // the bed starts with the output and loops
+      const o = outAt(tAt(X) - k.start) / sp, i = Math.floor(((o % pk.dur) / pk.dur) * pk.peaks.length), h = Math.max(1, pk.peaks[i] * (r.h - 6));
+      g.fillRect(X, mid - h / 2, 1.5, h);
     }
-    g.fillStyle = "#ffffff06"; g.fillRect(0, FX_Y, W, FX_H);
-    g.font = `600 ${10 * S.ui.timeline}px Inter, sans-serif`;
-    for (const o of T.ovs) {
-      const X0 = tx(k.start + o.t), Wd = Math.max(4, tx(k.start + o.t + o.d) - X0), sel = o.id === T.osel;
-      g.fillStyle = sel ? "#ffc247" : "#b07cffa0"; g.beginPath(); g.roundRect(X0, FX_Y, Wd, FX_H, 4); g.fill();
-      g.save(); g.beginPath(); g.rect(X0, FX_Y, Wd - 6, FX_H); g.clip();
-      g.fillStyle = sel ? "#1b0b04" : "#eceef6"; g.fillText(ovLabel(o), X0 + 4, FX_Y + 12.5); g.restore();
-      g.fillStyle = "#0006"; g.fillRect(X0 + Wd - 3, FX_Y + 4, 2, FX_H - 8); // resize grip
+  }
+  async function loadWave(file) { // decode the music once for its waveform (and keep an <audio> for the preview)
+    T.waveFor = file;
+    try {
+      const buf = await (await fetch(`/files/${pid()}/${file}`)).arrayBuffer(), ac = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 2, 44100);
+      const au = await ac.decodeAudioData(buf), ch = au.getChannelData(0), n = 2000, per = Math.max(1, Math.floor(ch.length / n)), peaks = [];
+      for (let i = 0; i < n; i++) { let m = 0; for (let j = i * per; j < (i + 1) * per && j < ch.length; j += 16) m = Math.max(m, Math.abs(ch[j])); peaks.push(m); }
+      T.wave = { file, dur: au.duration, peaks }; T.tlSig = null;
+    } catch { T.wave = { file, peaks: null }; }
+  }
+  // clip time → output time (through this clip's cuts), before speed: where the music bed is
+  function outAt(rel) { const t = c().start + rel; let acc = 0; for (const [a, b] of c().edit.cuts || []) { if (b <= t) acc += b - a; else if (a < t) acc += t - a; } return rel - acc; }
+  function drawRuler() {
+    const W = ruler.clientWidth, Hh = RULER_H(), dpr = window.devicePixelRatio || 1, g = rctx, k = c();
+    if (ruler.width !== Math.round(W * dpr) || ruler.height !== Math.round(Hh * dpr)) { ruler.width = Math.round(W * dpr); ruler.height = Math.round(Hh * dpr); }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, Hh);
+    const tk = TLM.ticks(T.range[0], T.range[1], W, fps()), a = T.range[0] - k.start, b = T.range[1] - k.start;
+    g.font = `${9.5 * S.ui.timeline}px JetBrains Mono, monospace`; g.textBaseline = "top";
+    if (tk.frames) { g.fillStyle = "#33364a"; const f = 1 / TLM.fpsExact(fps()); for (let t = Math.ceil(a / f) * f; t <= b; t += f) g.fillRect(tx(k.start + t), Hh - 4, 1, 4); }
+    g.fillStyle = "#5d6178"; for (let t = Math.ceil(a / tk.minor) * tk.minor; t <= b; t += tk.minor) g.fillRect(tx(k.start + t), Hh - 7, 1, 7);
+    g.fillStyle = "#8b90a8";
+    for (let t = Math.ceil(a / tk.major - 1e-9) * tk.major; t <= b; t += tk.major) {
+      const X = tx(k.start + t); g.fillRect(X, Hh - 12, 1, 12);
+      g.fillText(tk.major < 1 ? `${t < 0 ? "-" : ""}${fmt(Math.abs(t), 0)}:${String(TLM.toFrame(Math.abs(t), fps()) % Math.round(TLM.fpsExact(fps()))).padStart(2, "0")}f` : (t < 0 ? "-" : "") + fmt(Math.abs(t), 0), X + 3, 2);
     }
-    if (T.target) { const X = tx(k.start + T.target.t); g.strokeStyle = "#ffc247"; g.lineWidth = 2; g.strokeRect(X - 5, KF_Y - 5, 10, 10); }
-    if (angs().length) drawSwitchLane(g, W);
-    const X = tx(T.scrubT ?? video.currentTime);
-    g.fillStyle = "#fff"; g.fillRect(X - 1, 0, 2, TL_H);
+    for (const [key, col] of [["in", "#6aa8ff"], ["out", "#6aa8ff"]]) if (T.mark[key] != null) { const X = tx(T.mark[key]); g.fillStyle = col; g.fillText(key === "in" ? "[" : "]", X - 3, 2); }
+    const PX = tx(T.scrubT ?? video.currentTime); g.fillStyle = "#fff"; g.beginPath(); g.moveTo(PX - 5, 0); g.lineTo(PX + 5, 0); g.lineTo(PX, 7); g.fill(); g.fillRect(PX - 0.5, 0, 1, Hh);
+  }
+  function renderHeads() { // the DOM row headers beside the canvas: label + hide / mute / lock / menu
+    const el = $("#st-heads"); if (!el) return;
+    const key = JSON.stringify([T.lay.map((r) => [r.id, r.h]), TP, locked()]);
+    if (el._k === key) return;
+    el._k = key;
+    const tog = (id, f, on, icon, l) => `<button class="tl-tg${on ? " on" : ""}" data-tlt="${f}" data-id="${id}" aria-pressed="${on}" title="${l}" aria-label="${l} ${TRACKS[id][0]}">${icon}</button>`;
+    el.innerHTML = T.lay.map((r) => { const [label, flags] = TRACKS[r.id];
+      return `<div class="tl-head" style="height:${r.h}px;margin-bottom:1px" data-row="${r.id}"><button class="tl-name" data-tlt="collapsed" data-id="${r.id}" aria-expanded="${!TP.collapsed[r.id]}" title="${label}: click to collapse / expand"><i style="background:${TCOL[r.id]}"></i>${TP.collapsed[r.id] ? "▸" : "▾"} ${label}</button>
+        ${TP.collapsed[r.id] ? "" : (flags.includes("h") ? tog(r.id, "hidden", !!TP.hidden[r.id], TP.hidden[r.id] ? "◌" : "◉", "Hide in the preview (the render keeps it)") : "")
+          + (flags.includes("m") ? tog(r.id, "muted", !!TP.muted[r.id], TP.muted[r.id] ? "🔇" : "🔊", "Mute in the preview (the render keeps it)") : "")
+          + (flags.includes("l") ? tog(r.id, "locked", !!TP.locked[r.id], TP.locked[r.id] ? "🔒" : "🔓", "Lock against edits") : "")
+          + `<button class="tl-tg" data-tlmenu="${r.id}" title="Track menu" aria-label="${label} track menu">⋯</button>`}${TP.collapsed[r.id] ? "" : `<i class="tl-rz" data-rz="${r.id}" title="Drag to resize this row · double-click resets"></i>`}</div>`; }).join("");
+  }
+
+  // snapping: frames always; plus (when on) the playhead, in/out, clip ends, word edges, markers and other items' edges
+  function snapPts(skip) {
+    const k = c(), pts = [0, len(), playRel()];
+    if (T.mark.in != null) pts.push(T.mark.in - k.start); if (T.mark.out != null) pts.push(T.mark.out - k.start);
+    for (const w of T.words) pts.push(w.s - k.start, w.e - k.start);
+    for (const it of T.items || []) if (!skip.has(it.key)) pts.push(it.t, it.t + it.d);
+    return pts;
+  }
+  const snapRel = (t, skip = new Set(), ev) => { const tol = 8 / Math.max(tx(c().start + 1) - tx(c().start), 1e-6); const v = TLM.snap(t, { fps: fps(), points: snapPts(skip), tol, on: TP.snap && !ev?.altKey });
+    T.snapX = TP.snap && !ev?.altKey && Math.abs(v - TLM.snapFrame(t, fps())) > 1e-9 ? tx(c().start + v) : null; return v; };
+  const r3 = (v) => Math.round(v * 1000) / 1000;
+
+  function rowAt(y) { return T.lay.find((r) => y >= r.y && y < r.y + r.h + 1); }
+  function hitItem(x, y) {
+    const r = rowAt(y); if (!r || TP.collapsed[r.id]) return { r };
+    if (r.id === "video") {
+      const k = c();
+      if (Math.abs(x - tx(k.start)) < 7) return { r, trim: "start" };
+      if (Math.abs(x - tx(k.end)) < 7) return { r, trim: "end" };
+    }
+    const hits = (T.items || []).filter((it) => it.track === r.id).map((it) => ({ it, b: itemBox(it, r) }))
+      .filter(({ b }) => x >= b[0] - 4 && x <= b[0] + b[2] + 4 && y >= b[1] - 1 && y <= b[1] + b[3] + 1).reverse();
+    const h = hits[0]; if (!h) return { r };
+    const [X, , w] = h.b, trim = !h.it.ro && !tlLocked(r.id) && h.it.d && !["video", "angles"].includes(h.it.track); // a switch moves as a whole
+    return { r, it: h.it, edge: trim && Math.abs(x - (X + w)) < 6 ? "r" : trim && Math.abs(x - X) < 6 ? "l" : null };
   }
   function bindTimeline() {
+    ruler.addEventListener("pointerdown", (ev) => { ruler.setPointerCapture(ev.pointerId); video.pause(); T.rscrub = true; scrubTo(localXY(ev, ruler)[0]); });
+    ruler.addEventListener("pointermove", (ev) => { if (T.rscrub) scrubTo(localXY(ev, ruler)[0]); });
+    const rup = () => { if (T.rscrub) { T.rscrub = false; if (T.scrubT != null) seek(T.scrubT); T.scrubT = null; } };
+    ruler.addEventListener("pointerup", rup); ruler.addEventListener("pointercancel", rup);
     tl.addEventListener("pointerdown", (ev) => {
-      const x = localXY(ev, tl)[0], k = c();
-      if (angs().length && localXY(ev, tl)[1] >= SW_Y - 2) { // switch lane: drag a cut point, or click to seek
-        const i = cuts().findIndex((q) => Math.abs(tx(k.start + q.t) - x) < 7);
-        if (i >= 0) { T.swdrag = { i }; tl.setPointerCapture(ev.pointerId); } else seek(tAt(x));
-        return;
-      }
-      if (localXY(ev, tl)[1] >= FX_Y - 2) { // effects lane: select, move (body) or resize (right edge)
-        const hit = [...T.ovs].reverse().find((o) => x >= tx(k.start + o.t) - 2 && x <= tx(k.start + o.t + o.d) + 3);
-        if (hit) {
-          T.osel = hit.id; renderOvInspector();
-          T.odrag = { o: hit, mode: Math.abs(x - tx(k.start + hit.t + hit.d)) < 7 ? "d" : "t", x0: x, t0: hit.t, d0: hit.d };
-          tl.setPointerCapture(ev.pointerId);
-          return;
-        }
-      }
-      if (Math.abs(x - tx(k.start)) < 8) T.tdrag = "start";
-      else if (Math.abs(x - tx(k.end)) < 8) T.tdrag = "end";
-      else {
-        const kf = localXY(ev, tl)[1] > KF_Y - 10 && T.manual.find((q) => Math.abs(tx(k.start + q[0]) - x) < 7);
-        if (kf) { video.pause(); seek(k.start + kf[0]); return; }
-        if (T.target && localXY(ev, tl)[1] > KF_Y - 10 && Math.abs(tx(k.start + T.target.t) - x) < 7) { video.pause(); seek(k.start + T.target.t); return; }
-        T.tdrag = "seek"; T.fine = { cur: Math.min(Math.max(tAt(x), k.start), k.end), lx: x }; seek(T.fine.cur);
-      }
-      tl.setPointerCapture(ev.pointerId);
+      if (ev.button === 2) return;
+      const [x, y] = localXY(ev, tl), h = hitItem(x, y), k = c();
+      tl.focus({ preventScroll: true });
+      if (h.trim && !tlLocked("video")) { T.tdrag = h.trim; tl.setPointerCapture(ev.pointerId); video.pause(); return; }
+      if (!h.it) { T.press = { x, y, seekT: tAt(x), add: ev.shiftKey || ev.ctrlKey || ev.metaKey }; tl.setPointerCapture(ev.pointerId); return; }
+      const it = h.it;
+      if (ev.shiftKey || ev.ctrlKey || ev.metaKey) { T.sel.has(it.key) ? T.sel.delete(it.key) : T.sel.add(it.key); }
+      else if (!T.sel.has(it.key)) T.sel = new Set([it.key]);
+      onSelect(it);
+      if (it.seek || it.ro || it.track === "video" || it.track === "titles") { video.pause(); if (it.track !== "video" || it.cut) seek(k.start + it.t + (it.ro ? 0 : 0.0001)); else seek(tAt(x)); if (it.jump) $(it.jump)?.scrollIntoView({ block: "center", behavior: "smooth" }); T.tlSig = null; return; }
+      if (tlLocked(it.track)) { T.tlSig = null; return toast(locked() ? "Posted — make a new version to edit it." : `${TRACKS[it.track][0]} is locked (🔒 on its row).`); }
+      const sel = (T.items || []).filter((x2) => T.sel.has(x2.key) && !x2.ro && x2.track === it.track); // drags move one track's selection together
+      T.idrag = { it, edge: h.edge, x0: x, moved: false, orig: sel.map((s) => ({ key: s.key, t: s.t, d: s.d })) };
+      tl.setPointerCapture(ev.pointerId); video.pause();
     });
     tl.addEventListener("pointermove", (ev) => {
-      const x = localXY(ev, tl)[0], k = c();
-      if (T.swdrag) { // a cut moves between its neighbours
-        const sw = cuts(), i = T.swdrag.i, lo = i ? sw[i - 1].t + 0.1 : 0, hi = i + 1 < sw.length ? sw[i + 1].t - 0.1 : k.end - k.start;
-        sw[i] = { ...sw[i], t: +Math.min(Math.max(tAt(x) - k.start, lo), hi).toFixed(2) };
-        return;
-      }
-      if (T.odrag) {
-        const D = T.odrag, len = k.end - k.start, dt = ((x - D.x0) / (tl.clientWidth || 1)) * (T.range[1] - T.range[0]);
-        if (D.mode === "t") D.o.t = +Math.min(Math.max(D.t0 + dt, 0), Math.max(0, len - 0.2)).toFixed(2);
-        else D.o.d = +Math.min(Math.max(D.d0 + dt, 0.2), len - D.o.t).toFixed(2);
-        return;
-      }
-      if (!T.tdrag) { tl.style.cursor = Math.abs(x - tx(k.start)) < 8 || Math.abs(x - tx(k.end)) < 8 ? "ew-resize" : "pointer"; return; }
-      const t = Math.min(Math.max(tAt(x), 0), dur() || T.range[1]);
-      if (T.tdrag === "seek") { // Shift = fine scrub (10x slower); seeks coalesced to one per frame
-        const F = T.fine;
-        F.cur = Math.min(Math.max(ev.shiftKey ? F.cur + (((x - F.lx) / (tl.clientWidth || 1)) * (T.range[1] - T.range[0])) / 10 : t, k.start), k.end);
-        F.lx = x; T.scrubT = F.cur;
-        return scrubS(F.cur, true);
-      }
-      if (T.tdrag === "start") k.start = +Math.min(t, k.end - 0.5).toFixed(2); else k.end = +Math.max(t, k.start + 0.5).toFixed(2);
-      video.currentTime = T.tdrag === "start" ? k.start : k.end;
-      spanLabel();
+      const [x, y] = localXY(ev, tl), k = c();
+      if (T.tdrag) { const t = TLM.snapFrame(Math.min(Math.max(snapRel(tAt(x) - k.start) + k.start, 0), dur() || T.range[1]), fps()); // trim the clip
+        if (T.tdrag === "start") k.start = r3(Math.min(t, k.end - 0.5)); else k.end = r3(Math.max(t, k.start + 0.5));
+        video.currentTime = T.tdrag === "start" ? k.start : k.end; spanLabel(); T.tlSig = null; return; }
+      if (T.press) { if (Math.hypot(x - T.press.x, y - T.press.y) > 4) { T.marq = { x0: T.press.x, y0: T.press.y, x1: x, y1: y }; T.tlSig = null; } return; }
+      if (T.idrag) return dragItems(ev, x);
+      const h = hitItem(x, y);
+      T.hover = h.it?.key || null;
+      tl.style.cursor = h.trim || h.edge ? "ew-resize" : h.it && !h.it.ro && !tlLocked(h.it.track) && h.it.track !== "video" ? "grab" : "default";
     });
-    const up = async () => {
-      if (T.swdrag) { T.swdrag = null; return saveCuts(); }
-      if (T.odrag) { T.odrag = null; renderOvInspector(); return saveOverlays(); }
-      const d = T.tdrag; T.tdrag = null;
-      if (d === "seek" && T.fine) { seek(T.fine.cur); T.scrubT = null; T.fine = null; }
-      if (d !== "start" && d !== "end") return;
-      try { await patch({ start: c().start, end: c().end }); } catch (e) { fail(e); }
-      setRange(); spanLabel();
-      if (!T.custom) { loadWords(); renderWords(); } // transcript-based captions follow the new in/out
+    const up = async (ev) => {
+      T.snapX = null; T.tlSig = null;
+      if (T.tdrag) { T.tdrag = null; try { await patch({ start: c().start, end: c().end }); } catch (e) { fail(e); } pruneSecs(); setRange(); spanLabel(); if (!T.custom) { loadWords(); renderWords(); } loadKeeps(); return; }
+      if (T.press) {
+        const p = T.press; T.press = null;
+        if (T.marq) { // marquee: every editable item it touches, on the rows it spans
+          const m = T.marq; T.marq = null;
+          const [ya, yb] = [Math.min(m.y0, m.y1), Math.max(m.y0, m.y1)], ids = new Set(TLM.inRange(T.items.map((it) => ({ ...it, id: it.key })), tAt(Math.min(m.x0, m.x1)) - c().start, tAt(Math.max(m.x0, m.x1)) - c().start));
+          const hitRows = new Set(T.lay.filter((r) => r.y + r.h >= ya && r.y <= yb).map((r) => r.id));
+          if (!p.add) T.sel = new Set();
+          for (const it of T.items) if (ids.has(it.key) && hitRows.has(it.track) && !it.ro) T.sel.add(it.key);
+          return onSelect();
+        }
+        if (!p.add) T.sel = new Set();
+        video.pause(); seek(p.seekT); onSelect(); return;
+      }
+      if (T.idrag) { const D = T.idrag; T.idrag = null; if (D.moved) await commitTrack(D.it.track); }
     };
-    tl.addEventListener("pointerup", up);
-    tl.addEventListener("mousemove", (ev) => tlTip($("#st-tip"), localXY(ev, tl.parentElement)[0], tAt(localXY(ev, tl)[0]), pid(), T.proj));
-    tl.addEventListener("mouseleave", () => { $("#st-tip").hidden = true; });
-    tl.addEventListener("wheel", (ev) => {
-      const [a, b] = T.range, span = b - a;
-      if (ev.ctrlKey) { ev.preventDefault(); const tc = tAt(localXY(ev, tl)[0]), ns = span * (ev.deltaY < 0 ? 0.8 : 1.25); setView(tc - ((tc - a) / span) * ns, ns); }
-      else if (span < T.full[1] - T.full[0] - 1e-6) { ev.preventDefault(); setView(a + ((ev.deltaX || ev.deltaY) / (tl.clientWidth || 1)) * span, span); } // pan when zoomed
-    }, { passive: false });
-    tl.addEventListener("pointercancel", up);
+    tl.addEventListener("pointerup", up); tl.addEventListener("pointercancel", up);
+    tl.addEventListener("dblclick", (ev) => { const [x, y] = localXY(ev, tl), h = hitItem(x, y); if (h.it?.o) { T.osel = h.it.o.id; renderOvInspector(); $("#st-ovi")?.scrollIntoView({ block: "center", behavior: "smooth" }); } });
+    tl.addEventListener("mousemove", (ev) => tlTip($("#st-tip"), localXY(ev, $("#st-tl"))[0], tAt(localXY(ev, tl)[0]), pid(), T.proj));
+    tl.addEventListener("mouseleave", () => { $("#st-tip").hidden = true; T.hover = null; });
+    const wheel = (ev) => {
+      const [a, b] = T.range, span = b - a, el = ev.currentTarget;
+      if (ev.ctrlKey || ev.metaKey) { ev.preventDefault(); const tc = tAt(localXY(ev, el)[0]), ns = span * (ev.deltaY < 0 ? 0.8 : 1.25); setView(tc - ((tc - a) / span) * ns, ns); }
+      else if (ev.shiftKey || Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) { ev.preventDefault(); setView(a + ((ev.deltaX || ev.deltaY) / (tl.clientWidth || 1)) * span, span); } // plain wheel scrolls the rows
+    };
+    tl.addEventListener("wheel", wheel, { passive: false }); ruler.addEventListener("wheel", wheel, { passive: false });
+    tl.addEventListener("contextmenu", (ev) => { ev.preventDefault(); const [x, y] = localXY(ev, tl), h = hitItem(x, y); if (h.it && !T.sel.has(h.it.key)) { T.sel = new Set([h.it.key]); onSelect(h.it); } if (h.r) tlMenu(h.r.id, ev.clientX, ev.clientY, tAt(x)); });
+    tl.addEventListener("dragover", (e) => { if (e.dataTransfer.types.includes("text/x-asset")) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } });
+    tl.addEventListener("drop", (e) => { // a library asset dropped on the timeline: placed at that frame (sounds on SFX, the rest on Overlays)
+      const a = T.assets?.find((x) => x.id === e.dataTransfer.getData("text/x-asset"));
+      if (!a) return;
+      e.preventDefault();
+      if (tlLocked(a.kind === "sound" ? "sfx" : "overlays")) return toast("That track is locked.");
+      addOverlay(assetOv(a, {}), TLM.snapFrame(Math.max(0, tAt(localXY(e, tl)[0]) - c().start), fps()));
+    });
+    $("#st-heads").addEventListener("click", (e) => {
+      const m = e.target.closest("[data-tlmenu]"); if (m) { const r = m.getBoundingClientRect(); return tlMenu(m.dataset.tlmenu, r.left, r.bottom, video.currentTime); }
+      const b = e.target.closest("[data-tlt]"); if (!b) return;
+      TP[b.dataset.tlt][b.dataset.id] = !TP[b.dataset.tlt][b.dataset.id]; saveTP(); applyTrackPrefs();
+    });
+    $("#st-heads").addEventListener("contextmenu", (e) => { const h = e.target.closest("[data-row]"); if (h) { e.preventDefault(); tlMenu(h.dataset.row, e.clientX, e.clientY, video.currentTime); } });
+    $("#st-tlz").addEventListener("input", (e) => { const f = T.full, mn = 20 / TLM.fpsExact(fps()), mx = f[1] - f[0], ns = mn * Math.pow(mx / mn, 1 - +e.target.value / 1000), pc = video.currentTime; setView(pc - ns / 2, ns); });
+    $("#st-hs").addEventListener("input", (e) => { const f = T.full, span = T.range[1] - T.range[0]; setView(f[0] + (+e.target.value / 1000) * (f[1] - f[0] - span), span); });
+  }
+  function scrubTo(x) { T.scrubT = Math.min(Math.max(tAt(x), c().start), c().end); scrubS(T.scrubT, true); }
+  function dragItems(ev, x) {
+    const D = T.idrag, k = c(), L = len(), dt = tAt(x) - tAt(D.x0), skip = new Set(D.orig.map((o) => o.key)), f1 = 1 / TLM.fpsExact(fps());
+    if (!D.moved && Math.abs(x - D.x0) < 3) return;
+    D.moved = true;
+    const o0 = D.orig.find((o) => o.key === D.it.key) || D.orig[0];
+    if (D.edge === "r") { const end = snapRel(o0.t + o0.d + dt, skip, ev); setItem(D.it, o0.t, Math.max(f1, Math.min(end, L) - o0.t)); }
+    else if (D.edge === "l") { const t = Math.min(Math.max(snapRel(o0.t + dt, skip, ev), 0), o0.t + o0.d - f1); setItem(D.it, t, o0.t + o0.d - t); }
+    else { // body: the grabbed item snaps, the rest of the selection keeps its spacing
+      const t = snapRel(o0.t + dt, skip, ev), delta = t - o0.t;
+      const ord = [...D.orig].sort((p, q) => (delta > 0 ? q.t - p.t : p.t - q.t)); // leading item first: neighbours (layout sections) clamp against moved ones
+      for (const o of ord) { const it = T.items.find((x2) => x2.key === o.key); if (it) setItem(it, Math.min(Math.max(o.t + delta, 0), Math.max(0, L - (it.track === "markers" ? 0 : o.d))), o.d); }
+    }
+    T.tlSig = null;
+  }
+  function setItem(it, t, d) { // write a dragged/nudged/typed position back into the clip's own data (saved by commitTrack)
+    t = r3(t); d = r3(d);
+    const k = c(), e = k.edit;
+    if (it.o) { it.o.t = t; it.o.d = d; }
+    else if (it.f) { const old = it.f.d; it.f.t = t; it.f.d = d; if (it.f.keys && Math.abs(old - d) > 1e-6) it.f.keys = it.f.keys.map((q) => [Math.min(q[0], d), ...q.slice(1)]); }
+    else if (it.track === "markers") e.markers = e.markers.map((m, i) => (i === it.i ? { ...m, t } : m));
+    else if (it.track === "layout") { // a layout section stays between its neighbours
+      const sg = e.layout_segments, lo = it.i ? sg[it.i - 1].e : 0, hi = it.i + 1 < sg.length ? sg[it.i + 1].s : len();
+      t = r3(Math.min(Math.max(t, lo), hi - 0.04)); d = r3(Math.min(Math.max(d, 0.04), hi - t));
+      sg[it.i] = { ...sg[it.i], s: t, e: r3(t + d) };
+    }
+    else if (it.track === "cuts") e.cuts = e.cuts.map((q, i) => (i === it.i ? [r3(k.start + t), r3(k.start + t + d)] : q));
+    else if (it.track === "angles") { const sw = cuts(), i = it.i, lo = i ? sw[i - 1].t + 0.05 : 0, hi = i + 1 < sw.length ? sw[i + 1].t - 0.05 : len(); sw[i] = { ...sw[i], t: r3(Math.min(Math.max(t, lo), hi)) }; }
+    it.t = t; it.d = d;
+  }
+  async function commitTrack(track) {
+    if (track === "overlays" || track === "sfx") { buildFx(); renderOvInspector(); saveOverlays(); }
+    else if (track === "effects") saveFx();
+    else if (track === "markers") await saveMarkers();
+    else if (track === "layout") { saveSecs(); T.regs = null; renderLayout(); }
+    else if (track === "cuts") await setCuts(c().edit.cuts || []);
+    else if (track === "angles") await saveCuts();
+    renderSel();
+  }
+  function pruneSecs() { // after a trim: sections clamped into the new length, ones left outside dropped
+    const L = len(), sg = c().edit.layout_segments || [], kept = sg.map((q) => ({ ...q, e: Math.min(q.e, L) })).filter((q) => q.e - q.s >= 0.04);
+    if (kept.length !== sg.length || kept.some((q, i) => q.e !== sg[i].e)) { c().edit.layout_segments = kept; saveSecs(); }
+  }
+  function saveSecs() { c().edit = { ...c().edit }; clearTimeout(T.secTimer); T.secTimer = setTimeout(() => { T.secTimer = null; flushSecs(true).catch(fail); }, 400); T.tlSig = null; }
+  async function flushSecs(force) { if (!force && !T.secTimer) return; clearTimeout(T.secTimer); T.secTimer = null; const sg = c().edit.layout_segments || []; await patch({ edit: { layout_segments: sg.length ? sg : null } }); }
+  function saveFx() { clearTimeout(T.fxTimer); T.fxTimer = setTimeout(async () => { T.fxTimer = null; try { await patch({ edit: { effects: T.fx.length ? T.fx : null } }); } catch (e) { fail(e); } }, 400); T.tlSig = null; }
+  async function flushFx() { if (T.fxTimer) { clearTimeout(T.fxTimer); T.fxTimer = null; await patch({ edit: { effects: T.fx.length ? T.fx : null } }); } }
+  async function saveMarkers() { const m = c().edit.markers || []; try { await patch({ edit: { markers: m.length ? m : null } }); } catch (e) { fail(e); } T.tlSig = null; }
+  async function loadKeeps() { // the render's own cuts (silences, fillers): shown read-only on the Cuts row
+    const e = c().edit;
+    if (!e.remove_silence && !e.remove_fillers) { T.autoCuts = []; T.tlSig = null; return; }
+    const r = await api(`/api/clips/${cid}/keeps`).catch(() => null);
+    if (!r) return;
+    const own = e.cuts || [], gaps = [];
+    let cur = c().start;
+    for (const [a, b] of r.keeps) { if (a > cur + 0.01) gaps.push([cur, a]); cur = b; }
+    if (c().end > cur + 0.01) gaps.push([cur, c().end]);
+    T.autoCuts = gaps.filter(([a, b]) => !own.some(([s, e2]) => a >= s - 0.01 && b <= e2 + 0.01)); T.tlSig = null;
+  }
+
+  // ----- selection, inspector (exact values in frames), edits from the keyboard / toolbar / menus -----
+  const selItems = () => (T.items || []).filter((it) => T.sel.has(it.key));
+  function onSelect(it) {
+    const one = it && T.sel.size === 1 ? it : selItems().length === 1 ? selItems()[0] : null;
+    if (one?.o && T.osel !== one.o.id) { T.osel = one.o.id; renderOvInspector(); }
+    if (one?.track === "layout" && secAt(playRel()) !== one.i) { video.pause(); seek(c().start + one.t + Math.min(one.d / 2, 0.05)); }
+    T.tlSig = null; renderSel();
+  }
+  function renderSel() {
+    const el = $("#st-sel"); if (!el) return;
+    const its = selItems(), F = TLM.fpsExact(fps()), it = its.length === 1 ? its[0] : null, ro = it && (it.ro || tlLocked(it.track));
+    if (!its.length) { el.innerHTML = `<div class="muted" style="font-size:12px">Click an item on the timeline to edit it here, frame by frame. <button class="btn xs ghost" data-tl="help">Shortcuts (?)</button></div>`; return; }
+    if (!it) { el.innerHTML = `<div class="row"><b class="grow">${its.length} items selected</b><button class="btn xs" data-tl="dup">Duplicate</button><button class="btn xs ghost danger" data-tl="del">✕ Delete</button></div>`; return; }
+    const fr = (v) => TLM.toFrame(v, fps()), num = (k2, l, v, dis) => `<label class="field tl-num">${l}<input type="number" data-sel="${k2}" step="1" value="${v}" ${dis || ro ? "disabled" : ""}></label>`;
+    const name = it.track === "effects" ? FX_NAME[it.f.kind] : it.track === "video" ? (it.cut ? "Cut-out piece" : "Video piece") : TRACKS[it.track][0].replace(/s$/, "");
+    let extra = "";
+    if (it.f?.kind === "blur") extra = `<label class="slider"><span>Amount</span><input type="range" data-fx="amount" min="1" max="40" step="1" value="${it.f.amount}"><output>${it.f.amount}</output></label>`;
+    if (it.f?.keys) {
+      const cols = it.f.kind === "zoom" ? [["Zoom", 1, 4, 0.05], ["X", 0, 1, 0.01], ["Y", 0, 1, 0.01]] : [["Opacity", 0, 1, 0.05]];
+      extra = `${it.f.kind === "zoom" ? `<div class="muted" style="font-size:11.5px">X / Y place the zoomed window: 0 = left / top edge, 0.5 = centre, 1 = right / bottom.</div>` : ""}
+        <table class="tl-keys"><thead><tr><th>Frame</th>${cols.map(([l]) => `<th>${l}</th>`).join("")}<th></th></tr></thead><tbody>${it.f.keys.map((q, i) => `<tr>
+          <td><input type="number" data-key="${i}" data-kc="0" step="1" value="${fr(q[0])}" aria-label="Keyframe ${i + 1} frame (from the effect's start)"></td>
+          ${cols.map(([l, lo, hi, st], j) => `<td><input type="number" data-key="${i}" data-kc="${j + 1}" min="${lo}" max="${hi}" step="${st}" value="${q[j + 1]}" aria-label="Keyframe ${i + 1} ${l}"></td>`).join("")}
+          <td><button class="st-x" data-tl="key-del" data-i="${i}" title="Delete keyframe" ${it.f.keys.length < 2 ? "disabled" : ""}>✕</button></td></tr>`).join("")}</tbody></table>
+        <button class="btn xs" data-tl="key-add">◆ Keyframe at playhead</button>`;
+    }
+    if (it.track === "markers" && !it.ro) extra = `<input type="text" data-sel="label" maxlength="60" value="${esc(it.label)}" aria-label="Marker label">`;
+    if (it.track === "angles") extra = `<label class="field">Camera<select data-sel="angle">${[["main", "Main"], ...readyAngs().map((a) => [a.id, a.name])].map(([v, l]) => `<option value="${esc(v)}"${v === cuts()[it.i]?.angle ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>`;
+    if (it.o) extra = `<button class="btn xs ghost" data-tl="ov-more">Style, position &amp; animation ↓</button>`;
+    if (it.track === "layout") extra = `<div class="muted" style="font-size:12px">The Layout section below now edits only this slice (the playhead is in it).</div><button class="btn xs ghost" data-tl="lay-more">Layout for this slice ↓</button>`;
+    el.innerHTML = `<div class="row"><b class="grow">${esc(name)}${it.label && it.label !== name && it.track !== "markers" ? ` <span class="dim" style="font-weight:400">· ${esc(String(it.label).slice(0, 40))}</span>` : ""}</b>
+        ${ro ? `<span class="dim" style="font-size:11.5px">${it.ro ? "read only" : "locked"}</span>` : `<button class="btn xs ghost danger" data-tl="del">✕ ${it.track === "video" && !it.cut ? "Ripple delete" : it.cut || it.track === "cuts" ? "Restore" : "Delete"}</button>`}</div>
+      <div class="row wrap tl-nums">${num("t", "Start frame", fr(it.t), it.track === "video")}${it.d || it.track !== "markers" ? num("d", "Length (frames)", fr(it.d), it.track === "video" || it.track === "angles") + num("e", "End frame", fr(it.t + it.d), it.track === "video" || it.track === "angles") : ""}</div>
+      <div class="dim mono" style="font-size:11px">${TLM.timecode(it.t, fps())} → ${TLM.timecode(it.t + it.d, fps())} · ${(it.d).toFixed(3)} s @ ${(+F.toFixed(3))} fps</div>${extra}`;
+  }
+  function selInput(t) { // exact values typed into the inspector (frames)
+    const it = selItems()[0]; if (!it || it.ro || tlLocked(it.track)) return;
+    const f1 = 1 / TLM.fpsExact(fps()), v = TLM.frameTime(Math.round(+t.value), fps()), L = len();
+    if (t.dataset.sel === "t") setItem(it, Math.min(Math.max(v, 0), it.track === "markers" ? L : Math.max(0, L - Math.max(it.d, f1))), it.d);
+    else if (t.dataset.sel === "d") setItem(it, it.t, Math.min(Math.max(v, f1), L - it.t));
+    else if (t.dataset.sel === "e") setItem(it, it.t, Math.min(Math.max(v - it.t, f1), L - it.t));
+    else if (t.dataset.sel === "label") { c().edit.markers = c().edit.markers.map((m, i) => (i === it.i ? { ...m, label: t.value } : m)); return saveMarkers(); }
+    else if (t.dataset.sel === "angle") { cuts()[it.i] = { ...cuts()[it.i], angle: t.value }; return saveCuts(); }
+    else return;
+    commitTrack(it.track);
+  }
+  function keyInput(t) {
+    const it = selItems()[0], f = it?.f; if (!f || tlLocked("effects")) return;
+    const i = +t.dataset.key, j = +t.dataset.kc;
+    f.keys[i][j] = j === 0 ? r3(Math.min(Math.max(TLM.frameTime(Math.round(+t.value), fps()), 0), f.d)) : +t.value;
+    if (j === 0) f.keys.sort((a, b) => a[0] - b[0]);
+    saveFx(); if (j === 0) renderSel();
+  }
+  const newId = () => Math.random().toString(36).slice(2, 10);
+  function addFx(kind, rel = playRel()) {
+    if (tlLocked("effects")) return toast(locked() ? "Posted — make a new version to edit it." : "Effects are locked.");
+    const L = len(), t = r3(Math.min(Math.max(TLM.snapFrame(rel, fps()), 0), Math.max(0, L - 0.2))), d = r3(Math.min(kind === "zoom" ? 2 : 1, L - t));
+    const f = { id: newId(), kind, t, d, ...(kind === "zoom" ? { x: 0.5, y: 0.5, keys: [[0, 1, 0.5, 0.5], [r3(Math.min(0.25, d)), 1.3, 0.5, 0.5], [d, 1.3, 0.5, 0.5]] }
+      : kind === "opacity" ? { keys: [[0, 1], [r3(d / 2), 0], [d, 1]] } : { amount: 12 }) };
+    T.fx.push(f); T.sel = new Set([`effects:${f.id}`]); saveFx(); tlLayout(); onSelect();
+  }
+  function addMarker(rel = playRel()) {
+    if (tlLocked("markers")) return toast(locked() ? "Posted — make a new version to edit it." : "Markers are locked.");
+    const m = [...(c().edit.markers || []), { t: r3(TLM.snapFrame(Math.min(Math.max(rel, 0), len()), fps())), label: `Marker ${(c().edit.markers || []).length + 1}` }].sort((a, b) => a.t - b.t);
+    c().edit = { ...c().edit, markers: m }; saveMarkers();
+  }
+  function addSection(rel = playRel()) { // the In–Out range, else the piece of video (between cuts / splits) under the playhead
+    if (tlLocked("layout")) return toast(locked() ? "Posted — make a new version to edit it." : "Layout is locked.");
+    const k = c(), sg = k.edit.layout_segments || [];
+    if (secAt(rel) != null) return toast("This slice already has its own layout: edit it in the Layout section.", "info", 3000);
+    let a, b;
+    if (T.mark.in != null && T.mark.out != null) [a, b] = [Math.min(T.mark.in, T.mark.out) - k.start, Math.max(T.mark.in, T.mark.out) - k.start];
+    else { const g = TLM.segments(k.start, k.end, k.edit.cuts, T.splits).find((x) => k.start + rel >= x.a && k.start + rel < x.b) || { a: k.start, b: k.end }; [a, b] = [g.a - k.start, g.b - k.start]; }
+    const lo = Math.max(0, ...sg.filter((q) => q.e <= rel + 1e-6).map((q) => q.e)), hi = Math.min(len(), ...sg.filter((q) => q.s >= rel - 1e-6).map((q) => q.s));
+    a = r3(Math.max(a, lo)); b = r3(Math.min(b, hi));
+    if (b - a < 0.04) return toast("No room for a section here.", "err");
+    if (a < 1e-6 && Math.abs(b - len()) < 1e-6) toast("Tip: split at the playhead (S) or set In / Out first to give one slice its own layout.", "info", 4000);
+    const e = c().edit, n = { s: a, e: b, layout: e.layout || "single", ...(e.regions ? { regions: structuredClone(e.regions) } : {}) };
+    k.edit = { ...e, layout_segments: [...sg, n].sort((x, y) => x.s - y.s) };
+    if (rel < a || rel >= b) { video.pause(); seek(k.start + a + Math.min((b - a) / 2, 0.05)); } // the panel edits the layout at the playhead
+    T.sel = new Set([`layout:${k.edit.layout_segments.indexOf(n)}`]); saveSecs(); T.mark = {}; onSelect(); T.secShown = undefined;
+    $("#st-layout")?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+  async function splitAt() { // S: the selected items under the playhead, else the video at this frame
+    const rel = TLM.snapFrame(playRel(), fps()), sel = selItems().filter((it) => (it.o || it.f) && rel > it.t && rel < it.t + it.d && !tlLocked(it.track));
+    if (!sel.length) {
+      if (tlLocked("video")) return toast("Video is locked.");
+      const at = r3(c().start + rel); if (at <= c().start || at >= c().end) return;
+      T.splits = [...new Set([...T.splits, at])].sort((a, b) => a - b); T.tlSig = null;
+      return toast(`Split at ${TLM.timecode(rel, fps())} — select a piece and press Delete to ripple-delete it.`, "info", 3200);
+    }
+    for (const it of sel) {
+      const src = it.o || it.f, [a, b] = TLM.splitItem(src, rel, newId()), list = it.o ? T.ovs : T.fx;
+      list.splice(list.indexOf(src), 1, a, b);
+    }
+    if (sel.some((it) => it.o)) { buildFx(); saveOverlays(); }
+    if (sel.some((it) => it.f)) saveFx();
+    T.sel = new Set(); onSelect();
+  }
+  async function deleteSel(ripple = false) {
+    if (locked()) return toast("Posted — make a new version to edit it.", "err");
+    const its = selItems().filter((it) => !it.ro && !tlLocked(it.track)), k = c();
+    if (ripple && T.mark.in != null && T.mark.out != null && !its.length) { // Shift+Delete with in/out marks: cut that range
+      if (tlLocked("video") || tlLocked("cuts")) return toast("Unlock Video and Cuts first.");
+      await setCuts(TLM.rippleDelete(k.edit.cuts, Math.min(T.mark.in, T.mark.out), Math.max(T.mark.in, T.mark.out), k.start, k.end)); T.mark = {}; loadKeeps(); T.tlSig = null; return;
+    }
+    if (!its.length) return;
+    let cutsNow = k.edit.cuts || [], cutChange = false;
+    for (const it of its) {
+      if (it.track === "video") { cutsNow = it.cut ? TLM.removeCutAt(cutsNow, it.seg.a + 1e-6) : TLM.rippleDelete(cutsNow, it.seg.a, it.seg.b, k.start, k.end); cutChange = true; }
+      if (it.track === "cuts") { cutsNow = cutsNow.filter(([a]) => Math.abs(a - (k.start + it.t)) > 1e-6); cutChange = true; }
+    }
+    const ovIds = new Set(its.filter((it) => it.o).map((it) => it.o.id)), fxIds = new Set(its.filter((it) => it.f).map((it) => it.f.id));
+    if (ovIds.size) { T.ovs = T.ovs.filter((o) => !ovIds.has(o.id)); if (ovIds.has(T.osel)) T.osel = null; buildFx(); renderOvInspector(); saveOverlays(); }
+    if (fxIds.size) { T.fx = T.fx.filter((f) => !fxIds.has(f.id)); saveFx(); }
+    const mi = new Set(its.filter((it) => it.track === "markers").map((it) => it.i)); if (mi.size) { k.edit.markers = (k.edit.markers || []).filter((_, i) => !mi.has(i)); await saveMarkers(); }
+    const li = new Set(its.filter((it) => it.track === "layout").map((it) => it.i));
+    if (li.size) { c().edit.layout_segments = (c().edit.layout_segments || []).filter((_, i) => !li.has(i)); saveSecs(); T.regs = null; T.secShown = undefined; }
+    const si = new Set(its.filter((it) => it.track === "angles").map((it) => it.i)); if (si.size) { c().edit.switches = cuts().filter((_, i) => !si.has(i)); await saveCuts(); }
+    if (cutChange) { await setCuts(cutsNow); loadKeeps(); }
+    T.sel = new Set(); onSelect();
+  }
+  function copySel() {
+    const its = selItems().filter((it) => it.o || it.f || (it.track === "markers" && !it.ro));
+    if (!its.length) return false;
+    const t0 = Math.min(...its.map((it) => it.t));
+    T.clipb = its.map((it) => ({ track: it.track, dt: it.t - t0, data: structuredClone(it.o || it.f || c().edit.markers[it.i]) }));
+    toast(`Copied ${its.length} item${its.length > 1 ? "s" : ""}.`, "info", 1400); return true;
+  }
+  function paste(at = playRel()) {
+    if (!T.clipb?.length) return;
+    const L = len(), add = new Set();
+    for (const cb of T.clipb) {
+      if (tlLocked(cb.track)) continue;
+      const t = r3(Math.min(Math.max(TLM.snapFrame(at + cb.dt, fps()), 0), Math.max(0, L - 0.1)));
+      if (cb.track === "markers") { c().edit.markers = [...(c().edit.markers || []), { ...cb.data, t }].sort((a, b) => a.t - b.t); continue; }
+      const n = { ...structuredClone(cb.data), id: newId(), t }; n.d = r3(Math.min(n.d, L - t));
+      if (cb.track === "effects") { T.fx.push(n); add.add(`effects:${n.id}`); } else { T.ovs.push(n); add.add(`${cb.track}:${n.id}`); }
+    }
+    if (T.clipb.some((cb) => cb.track === "markers")) saveMarkers();
+    if (T.clipb.some((cb) => cb.track === "overlays" || cb.track === "sfx")) { buildFx(); saveOverlays(); }
+    if (T.clipb.some((cb) => cb.track === "effects")) saveFx();
+    T.sel = add; onSelect();
+  }
+  function nudgeSel(df) { // ±1 frame (Shift ±10) for the selection, through the same save paths
+    const its = selItems().filter((it) => !it.ro && !tlLocked(it.track) && it.track !== "video");
+    if (!its.length) return false;
+    const moved = TLM.nudge(its.map((it) => ({ t: it.t, d: it.track === "markers" ? 0 : it.d })), df, fps(), len());
+    its.forEach((it, i) => setItem(it, moved[i].t, it.d));
+    for (const tr of new Set(its.map((it) => it.track))) commitTrack(tr);
+    T.tlSig = null; return true;
+  }
+  const stepFrames = (n) => { video.pause(); const k = c(); seek(TLM.frameTime(TLM.toFrame(video.currentTime - k.start, fps()) + n, fps()) + k.start); };
+  function setMark(which) { T.mark[which] = r3(TLM.snapFrame(video.currentTime, fps())); T.tlSig = null; toast(`${which === "in" ? "In" : "Out"} at ${TLM.timecode(T.mark[which] - c().start, fps())}`, "info", 1200); }
+  async function trimToMarks() {
+    const a = T.mark.in ?? c().start, b = T.mark.out ?? c().end;
+    if (tlLocked("video")) return toast("Video is locked.");
+    if (Math.abs(b - a) < 0.5) return toast("In and out must be at least 0.5 s apart.", "err");
+    c().start = Math.min(a, b); c().end = Math.max(a, b);
+    try { await patch({ start: c().start, end: c().end }); } catch (e) { fail(e); }
+    pruneSecs(); T.mark = {}; setRange(); spanLabel(); if (!T.custom) { loadWords(); renderWords(); } loadKeeps(); T.tlSig = null;
+  }
+  function fitView() { setView(T.full[0], T.full[1] - T.full[0]); }
+  function tlAdd(what, rel = playRel()) {
+    if (what === "text") { if (tlLocked("overlays")) return toast("Overlays are locked."); addOverlay({ kind: "text", text: "Your text", w: 0.6 }, rel); }
+    else if (what === "emoji") { if (tlLocked("overlays")) return toast("Overlays are locked."); addOverlay({ kind: "text", text: "🔥", w: 0.25 }, rel); }
+    else if (what === "media" || what === "sfx") { T.akind = what === "sfx" ? "sound" : ""; renderLib(); $$("[data-act=akind]").forEach((b) => b.classList.toggle("on", b.dataset.v === T.akind)); $("#st-libl")?.scrollIntoView({ block: "center", behavior: "smooth" }); toast("Drag an item onto the timeline or the preview, or press ＋ At playhead.", "info", 3500); }
+    else if (what === "zoom" || what === "opacity" || what === "blur") addFx(what, rel);
+    else if (what === "marker") addMarker(rel);
+    else if (what === "layout") addSection(rel);
+    else if (what === "headline") $("#st-hl-ed")?.scrollIntoView({ block: "center", behavior: "smooth" });
+    else if (what === "music") toast("Music is picked in the project's Edit tab (Editor › Edit › Music); it shows on the Music row here.", "info", 4500);
+    else if (what === "angle") { if (readyAngs().length) cutTo(readyAngs()[0].id); else toast("Add a camera angle first (Camera angles section)."); }
+  }
+  const ADDS = [["text", "Text"], ["emoji", "Emoji sticker"], ["media", "Image / GIF / video…"], ["sfx", "Sound effect…"], ["music", "Music…"], ["zoom", "Zoom / punch-in"], ["opacity", "Dip to black"], ["blur", "Blur"], ["headline", "Headline / streamer card…"], ["marker", "Marker"], ["angle", "Camera cut"], ["layout", "Layout for this slice"]];
+  const TRACK_ADDS = { overlays: ["text", "emoji", "media"], sfx: ["sfx"], effects: ["zoom", "opacity", "blur"], markers: ["marker"], titles: ["headline"], music: ["music"], angles: ["angle"], layout: ["layout"] };
+  function tlMenu(id, x, y, absT) { // per-track menu (right-click a row or its ⋯): add here, select all, delete, and the row's layout
+    const rel = Math.min(Math.max(absT - c().start, 0), len()), i = TP.order.indexOf(id), [, flags] = TRACKS[id];
+    const ent = [...(TRACK_ADDS[id] || []).map((w) => [`＋ ${ADDS.find((a) => a[0] === w)[1]} here`, () => tlAdd(w, rel)]),
+      ["Select all on this row", () => { T.sel = new Set(T.items.filter((it) => it.track === id && !it.ro).map((it) => it.key)); onSelect(); }],
+      ...(selItems().length ? [["Delete selected", () => deleteSel()]] : []),
+      ...(id === "video" ? [["Split at playhead (S)", () => splitAt()], ["Clear split points", () => { T.splits = []; T.tlSig = null; }]] : []),
+      null,
+      [TP.collapsed[id] ? "Expand row" : "Collapse row", () => { TP.collapsed[id] = !TP.collapsed[id]; saveTP(); }],
+      ...(flags.includes("h") ? [[TP.hidden[id] ? "Show in preview" : "Hide in preview", () => { TP.hidden[id] = !TP.hidden[id]; saveTP(); applyTrackPrefs(); }]] : []),
+      ...(flags.includes("m") ? [[TP.muted[id] ? "Unmute preview" : "Mute preview", () => { TP.muted[id] = !TP.muted[id]; saveTP(); applyTrackPrefs(); }]] : []),
+      ...(flags.includes("l") ? [[TP.locked[id] ? "Unlock" : "Lock", () => { TP.locked[id] = !TP.locked[id]; saveTP(); }]] : []),
+      ["Move row up", () => { if (i > 0) { TP.order.splice(i - 1, 0, TP.order.splice(i, 1)[0]); saveTP(); } }, i === 0],
+      ["Move row down", () => { if (i < TP.order.length - 1) { TP.order.splice(i + 1, 0, TP.order.splice(i, 1)[0]); saveTP(); } }, i === TP.order.length - 1]];
+    popMenu(ent, x, y);
+  }
+  function popMenu(ent, x, y) {
+    $("#tl-menu")?.remove();
+    const m = document.createElement("div"); m.id = "tl-menu"; m.className = "tl-menu"; m.setAttribute("role", "menu");
+    m.innerHTML = ent.map((e, i) => (e ? `<button role="menuitem" data-i="${i}"${e[2] ? " disabled" : ""}>${esc(e[0])}</button>` : `<hr>`)).join("");
+    document.body.append(m);
+    Object.assign(m.style, { left: Math.min(x, innerWidth - m.offsetWidth - 8) + "px", top: Math.min(y, innerHeight - m.offsetHeight - 8) + "px" });
+    const close = () => { m.remove(); document.removeEventListener("pointerdown", out, true); };
+    const out = (e) => { if (!m.contains(e.target)) close(); };
+    setTimeout(() => document.addEventListener("pointerdown", out, true));
+    m.onclick = (e) => { const b = e.target.closest("[data-i]"); if (!b) return; close(); ent[+b.dataset.i][1](); T.tlSig = null; };
+    m.onkeydown = (e) => { const bs = $$("button:not([disabled])", m), i = bs.indexOf(document.activeElement);
+      if (e.key === "Escape") { e.preventDefault(); close(); tl.focus(); } else if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); bs[(i + (e.key === "ArrowDown" ? 1 : bs.length - 1)) % bs.length]?.focus(); } };
+    m.querySelector("button:not([disabled])")?.focus();
+  }
+  function tlHelp() {
+    const K = [["Space", "Play / pause"], [", / .", "Back / forward one frame (Shift: 10 frames)"], ["← / →", "One frame (Shift: 1 s), or nudge the selection one frame (Shift: 10)"],
+      ["Home / End", "Clip start / end"], ["S", "Split at the playhead (selected items, else the video)"], ["Delete", "Delete the selection (a video piece is ripple-deleted; a cut is restored)"],
+      ["Shift+Delete", "Ripple-delete the In–Out range"], ["I / O / X", "Mark in / mark out / clear marks"], ["M", "Add a marker"], ["N", "Snapping on / off (hold Alt while dragging to skip it)"],
+      ["Ctrl+C / Ctrl+V / Ctrl+D", "Copy / paste at the playhead / duplicate"], ["Ctrl+A", "Select every editable item"], ["Esc", "Clear the selection"],
+      ["= / -  ·  Ctrl+wheel", "Zoom the timeline (down to single frames)"], ["\\", "Fit the clip"], ["Shift+wheel", "Scroll sideways"], ["0–6", "Cut to a camera angle"], ["Ctrl+Z / Ctrl+Y", "Undo / redo"], ["?", "This list"]];
+    modal(`<h2>Timeline shortcuts</h2><table class="tl-help"><tbody>${K.map(([k2, v]) => `<tr><td><span class="kbd">${esc(k2)}</span></td><td>${esc(v)}</td></tr>`).join("")}</tbody></table>
+      <p class="muted" style="font-size:12px">Drag items to move them, their edges to trim them; drag on an empty part of a row to select several. Right-click a row (or its ⋯) for its menu.
+      Hide and mute only change this preview: the render always includes every layer, so delete an item to drop it from the video.</p><div class="foot"><button class="btn" data-close>Close</button></div>`);
+  }
+  function applyTrackPrefs() { // the preview side of hide / mute
+    video.muted = !!TP.muted.video;
+    T.sounds.forEach((au) => { au.muted = !!TP.muted.sfx; });
+    if (T.music) T.music.muted = !!TP.muted.music;
+    $("#st-snap") && ($("#st-snap").checked = TP.snap);
+    const fx = $("#st-fx"); if (fx) for (const id of ["captions", "titles", "overlays"]) fx.classList.toggle(`hide-${id}`, !!TP.hidden[id]);
+    T.tlSig = null;
+  }
+  function onTlTool(b) {
+    const a = b.dataset.tl, f = selItems()[0]?.f;
+    if (a === "split") splitAt(); else if (a === "ripple") deleteSel(true); else if (a === "del") deleteSel(); else if (a === "dup") { if (copySel()) paste(Math.max(...selItems().map((it) => it.t + it.d))); }
+    else if (a === "in" || a === "out") setMark(a); else if (a === "trim-io") trimToMarks(); else if (a === "fit") fitView(); else if (a === "help") tlHelp();
+    else if (a === "zin" || a === "zout") { const span = T.range[1] - T.range[0], ns = a === "zin" ? span / 1.5 : span * 1.5; setView(video.currentTime - ns / 2, ns); }
+    else if (a === "ov-more") { $("#st-ovi")?.scrollIntoView({ block: "center", behavior: "smooth" }); }
+    else if (a === "lay-more") { $("#st-layout")?.scrollIntoView({ block: "center", behavior: "smooth" }); }
+    else if (a === "key-add" && f) { const rel = r3(Math.min(Math.max(TLM.snapFrame(playRel(), fps()) - f.t, 0), f.d)), n = f.keys[0].length, row = [rel];
+      for (let i = 1; i < n; i++) row.push(+TLM.interp(f.keys, rel, i).toFixed(4)); f.keys = [...f.keys.filter((q) => Math.abs(q[0] - rel) > 1e-6), row].sort((x, y) => x[0] - y[0]); saveFx(); renderSel(); }
+    else if (a === "key-del" && f && f.keys.length > 1) { f.keys.splice(+b.dataset.i, 1); saveFx(); renderSel(); }
+    T.tlSig = null;
+  }
+  function tlKey(e) { // timeline keys (the Studio's keydown handler calls this first); true = handled
+    const k = e.key, mod = e.ctrlKey || e.metaKey;
+    if (mod && !e.altKey) {
+      const z = k.toLowerCase();
+      if (z === "c") return copySel();
+      if (z === "v") { if (!T.clipb) return false; paste(); return true; }
+      if (z === "d") { if (copySel()) paste(Math.max(...selItems().map((it) => it.t + it.d))); return true; }
+      if (z === "a") { T.sel = new Set(T.items.filter((it) => !it.ro && !tlLocked(it.track) && it.track !== "video").map((it) => it.key)); onSelect(); return true; }
+      return false;
+    }
+    if (e.altKey) return false;
+    if (k === "," || k === "<") { stepFrames(e.shiftKey ? -10 : -1); return true; }
+    if (k === "." || k === ">") { stepFrames(e.shiftKey ? 10 : 1); return true; }
+    if ((k === "ArrowLeft" || k === "ArrowRight") && T.sel.size && !(multiOn() && regs()[T.rsel])) return nudgeSel((k === "ArrowLeft" ? -1 : 1) * (e.shiftKey ? 10 : 1));
+    if (k === "Delete" || k === "Backspace") { if (T.csel && !T.sel.size) return false; deleteSel(e.shiftKey); return true; }
+    const l = k.toLowerCase();
+    if (l === "s") { splitAt(); return true; }
+    if (l === "i" || l === "o") { setMark(l === "i" ? "in" : "out"); return true; }
+    if (l === "x") { T.mark = {}; T.tlSig = null; return true; }
+    if (l === "m") { addMarker(); return true; }
+    if (l === "n") { TP.snap = !TP.snap; saveTP(); applyTrackPrefs(); toast(`Snapping ${TP.snap ? "on" : "off"}`, "info", 1000); return true; }
+    if (k === "=" || k === "+" || k === "-" || k === "_") { onTlTool({ dataset: { tl: k === "-" || k === "_" ? "zout" : "zin" } }); return true; }
+    if (k === "\\") { fitView(); return true; }
+    if (k === "?") { tlHelp(); return true; }
+    if (k === "Home" || k === "End") { video.pause(); seek(k === "Home" ? c().start : c().end); return true; }
+    if (k === "Escape" && T.sel.size) { T.sel = new Set(); onSelect(); return true; }
+    return false;
+  }
+  function tlSync() { // per frame: redraw only when what the timeline shows changed; keep the zoom/scroll controls in step
+    const k = c(), sig = JSON.stringify([k.start, k.end, k.edit.cuts, k.edit.switches, k.edit.markers, k.edit.layout_segments, k.edit.music, k.edit.headline, k.edit.streamer_card, k.edit.title_text, k.edit.sticker_text, T.ovs, T.fx, T.words.length, T.wordsRev, T.manual.length, T.points.length,
+      T.range, [...T.sel], T.hover, T.splits, T.mark, T.autoCuts.length, TP, S.ui.timeline, tl.clientWidth, innerHeight, locked(), T.sprite?.complete, !!T.sig, angs().length, !!T.sugg, !!T.wave?.peaks]);
+    const px = Math.round(tx(T.scrubT ?? video.currentTime));
+    if (sig === T.tlSig && px === T.tlPx) return;
+    T.tlSig = sig; T.tlPx = px;
+    drawTimeline();
+    const f = T.full, span = T.range[1] - T.range[0], mn = 20 / TLM.fpsExact(fps()), mx = f[1] - f[0];
+    const z = $("#st-tlz"), hs = $("#st-hs");
+    if (z && document.activeElement !== z) z.value = Math.round((1 - Math.log(span / mn) / Math.log(Math.max(mx / mn, 1.0001))) * 1000);
+    if (hs && document.activeElement !== hs) { hs.value = mx - span > 1e-6 ? Math.round(((T.range[0] - f[0]) / (mx - span)) * 1000) : 0; hs.disabled = mx - span <= 1e-6; }
+    $("#st-tcf").textContent = TLM.timecode(Math.max(0, (T.scrubT ?? video.currentTime) - k.start), fps());
+  }
+  // the preview side of the effects row (Output view): zoom on the picture, blur, the dip to black under the captions
+  function fxPreview(rel) {
+    const fr2 = $("#st-frame"), on = T.mode === "output" && !TP.hidden.effects && !multiOn();
+    let z = 1, cx = 0.5, cy = 0.5, blur = 0, op = 1, placed = false;
+    if (on) for (const f of T.fx) {
+      if (rel < f.t || rel > f.t + f.d) continue;
+      const r = rel - f.t;
+      if (f.kind === "zoom") { z += TLM.interp(f.keys, r, 1) - 1; if (!placed) { cx = TLM.interp(f.keys, r, 2); cy = TLM.interp(f.keys, r, 3); placed = true; } }
+      else if (f.kind === "opacity") op *= TLM.interp(f.keys, r, 1);
+      else blur = Math.max(blur, f.amount);
+    }
+    z = Math.min(Math.max(z, 1), 4);
+    const vt = z > 1.0005 ? `scale(${z.toFixed(4)})` : "";
+    if (video.style.transform !== vt) {
+      video.style.transform = vt;
+      if (vt) video.style.transformOrigin = `${cx * fr2.clientWidth - (parseFloat(video.style.left) || 0)}px ${cy * fr2.clientHeight - (parseFloat(video.style.top) || 0)}px`;
+    }
+    const fb = blur ? `blur(${(blur * fr2.clientWidth / 1080 * 1.5).toFixed(1)}px)` : "";
+    if (video.style.filter !== fb) video.style.filter = fb;
+    let dip = $("#st-dip");
+    if (!dip && op < 0.999 && $("#st-fx")) { dip = Object.assign(document.createElement("div"), { id: "st-dip", className: "st-dip" }); $("#st-fx").prepend(dip); } // buildFx rebuilds #st-fx
+    if (dip) { const o = (1 - op).toFixed(3); if (dip.style.opacity !== o) dip.style.opacity = o; dip.hidden = op > 0.999; }
+  }
+  function syncMusic(rel) { // the music bed in the preview: starts with the output, loops, at the clip's music volume
+    const e = c().edit;
+    if (!e.music) { if (T.music) { T.music.pause(); T.music = null; } return; }
+    if (!T.music || T.music._f !== e.music) { T.music?.pause(); T.music = Object.assign(new Audio(`/files/${pid()}/${e.music}`), { _f: e.music, loop: true, muted: !!TP.muted.music }); }
+    const au = T.music; au.volume = Math.min(Math.max(+e.music_volume || 0, 0), 1);
+    if (video.paused || T.mode !== "output") { if (!au.paused) au.pause(); return; }
+    const want = outAt(rel) / (+e.speed || 1), d = au.duration || 0;
+    if (d && Math.abs(au.currentTime - (want % d)) > 0.3) au.currentTime = want % d;
+    if (au.paused) au.play().catch(() => {});
   }
   const spanLabel = () => { $("#st-span").textContent = `${fmt(c().start)} → ${fmt(c().end)} · ${(c().end - c().start).toFixed(1)}s`; };
 
   // ----- split-screen layout: gallery, one box per region on the source, live composition -----
-  const multiOn = () => isMulti(c()?.edit);
-  const regs = () => T.regs || (T.regs = regionsOf(c().edit));
+  // per-section layouts (edit.layout_segments, clip time): the panel, the region boxes and the preview use the layout at the
+  // playhead: a section's own when the playhead is in one, else the clip's
+  const secAt = (rel) => { const i = (c()?.edit.layout_segments || []).findIndex((q) => rel >= q.s && rel < q.e); return i < 0 ? null : i; };
+  const curSec = () => (video && c() ? secAt(playRel()) : null);
+  const layE = () => { const i = curSec(); return i == null ? c().edit : { ...c().edit, ...c().edit.layout_segments[i] }; };
+  function setLayKey(key, v) { // a layout value: into the section at the playhead (true), else the caller saves it on the clip
+    const i = curSec(); if (i == null) return false;
+    c().edit.layout_segments[i] = { ...c().edit.layout_segments[i], [key]: v }; saveSecs(); return true;
+  }
+  const multiOn = () => !!c() && isMulti(layE());
+  const regs = () => T.regs || (T.regs = regionsOf(layE()));
   const freeOuts = () => { const rs = regs(), m = rs.findIndex((r) => r.role === "main"); return rs.map((r, i) => clampBox(r.out || (i === m ? FULL_BOX : FREE_OUT))); };
   function saveRegions() { // the first change turns an old split clip's derived boxes into saved regions
-    c().edit = { ...c().edit, regions: regs() };
+    if (setLayKey("regions", regs())) return;
+    const rs = regs(); c().edit = { ...c().edit, regions: rs }; T.rgSave = rs;
     clearTimeout(T.rgTimer);
-    T.rgTimer = setTimeout(() => { T.rgTimer = null; patch({ edit: { regions: regs() } }).catch(fail); }, 400);
+    T.rgTimer = setTimeout(() => { T.rgTimer = null; patch({ edit: { regions: rs } }).catch(fail); }, 400);
   }
-  async function flushRegions() { if (T.rgTimer) { clearTimeout(T.rgTimer); T.rgTimer = null; await patch({ edit: { regions: regs() } }); } }
+  async function flushRegions() { await flushSecs(); if (T.rgTimer) { clearTimeout(T.rgTimer); T.rgTimer = null; await patch({ edit: { regions: T.rgSave || regs() } }); } }
   function selectRegion(i) { T.rsel = i; $$(".lay-reg").forEach((r) => r.classList.toggle("on", +r.dataset.i === i)); }
   function nudgeRegion(key, step) {
-    const out = T.mode === "output" && c().edit.layout === "free", r = regs()[T.rsel], b = out ? freeOuts()[T.rsel] : r;
+    const out = T.mode === "output" && layE().layout === "free", r = regs()[T.rsel], b = out ? freeOuts()[T.rsel] : r;
     const [dx, dy] = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[key] || [0, 0];
     const nb = clampBox({ ...b, x: b.x + dx, y: b.y + dy });
     if (out) r.out = nb; else Object.assign(r, nb);
@@ -2439,7 +3310,7 @@ function Studio(cid) {
     if (cv.width !== Math.round(cw * dpr) || cv.height !== Math.round(ch * dpr)) { cv.width = Math.round(cw * dpr); cv.height = Math.round(ch * dpr); }
     g.setTransform(dpr * k, 0, 0, dpr * k, 0, 0);
     g.fillStyle = "#000"; g.fillRect(0, 0, OW, OH);
-    const e = { ...LAYOUT_DEFAULTS, ...c().edit, regions: regs() }, sizeOf = (r) => angSize(r.source) || [sw, sh], { base, items } = layoutSlots(e, OW, OH, sw, sh, sizeOf);
+    const e = { ...LAYOUT_DEFAULTS, ...layE(), regions: regs() }, sizeOf = (r) => angSize(r.source) || [sw, sh], { base, items } = layoutSlots(e, OW, OH, sw, sh, sizeOf);
     const draw = (src, sx, sy, sW, sH, x, y, w, h) => { if (src) g.drawImage(src[0], sx, sy, sW, sH, x, y, w, h); else { g.fillStyle = "#000"; g.fillRect(x, y, w, h); } };
     if (base === "blur") { const [w, h, x, y] = regionCrop(items[0].r, OW / OH, ...sizeOf(items[0].r)); g.filter = `blur(${Math.round(10 * dpr)}px)`; draw(srcOf(angSize(items[0].r.source) ? items[0].r.source : "main"), x, y, w, h, 0, 0, OW, OH); g.filter = "none"; }
     for (const it of items) {
@@ -2461,15 +3332,20 @@ function Studio(cid) {
   }
   const base0 = () => ({ cx: +c().edit.crop_x, cy: +c().edit.crop_y });
   function renderLayout() {
-    const el = $("#st-layout"), e = { ...LAYOUT_DEFAULTS, ...c().edit };
+    const el = $("#st-layout"), e = { ...LAYOUT_DEFAULTS, ...layE() }, si = curSec(), sec = si == null ? null : c().edit.layout_segments[si];
     if (!el) return;
+    T.secShown = si;
     if (!T.rgTimer) T.regs = regionsOf(e);
     if (e.aspect === "source") { el.innerHTML = `<h3>Layout</h3><div class="muted" style="font-size:12px">Split-screen layouts need a 9:16, 1:1, 4:5 or 16:9 output — pick one in the project's Edit tab.</div>`; return; }
     const multi = multiOn(), lay = e.layout, [OW, OH] = outSize(), rs = regs();
     // camera angles (project.angles, once multicam import exists): a source picker per region; hidden without any
     const angles = (T.proj.angles || []).map((a) => (typeof a === "string" ? [a, a] : [a.id, a.name || a.id])).filter(([v]) => v);
     const rl = (k, label, min, max, step, unit = "") => `<label class="slider"><span>${label}</span><input type="range" data-k="${k}" min="${min}" max="${max}" step="${step}" value="${e[k]}"><output>${(+e[k]).toFixed(step < 1 ? 2 : 0)}${unit}</output></label>`;
-    el.innerHTML = `<h3>Layout</h3>
+    const nSec = (c().edit.layout_segments || []).length;
+    el.innerHTML = `<h3>Layout${sec ? " · this slice only" : ""}</h3>
+      ${sec ? `<div class="lay-sec"><span class="grow">Section ${TLM.timecode(sec.s, fps())} → ${TLM.timecode(sec.e, fps())}: changes here apply only to this slice (the Layout row on the timeline).</span>
+        <button class="btn xs ghost danger" data-act="sec-del" title="Remove this section: the slice goes back to the clip's layout">✕ Use the clip's layout</button></div>`
+      : nSec ? `<div class="muted" style="font-size:12px">The clip's layout (outside the ${nSec} section${nSec > 1 ? "s" : ""} on the timeline's Layout row).</div>` : ""}
       <div class="lay-gal">${LAYOUTS.map(([v, l]) => `<button class="lay-card${lay === v ? " on" : ""}" data-act="layout" data-v="${v}" title="${l}" aria-pressed="${lay === v}">${layoutThumb(v)}<span>${l}</span></button>`).join("")}</div>
       ${multi ? `<canvas id="st-comp" class="lay-out" style="aspect-ratio:${OW}/${OH}" title="Output preview${lay === "free" ? " — drag a box to place it" : ""}"></canvas>
         ${["split", "split_rev", "stack3", "duo"].includes(lay) ? rl("split", lay === "split_rev" ? "Cam share (bottom)" : "Top share", 0.15, 0.7, 0.01) : ""}
@@ -2482,11 +3358,11 @@ function Studio(cid) {
             `<option value="${esc(v)}"${v === (r.source || "main") ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>` : ""}
           <label class="switch grow" title="This box follows the tracked subject (run tracking below)"><input type="checkbox" data-rg="${i}" data-f="follow"${r.follow ? " checked" : ""}> follow</label>
           <button class="st-x" data-act="rg-del" data-i="${i}" title="Remove this region"${rs.length < 2 ? " disabled" : ""}>✕</button></div>`).join("")}</div>
-        <div class="row wrap"><button class="btn xs" data-act="rg-add"${rs.length >= 4 ? " disabled" : ""}>＋ Region</button><button class="btn xs" data-act="rg-detect">◎ Detect regions</button></div>
+        <div class="row wrap"><button class="btn xs" data-act="rg-add"${rs.length >= 4 ? " disabled" : ""}>＋ Region</button>${sec ? "" : `<button class="btn xs" data-act="rg-detect">◎ Detect regions</button>`}</div>
         <div class="muted" style="font-size:12px">Source view: drag a box to move it, a corner to resize it; arrow keys nudge the selected box (Shift = faster).${lay === "free" ? " Drag the boxes on the preview to place them in the frame." : ""}</div>` : ""}
-      <div class="row wrap"><button class="btn xs" data-act="lay-all">Apply to all clips in this project</button><button class="btn xs" data-act="lay-default">Save as my default layout</button></div>`;
+      ${sec ? "" : `<div class="row wrap"><button class="btn xs" data-act="lay-all">Apply to all clips in this project</button><button class="btn xs" data-act="lay-default">Save as my default layout</button></div>`}`;
     const comp = $("#st-comp");
-    if (comp) bindBoxes(comp, () => (c().edit.layout === "free" ? freeOuts() : null), (i, b) => { regs()[i].out = b; });
+    if (comp) bindBoxes(comp, () => (layE().layout === "free" ? freeOuts() : null), (i, b) => { regs()[i].out = b; });
   }
 
 
@@ -2544,20 +3420,6 @@ function Studio(cid) {
       if (s && s[1]) { const k = Math.min(W / 2 / s[1], H / s[2]), w = s[1] * k, h = s[2] * k; g.drawImage(s[0], x0 + (W / 2 - w) / 2, (H - h) / 2, w, h); }
       angTag(g, angName(id) + (s ? "" : " · not recording"), x0, 0);
     });
-  }
-  function drawSwitchLane(g, W) { // which camera is live along the clip; white ticks = cuts (drag them), yellow = suggestions
-    const k = c(), len = k.end - k.start, segs = [[0, swDefault()], ...cuts().map((q) => [q.t, q.angle])];
-    g.fillStyle = "#ffffff06"; g.fillRect(0, SW_Y, W, SW_H);
-    g.font = `600 ${9 * S.ui.timeline}px Inter, sans-serif`;
-    segs.forEach(([t0, id], i) => {
-      const X0 = tx(k.start + t0), X1 = tx(k.start + (i + 1 < segs.length ? segs[i + 1][0] : len));
-      if (X1 <= X0) return;
-      g.fillStyle = angCol(id) + (id === "main" ? "66" : "cc"); g.beginPath(); g.roundRect(X0, SW_Y, X1 - X0, SW_H, 3); g.fill();
-      g.save(); g.beginPath(); g.rect(X0, SW_Y, X1 - X0 - 2, SW_H); g.clip(); g.fillStyle = "#0b0c10"; g.fillText(angName(id), X0 + 4, SW_Y + SW_H - 4); g.restore();
-    });
-    g.fillStyle = "#fff";
-    for (const q of cuts()) g.fillRect(tx(k.start + q.t) - 1, SW_Y - 2, 2, SW_H + 4);
-    if (T.sugg) { g.fillStyle = "#ffc247"; for (const q of T.sugg.switches) g.fillRect(tx(k.start + q.t) - 1.5, SW_Y - 4, 3, 5); }
   }
   function cutTo(id) { // a cut at the playhead (replacing one within 0.1 s of it)
     const rel = +Math.min(Math.max(video.currentTime - c().start, 0), c().end - c().start).toFixed(2);
@@ -2630,6 +3492,7 @@ function Studio(cid) {
     $("#st-panel").innerHTML = `
       <div class="sec"><input type="text" id="st-title" value="${esc(k.title)}" style="font-weight:600">
         <div class="muted" style="font-size:12px">Output ${esc(e.aspect === "source" ? "original frame" : e.aspect)}${e.fit === "blur" && e.layout === "single" && e.aspect !== "source" ? " · fit + blur (preview shows the crop)" : ""}</div></div>
+      <div class="sec tl-sel" id="st-sel" aria-live="polite"></div>
       <div class="sec" id="st-layout"></div>
       <div class="sec" id="st-angles"></div>
       <div class="sec"><h3>Framing</h3>
@@ -2656,6 +3519,7 @@ function Studio(cid) {
       <div class="sec"><h3>Headline</h3><div id="st-hl-ed" class="stack" style="gap:8px"></div>
         <details><summary class="muted" style="font-size:12px;cursor:pointer">Headline font &amp; style (over the theme)</summary><div id="st-hts" class="stack" style="gap:8px;margin-top:8px"></div></details>
         <div class="muted" style="font-size:12px">Switch to Output view to see the banner in the frame.</div></div>
+      <div class="sec"><h3>Streamer card</h3><div id="st-sc-ed" class="stack" style="gap:8px"></div></div>
       <div class="sec"><h3>Effects</h3>
         <div id="st-ovi" class="stack" style="gap:8px"></div>
         <div class="row"><input type="text" id="st-txt" placeholder="Text or emoji sticker 🔥" maxlength="80"><button class="btn sm" data-act="add-text">＋ Add</button></div>
@@ -2689,8 +3553,9 @@ function Studio(cid) {
     const hlStyle = () => textStyleEditor($("#st-hts"), { get: (k) => c().edit[`headline_${k}`], set: (k, v) => queueEdit(`headline_${k}`, v), def: hlTsDefaults(c().edit), sample: c().edit.headline?.text || "Your headline" });
     headlineEditor($("#st-hl-ed"), { clip: c, set: (ed) => { const th = c().edit.headline?.theme; Object.entries(ed).forEach(([k, v]) => queueEdit(k, v)); if (ed.headline?.theme !== th) hlStyle(); } });
     hlStyle();
+    T.scDraw = streamerCardEditor($("#st-sc-ed"), { clip: c, set: (ed) => { Object.entries(ed).forEach(([k, v]) => queueEdit(k, v)); $("#st-sc") && ($("#st-sc")._k = null); }, avoid: () => scAvoid(c().edit, ...outSize()) });
     renderLib(); renderOvInspector(); renderPlan(); renderLayout(); renderAngles();
-    spanLabel(); renderTrack(); renderWords(); renderCuts(); renderActions();
+    spanLabel(); renderTrack(); renderWords(); renderCuts(); renderActions(); renderSel();
   }
 
   // ----- effects (edit.overlays) -----
@@ -2704,12 +3569,12 @@ function Studio(cid) {
     clearTimeout(T.frTimer); T.frTimer = null;
     try { await patch({ edit: { framing: fr() } }); } catch (e) { fail(e); }
   }
-  function addOverlay(o) {
-    const len = c().end - c().start, rel = Math.max(0, video.currentTime - c().start);
+  function addOverlay(o, at) { // at = clip time (the timeline's drop / add-here), else the playhead
+    const len = c().end - c().start, rel = at ?? Math.max(0, video.currentTime - c().start);
     const n = { id: Math.random().toString(36).slice(2, 10), kind: "text", asset_id: null, text: "", t: 0, d: 2.5, x: 0.5, y: 0.35, w: 0.4, anim: "pop", volume: 1, layer: T.ovs.length, cutaway: false, ...o };
     n.t = +Math.min(rel, Math.max(0, len - 0.5)).toFixed(2);
     n.d = +Math.max(0.2, Math.min(n.d, len - n.t)).toFixed(2);
-    T.ovs.push(n); T.osel = n.id;
+    T.ovs.push(n); T.osel = n.id; T.sel = new Set([`${n.kind === "sound" ? "sfx" : "overlays"}:${n.id}`]); T.tlSig = null;
     buildFx(); renderOvInspector(); saveOverlays();
   }
   function bindDrop() {
@@ -2740,7 +3605,8 @@ function Studio(cid) {
       const inner = o.kind === "text" ? `<span>${esc(o.text)}</span>` : !a ? `<span class="st-miss">${esc(o.kind)}</span>`
         : o.kind === "video" ? `<video src="${src}" muted loop playsinline preload="metadata"></video>` : `<img src="${src}" alt="">`;
       return o.kind === "sound" ? "" : `<div class="st-ov" data-o="${esc(o.id)}" hidden>${inner}</div>`;
-    }).join("") + `<div class="st-cap" id="st-cap" hidden></div><div class="hl-prev" id="st-hl" hidden></div><div class="st-safe" id="st-safe" hidden></div>`;
+    }).join("") + `<div class="st-cap" id="st-cap" hidden></div><div class="hl-prev" id="st-hl" hidden></div><div class="sc-prev" id="st-sc" hidden></div><div class="st-safe" id="st-safe" hidden></div>`;
+    bindCard($("#st-sc"));
     for (const o of T.ovs) {
       const a = o.kind === "sound" && T.assets?.find((x) => x.id === o.asset_id);
       if (a) { const au = new Audio(`/assets/${encodeURI(a.file)}`); au.volume = Math.min(Math.max(+(o.volume ?? 1), 0), 1); T.sounds.set(o.id, au); }
@@ -2768,6 +3634,7 @@ function Studio(cid) {
     }
     capTick(out, fw);
     hlTick(out, fw, rel);
+    scTick(out, fw, rel);
     safeTick(out);
     if (!video.paused && T.prevRel != null && rel > T.prevRel && rel - T.prevRel < 0.5) {
       for (const [id, au] of T.sounds) { const o = T.ovs.find((x) => x.id === id); if (o && T.prevRel < o.t && rel >= o.t) { au.currentTime = 0; au.play().catch(() => {}); } }
@@ -2791,15 +3658,80 @@ function Studio(cid) {
       return e.caption_emphasis && capKeyword(raw) ? `<b class="ca-emph" style="color:${hl}">${txt}</b>` : txt; }).join(" ");
     if (el._h !== html) { el._h = html; el.innerHTML = html; }
     styleText(el, tsOf((k) => e[`caption_${k}`], tsDefaults("caption", e, OW, OH)), fw / OW);
+    el.style.bottom = ((OH - capBand(e, OW, OH)[1]) / OH) * 100 + "%";
+    el.style.background = e.caption_style === "boxed" ? "#0009" : "";
+  }
+  // [top, bottom] px the captions can fill (two lines), clear of the banner like media.build_ass (media.caption_band)
+  function capBand(e, OW, OH) {
     let mv = CAPTION_POS[e.caption_pos || "low"][OH > OW ? 0 : 1] * OH;
-    const hs = hlSpec(e);
-    if (hs) { // keep clear of the banner, like media.build_ass
+    const hs = hlSpec(e), capH = 2.4 * tsOf((k) => e[`caption_${k}`], tsDefaults("caption", e, OW, OH)).size;
+    if (hs) { // keep clear of the banner
       const L = hlLayout(hs, OW, OH, seamOf(e)), y0 = L.kbox && !L.left ? L.kbox[1] : L.bar[1], y1 = L.bar[1] + L.bar[3], gap = OH * 0.015;
-      const capH = 2.4 * tsOf((k) => e[`caption_${k}`], tsDefaults("caption", e, OW, OH)).size;
       if (OH - mv > y0 - gap && OH - mv - capH < y1 + gap) mv = y0 + y1 < OH ? OH - (y1 + gap + capH) : OH - (y0 - gap);
     }
-    el.style.bottom = (mv / OH) * 100 + "%";
-    el.style.background = e.caption_style === "boxed" ? "#0009" : "";
+    return [OH - mv - capH, OH - mv];
+  }
+  // what the streamer card keeps clear of (media.card_place): the banner and the captions
+  function scAvoid(e, OW, OH) {
+    const out = [], hs = hlSpec(e);
+    if (hs) { const L = hlLayout(hs, OW, OH, seamOf(e)); out.push([L.kbox && !L.left ? L.kbox[1] : L.bar[1], L.bar[1] + L.bar[3]]); }
+    if (e.captions && T.words?.length) out.push(capBand(e, OW, OH));
+    return out;
+  }
+  // the streamer card in the output view (only while it shows: whole clip or its first seconds)
+  function scTick(out, fw, rel) {
+    const el = $("#st-sc"), e = c().edit, sp = out ? scSpec(e) : null;
+    const on = !!sp && (sp.show === "whole" || rel / (+e.speed || 1) <= +sp.seconds);
+    if (!el) return;
+    if (el.hidden === on) el.hidden = !on;
+    if (!on || el._edit) return;
+    const [OW, OH] = outSize(), avoid = scAvoid(e, OW, OH), key = JSON.stringify([sp, avoid, fw, OH, SC.assets.length]);
+    if (el._k !== key) { el._k = key; el._L = scLayout(sp, OW, OH, avoid); scRender(el, sp, el._L, fw / OW, scAvatarUrl(sp.avatar_asset_id), true); }
+  }
+  // drag the card to move it (a custom spot), drag its corner to resize it, double-click a text line to edit it in place
+  function bindCard(el) {
+    if (!el) return;
+    let d = null;
+    const redraw = () => { el._k = null; scTick(true, $("#st-fx").clientWidth, 0); };
+    el.onpointerdown = (ev) => {
+      const card = ev.target.closest(".sc-card");
+      if (!card || el._edit || locked()) return;
+      ev.preventDefault(); ev.stopPropagation(); video.pause();
+      const [OW, OH] = outSize();
+      d = { rz: !!ev.target.closest(".sc-rz"), p0: localXY(ev, $("#st-fx")), L: el._L, s: $("#st-fx").clientWidth / OW, OW, OH, scale: +(c().edit.streamer_card?.scale || 1) };
+      // on the window: each move redraws the card, so the element under the pointer is replaced mid-drag
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", end, { once: true });
+      window.addEventListener("pointercancel", end, { once: true });
+    };
+    const move = (ev) => {
+      if (!d) return;
+      const [lx, ly] = localXY(ev, $("#st-fx")), dx = (lx - d.p0[0]) / d.s, dy = (ly - d.p0[1]) / d.s;
+      d.patch = d.rz ? { scale: +Math.min(Math.max((d.scale * (d.L.w + dx)) / d.L.w, 0.5), 2).toFixed(2) }
+        : { position: "custom", x: +Math.min(Math.max((d.L.x + d.L.w / 2 + dx) / d.OW, 0), 1).toFixed(4), y: +Math.min(Math.max((d.L.y + d.L.h / 2 + dy) / d.OH, 0), 1).toFixed(4) };
+      c().edit = { ...c().edit, streamer_card: { ...(c().edit.streamer_card || {}), ...d.patch } }; // live while dragging, saved on release
+      redraw();
+    };
+    const end = () => {
+      window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); window.removeEventListener("pointercancel", end);
+      if (d?.patch) { queueEdit("streamer_card", c().edit.streamer_card); T.scDraw?.(); }
+      d = null;
+    };
+    el.ondblclick = (ev) => {
+      const sp = ev.target.closest("[data-scf]");
+      if (!sp || locked()) return;
+      el._edit = true; sp.contentEditable = "plaintext-only"; sp.focus();
+      document.getSelection()?.selectAllChildren(sp);
+      const done = (save) => {
+        sp.onblur = sp.onkeydown = null; el._edit = false;
+        const f = sp.dataset.scf, raw = sp.textContent.trim().slice(0, 40);
+        const v = f === "handle" ? raw.replace(/^.*\//, "").replace(/^@+/, "").replace(/[^\w.-]/g, "") : raw;
+        if (save && (v || f === "category")) { queueEdit("streamer_card", { ...(c().edit.streamer_card || {}), [f]: v }); T.scDraw?.(); }
+        redraw();
+      };
+      sp.onblur = () => done(true);
+      sp.onkeydown = (k) => { k.stopPropagation(); if (k.key === "Enter") { k.preventDefault(); sp.blur(); } if (k.key === "Escape") { sp.onblur = null; done(false); } };
+    };
   }
   // platform safe zones over the output view (vertical only): the app UI that would cover text, from qa.SAFE_ZONES
   function safeTick(out) {
@@ -2881,7 +3813,7 @@ function Studio(cid) {
     clearTimeout(T.rgTimer); T.rgTimer = null; T.regs = null; // regions come from the fresh clip
     T.clip = { ...c(), ...fresh };
     setTrack(c().edit.track || {});
-    T.ovs = structuredClone(c().edit.overlays || []);
+    T.ovs = structuredClone(c().edit.overlays || []); T.fx = structuredClone(c().edit.effects || []); T.sel = new Set(); loadKeeps();
     if (!T.ovs.some((o) => o.id === T.osel)) T.osel = null;
     loadWords(); setRange(); renderPanel(); buildFx();
   }
@@ -2964,6 +3896,8 @@ function Studio(cid) {
       video.pause(); if (word) seek(word.s);
       return renderCuts();
     }
+    const tb = ev.target.closest("[data-tl]"); // timeline toolbar, inspector and help buttons
+    if (tb) return onTlTool(tb);
     const a = ev.target.closest("[data-act]");
     if (!a) return;
     const k = c();
@@ -2977,6 +3911,7 @@ function Studio(cid) {
         case "safe": { const all = ["", ...Object.keys(SAFE_ZONES)]; T.safe = all[(all.indexOf(T.safe || "") + 1) % all.length]; a.textContent = `Safe zones: ${SAFE_NAMES[T.safe] || "off"}`; if (T.safe && T.mode !== "output") setMode("output"); break; }
         case "layout": {
           await flushRegions();
+          if (setLayKey("layout", a.dataset.v)) { T.rsel = null; T.regs = null; renderLayout(); hint(); break; }
           k.edit = { ...k.edit, layout: a.dataset.v }; T.rsel = null;
           renderLayout(); hint();
           await patch({ edit: { layout: a.dataset.v } });
@@ -3033,7 +3968,9 @@ function Studio(cid) {
           toast(`Layout applied to ${r.updated} more clip${r.updated === 1 ? "" : "s"}.`, "ok"); break;
         }
         case "lay-default": await flushRegions(); await api(`/api/clips/${cid}/layout/default`, { method: "POST" }); toast("New clips will start with this layout.", "ok"); break;
-        case "set": k.edit = { ...k.edit, [a.dataset.k]: a.dataset.v }; $$(`[data-k="${a.dataset.k}"]`, a.parentElement).forEach((b) => b.classList.toggle("on", b === a)); await patch({ edit: { [a.dataset.k]: a.dataset.v } }); break;
+        case "sec-del": { const i = curSec(); if (i != null) { T.sel = new Set([`layout:${i}`]); await deleteSel(); T.regs = null; renderLayout(); hint(); } break; }
+        case "set": if (a.closest("#st-layout") && setLayKey(a.dataset.k, a.dataset.v)) { $$(`[data-k="${a.dataset.k}"]`, a.parentElement).forEach((b) => b.classList.toggle("on", b === a)); break; }
+          k.edit = { ...k.edit, [a.dataset.k]: a.dataset.v }; $$(`[data-k="${a.dataset.k}"]`, a.parentElement).forEach((b) => b.classList.toggle("on", b === a)); await patch({ edit: { [a.dataset.k]: a.dataset.v } }); break;
         case "tmode":
           T.tmode = a.dataset.v;
           if (T.tmode === "target") setMode("source"); else T.pick = null; // picking happens on the source-view overlay
@@ -3113,7 +4050,7 @@ function Studio(cid) {
   function onInput(ev) {
     const t = ev.target;
     if (t.dataset.k && t.type === "range" && t.closest("#st-layout")) { // layout ratios / corner-cam look: live preview, batched save
-      queueEdit(t.dataset.k, +t.value);
+      if (!setLayKey(t.dataset.k, +t.value)) queueEdit(t.dataset.k, +t.value);
       t.nextElementSibling.textContent = (+t.value).toFixed(+t.step < 1 ? 2 : 0) + (t.dataset.k === "pip_border" ? "px" : "");
       return;
     }
@@ -3132,16 +4069,19 @@ function Studio(cid) {
       return saveOverlays();
     }
     if (t.id === "st-aq") { T.aq = t.value; return renderLib(); }
+    if (t.dataset.fx === "amount") { const f = selItems()[0]?.f; if (f && !tlLocked("effects")) { f.amount = +t.value; t.nextElementSibling.textContent = t.value; saveFx(); } return; }
     if (!t.classList.contains("wd")) return;
     T.words[+t.dataset.i].w = t.value;
     t.style.width = `calc(${Math.max(1, t.value.length)}ch + 16px)`;
-    T.custom = true; $("#st-wsrc").textContent = "Edited captions (saved on this clip)";
+    T.custom = true; T.wordsRev = (T.wordsRev || 0) + 1; $("#st-wsrc").textContent = "Edited captions (saved on this clip)";
     clearTimeout(wordTimer);
     wordTimer = setTimeout(saveWords, 700);
   }
   async function onChange(ev) {
     const t = ev.target, k = c();
     if (t.dataset.plan) { t.checked ? T.picked.add(t.dataset.plan) : T.picked.delete(t.dataset.plan); return renderPlan(); }
+    if (t.dataset.sel) return selInput(t);
+    if (t.dataset.key != null) return keyInput(t);
     if (t.dataset.ang) { const ag = angs().find((x) => x.id === t.dataset.ang); if (ag) await saveAngle(ag, t.dataset.f === "name" ? { name: t.value } : { offset_s: +t.value }).catch(fail); return; }
     if (t.id === "st-swreg" || t.id === "st-asrc") {
       const key = t.id === "st-swreg" ? "switch_region" : "audio_source";
@@ -4262,7 +5202,8 @@ $("#side-status").addEventListener("click", async (e) => {
 
 // ---------- boot ----------
 sideStatus().then(route);
-setInterval(sideStatus, 5000);
+setInterval(() => { if (!document.hidden || Date.now() - (S.polled || 0) > 30000) sideStatus(); }, 5000); // hidden window: every 30 s
+document.addEventListener("visibilitychange", () => { if (!document.hidden) sideStatus(); });
 if (localStorage.lastProject) $("#nav-editor").hidden = false;
 if (localStorage.lastClip) $("#nav-studio").hidden = false;
 
@@ -4451,7 +5392,7 @@ function LongForm(lid) {
     L.d = await api(`/api/longform/${lid}`);
     L.srv = structuredClone(L.d);
     L.proj = await api(`/api/projects/${L.d.project_id}`);
-    const tr = await fetch(`/files/${L.d.project_id}/transcript.json`).then((r) => (r.ok ? r.json() : { segments: [] })).catch(() => ({ segments: [] }));
+    const tr = await transcriptOf(L.d.project_id);
     L.words = (tr.segments || []).flatMap((s) => s.words || []).sort((a, b) => a.s - b.s);
     L.starts = L.words.map((w) => w.s);
     reindex();

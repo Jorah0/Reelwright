@@ -1,9 +1,11 @@
 """Background jobs: import → analyze → find clips → render → publish, plus the scheduler, Autopilot,
 streaming-channel sources (Twitch / Kick / YouTube / any yt-dlp URL), virality analysis and style-profile training."""
 import contextlib
+import functools
 import json
 import os
 import queue
+import re
 import shutil
 import threading
 import time
@@ -29,7 +31,11 @@ STORAGE_POLL = 5.0
 
 
 def pdir(pid: str):
-    root = config.projects_dir()  # the chosen storage folder (Settings › Storage), followed live
+    return _pdir(config.projects_dir(), pid)  # the chosen storage folder (Settings › Storage), followed live
+
+
+@functools.lru_cache(maxsize=4096)  # resolve() costs ~0.1 ms on Windows; the Pipeline board asks once per card
+def _pdir(root, pid: str):
     p = (root / pid).resolve()
     if not pid or p.parent != root.resolve():  # ids come from store.new_id; anything else is a traversal attempt
         raise ValueError(f"bad project id: {pid!r}")
@@ -55,6 +61,26 @@ def load_json(pid: str, name: str, default=None):
         return json.loads((pdir(pid) / name).read_text("utf-8"))
     except FileNotFoundError:
         return default
+
+
+_words_memo: dict = {}  # transcript path -> ((mtime_ns, size), its words)
+
+
+def transcript_words(pid: str) -> list[dict]:
+    """Every transcript word, in order. The parse is kept per file version (mtime + size): Autopilot renders N clips of
+    one VOD and each used to re-read a 10-20 MB transcript. Callers get their own word dicts."""
+    f = pdir(pid) / "transcript.json"
+    try:
+        st = f.stat()
+    except FileNotFoundError:
+        return []
+    key, hit = (st.st_mtime_ns, st.st_size), _words_memo.get(f)
+    if not hit or hit[0] != key:
+        words = [w for seg in json.loads(f.read_text("utf-8"))["segments"] for w in seg.get("words", [])]
+        if len(_words_memo) >= 4:  # ponytail: a few projects' words at most; renders of one VOD come in a row
+            _words_memo.clear()
+        _words_memo[f] = hit = (key, words)
+    return [dict(w) for w in hit[1]]
 
 
 def save_json(pid: str, name: str, data) -> None:
@@ -244,7 +270,16 @@ def _enqueue(job: dict):
         QUEUE_OF.get(job["kind"], _heavy).put(job["id"])
 
 
+PROGRESS_EVERY = 0.5  # s: progress callbacks fire per download chunk / Whisper segment; the UI polls every 1.5 s
+_progress_at: dict[str, tuple[float, str | None]] = {}  # job id -> (last write, its message)
+
+
 def _progress(job_id: str, frac: float, msg: str | None = None, project_id: str | None = None, lo=0.0, hi=1.0):
+    """At most one write per PROGRESS_EVERY per job; a new message is always written at once."""
+    now, (last, last_msg) = time.monotonic(), _progress_at.get(job_id, (-1e9, None))
+    if now - last < PROGRESS_EVERY and (not msg or msg == last_msg) and frac < 1:  # a step's end is always written
+        return
+    _progress_at[job_id] = (now, msg or last_msg)
     p = round(lo + (hi - lo) * frac, 4)
     store.update("job", job_id, {"progress": p, **({"message": msg} if msg else {})})
     if project_id:
@@ -296,6 +331,8 @@ def _run_job(jid: str):
         log.error("job", f"{job['kind']} {jid} failed: {e}")
         store.update("job", jid, {"status": "failed", "error": str(e), "message": "Failed", "finished": time.time()})
         FAIL_HOOKS.get(job["kind"], lambda j, e: None)(job, str(e))
+    finally:
+        _progress_at.pop(jid, None)
 
 
 def _wait_for_storage(job: dict) -> dict | None:
@@ -479,32 +516,35 @@ def _analyze(job):
 
     step(0, "Building thumbnails", 0.02, 0.08)
     media.poster(src, min(dur * 0.1, 5), pdir(pid) / "poster.jpg")
-    count = int(min(100, max(10, dur / 4)))
-    try:
-        media.sprite(src, dur, pdir(pid) / "sprite.jpg", count)
-        store.update("project", pid, {"sprite_count": count})
-    except RuntimeError:
-        pass
+    count = int(min(100, max(10, dur / 4)))  # the timeline sprite: drawn from the on-screen pass's frames below
 
     signals = {"waveform": [], "loud": [], "scenes": [], "silences": []}
     if meta["has_audio"]:
-        step(0, "Analyzing audio energy", 0.08, 0.12)
-        signals["waveform"], signals["loud"] = media.audio_signals(src)
+        step(0, "Analyzing audio energy and silences", 0.08, 0.12)  # one decode: silences fill in signals["silences"]
+        signals["waveform"], signals["loud"] = media.audio_signals(src, signals["silences"])
     step(0, "Detecting scene cuts and on-screen action", 0.12, 0.25)
     from . import hud  # screen events the creator taught (hud.py): matched in the same decode, saved before markers merge
     tpl = hud.active()
     try:  # one decode for both; the on-screen part is best-effort and clip finding works without it
         signals["visual"] = vision.analyze(src, meta, lambda f: step(f, None, 0.12, 0.25), faces=faces, scenes=True,
+                                           sprite=(count, pdir(pid) / "sprite.jpg"),
                                            **({"hud": tpl} if tpl else {}))  # no templates: the call is exactly as before
         signals["scenes"] = signals["visual"].pop("scenes")
+        sprite = signals["visual"].pop("sprite", False)
         hud.save_markers(pid, signals["visual"].pop("hud", None), tpl)
     except Exception as e:
         log.event("vision", f"on-screen analysis skipped: {e}")
         signals.pop("visual", None)
         signals["scenes"] = media.scenes(src)
-    if meta["has_audio"]:
-        step(0, "Detecting silences", 0.25, 0.3)
-        signals["silences"] = media.silences(src)
+        sprite = False
+    if not sprite:  # no frames from the on-screen pass: the sprite's own decode
+        try:
+            media.sprite(src, dur, pdir(pid) / "sprite.jpg", count)
+            sprite = True
+        except RuntimeError:
+            pass
+    if sprite:
+        store.update("project", pid, {"sprite_count": count})
     chat = next(pdir(pid).glob("*.live_chat.json"), None)
     if chat:
         signals["chat"] = chat_counts(chat, dur)
@@ -681,7 +721,8 @@ def streamer_guess(proj: dict) -> dict:
     host = (u.hostname or "").removeprefix("www.").removeprefix("m.") if u else ""
     plat = next((p for h, p in STREAM_HOSTS.items() if host == h or host.endswith("." + h)), None)
     if plat and not out:
-        first = next((s for s in (u.path or "").split("/") if s), "")
+        # only the platform's own host names a channel in its path (clips.twitch.tv/<slug> doesn't)
+        first = next((s for s in (u.path or "").split("/") if s), "") if host in STREAM_HOSTS else ""
         h = first[1:] if plat == "youtube" and first.startswith("@") else first if plat != "youtube" else ""
         out = {"platform": plat, **({"handle": h} if h and h.lower() not in _NOT_HANDLES else {})}
     name = str(info.get("channel") or "").strip()[:media.CARD_TEXT_MAX]
@@ -689,10 +730,12 @@ def streamer_guess(proj: dict) -> dict:
         out["name"] = name
         if out.get("platform") in ("twitch", "kick") and not out.get("handle") and name.replace("_", "").isalnum():
             out["handle"] = name.lower()  # their channel names are the handle in another case
-    if not out.get("handle") and out.get("platform") in (None, "youtube"):  # a linked YouTube account (the one card platform
+    if not out.get("handle") and (out.get("platform") == "youtube" or not (out or host)):  # a linked YouTube account (the one card platform
         acc = next(iter(accounts.all_accounts("youtube")), None)              # accounts.py links)
         if acc and (acc.get("handle") or acc.get("name")):
             out = {"platform": "youtube", "handle": str(acc.get("handle") or "").lstrip("@"), "name": out.get("name") or acc.get("name")}
+    if out.get("handle"):  # what clean_edit accepts, so the guess can't sink a card patch
+        out["handle"] = re.sub(r"[^\w.\-]", "", out["handle"])[:media.CARD_TEXT_MAX]
     return {k: v for k, v in out.items() if v}
 
 
@@ -772,7 +815,7 @@ def _render_clip(clip: dict, prog) -> str:
     src = source_file(proj)  # removed to save space / drive away: a clear message, not an ffmpeg error
     s = config.load()
     e = assets.resolve_fonts({**media.DEFAULT_EDIT, **clip["edit"]})  # a missing font falls back instead of failing
-    words = [w for seg in load_json(pid, "transcript.json", {"segments": []})["segments"] for w in seg.get("words", [])]
+    words = transcript_words(pid)
     cap_words = e["words"] or words  # the creator's caption edits; filler cuts still go by what was actually said
     keeps = clip_keeps(clip, e, words)
     size = media.output_size(e["aspect"], proj["meta"]["width"], proj["meta"]["height"])
@@ -947,6 +990,8 @@ def request_upload(clip_id: str | None, spec: dict, longform_id: str | None = No
     if not _current(clip) and (proj := store.get("project", clip["project_id"])) and proj.get("source_removed"):
         source_file(proj)  # it would need a render the source is gone for: refuse before creating the post
     acc = _pick_account(platform, spec.get("account_id"), bool(spec.get("auto")))
+    if _current(clip) and (block := qa_block(clip, platform)):  # the render exists: refuse now, with the fix
+        raise RuntimeError(block)
     publish_at, upload_at = spec.get("publish_at") or None, spec.get("upload_at") or None
     if platform != "youtube" and publish_at:  # TikTok/Instagram have no API scheduling: hold locally, post at that time
         upload_at, publish_at = publish_at, None
@@ -974,6 +1019,14 @@ def request_upload(clip_id: str | None, spec: dict, longform_id: str | None = No
     })
     _release_or_render(clip)
     return store.get("upload", up["id"])
+
+
+def qa_block(item: dict, platform: str) -> str:
+    """Why the platform would refuse this render ("" = it wouldn't): an "error" of its pre-publish check (export["qa"],
+    qa.lint at render time) for that platform or every platform. Warnings never block; the publish dialog shows them."""
+    errs = [i for i in (item.get("export") or {}).get("qa") or [] if i.get("level") == "error" and i.get("platform") in (None, platform)]
+    return "; ".join(f"Not posted to {({'youtube': 'YouTube', 'tiktok': 'TikTok'}).get(platform, platform.title())}: {i['msg']}" + (f". {i['fix']}" if i.get("fix") else "")
+                     for i in errs)
 
 
 # A post publishes a clip, or a long-form edit (upload["longform_id"], clip_id None; see longform.py).
@@ -1106,6 +1159,12 @@ def _upload(job):
     if not _current(clip):  # edited after queueing → re-render first
         store.update("upload", u["id"], {"status": "waiting_render"})
         _release_or_render(clip)
+        return
+    block = qa_block(clip, platform)  # the pre-publish check's errors: posting would only fail there (or post a broken video)
+    if block:
+        store.update("upload", u["id"], {"status": "failed", "error": block})
+        if u.get("auto"):
+            log.event("autopilot", f"skipped {kind} {clip['id']} ({clip.get('title')!r}): {block}")
         return
     acc = _account_of(u)
     refuse = _refusal(u, acc)  # the "okay" is enforced here, not only in the UI
@@ -1565,10 +1624,14 @@ def _scheduler():
 
 
 _last_source_check = 0.0
+_last_prune = 0.0  # finished jobs older than store.JOB_DAYS go at startup and then daily
 
 
 def _scheduler_tick():
-    global _last_source_check
+    global _last_source_check, _last_prune
+    if time.time() - _last_prune > 86400:
+        _last_prune = time.time()
+        store.prune_jobs()
     for u in store.find("upload", status="scheduled"):
         if _due(u):
             _queue_or_schedule(u)

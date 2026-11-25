@@ -383,14 +383,19 @@ def _render_part(d: dict, proj: dict, g: list[tuple[float, float]], e: dict, wor
     headline = media.headline_spec(e, (proj.get("video_type") or {}).get("type"),
                                    (store.get("pref", "headline_theme") or {}).get("theme")) if e.get("headline") else None
     ass, card = None, pipeline.card_of(e)  # the streamer card is drawn in every part, like the headline
-    if (e["captions"] and words) or e["title_text"] or e["sticker_text"] or texts or headline or card:
-        ass = media.build_ass(words, start, end, speed, size, e["title_text"], s["caption_uppercase"], s["caption_color"],
+    # the swear filter as in pipeline._render_clip: source-time spans (media.render maps them through the cuts), captions starred
+    bad = media.bleep_list(s["bleep_words"]) if e["bleep"] in ("beep", "mute") else []
+    bleeps = media.bleep_spans(words, start, end, bad) if bad else None
+    cap_words = media.censor(words, bad) if bad else words
+    if (e["captions"] and cap_words) or e["title_text"] or e["sticker_text"] or texts or headline or card:
+        ass = media.build_ass(cap_words, start, end, speed, size, e["title_text"], s["caption_uppercase"], s["caption_color"],
                               bool(e["captions"]), e["caption_style"], e["caption_pos"], e["sticker_text"], e["sticker_pos"],
-                              jump, media.seam(e), overlays=texts, text_style=e, headline=headline, card=card)
+                              jump, media.seam(e), overlays=texts, text_style=e, headline=headline, anim=e["caption_anim"],
+                              emphasis=bool(e["caption_emphasis"]), card=card)
     # each part seeks main and every angle to the same source start (an angle to start - its offset), as a clip does
     media.render(pipeline.source_file(proj), out, start, end, e, proj["meta"], ass, prog, jump, None, placed,
                  assets.uploaded_font_files(), headline=headline,
-                 angles=multicam.render_angles(pid, proj) if media.used_angles(e) else None, card=card)
+                 angles=multicam.render_angles(pid, proj) if media.used_angles(e) else None, bleeps=bleeps, card=card)
     return out_len
 
 

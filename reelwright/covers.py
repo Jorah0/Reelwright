@@ -6,13 +6,13 @@ Used as the YouTube custom thumbnail and the TikTok cover frame, and shown in th
 import subprocess
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 from . import media
 
 
 def frame_score(img, faces: int = 0, face_area: float = 0.0) -> float:
+    import cv2  # lazy: OpenCV is not needed to start the app
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     sharp = min(float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 600.0, 1.0)
     exposure = 1.0 - min(abs(float(gray.mean()) / 255 - 0.5) / 0.5, 1.0)
@@ -25,6 +25,7 @@ def frame_score(img, faces: int = 0, face_area: float = 0.0) -> float:
 
 def pick(video, samples: int = 24, faces: bool = True) -> float | None:
     """Seconds into the video of the best-looking frame (skipping the first/last 8%: fades and title cards)."""
+    import cv2
     cap = cv2.VideoCapture(str(video))
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30

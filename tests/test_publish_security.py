@@ -495,3 +495,55 @@ def test_routes_are_mounted_before_the_static_ui():
 if sys.platform != "win32":  # the vault must not be needed off Windows
     def test_vault_reports_plain_text_off_windows():
         assert not vault.status()["encrypted"]
+
+
+# ---------------- the QA gate at upload ----------------
+
+TOO_SHORT = {"code": "too_short", "level": "error", "msg": "Instagram Reels must be at least 3 s (this is 2.0 s)",
+             "fix": "Make the clip longer.", "platform": "instagram"}
+LOUD = {"code": "loudness", "level": "warn", "msg": "Loudness -20 LUFS", "fix": "Normalize.", "platform": None}
+
+
+def _qa(c, *issues):
+    return store.update("clip", c["id"], fn=lambda d: d["export"].update(qa=list(issues)))
+
+
+def test_upload_is_blocked_by_a_platform_error_and_never_posted(post, monkeypatch):
+    sent, events = [], []
+    monkeypatch.setattr(platforms, "publish", lambda *a, **k: sent.append(a[0]) or {"url": "https://x"})
+    monkeypatch.setattr(pipeline.log, "event", lambda kind, msg: events.append((kind, msg)))
+    acc, u = post("instagram", auto=True)
+    accounts.update(acc["id"], {"autopilot": True})
+    _qa(pipeline._target(u), TOO_SHORT, LOUD)
+    pipeline._upload({"upload_id": u["id"]})
+    u = store.get("upload", u["id"])
+    assert u["status"] == "failed" and "at least 3 s" in u["error"] and not sent
+    assert any(k == "autopilot" and "at least 3 s" in m for k, m in events)  # Autopilot skips it and says why
+    # the same clip with only a warning, or an error for another platform, still goes out
+    acc, u2 = post("tiktok")
+    _qa(pipeline._target(u2), TOO_SHORT, LOUD)
+    pipeline._upload({"upload_id": u2["id"]})
+    assert store.get("upload", u2["id"])["status"] == "done" and sent == ["tiktok"]
+
+
+def test_a_manual_post_of_a_blocked_render_is_refused_up_front(post):
+    acc, u = post("instagram")
+    c = _qa(pipeline._target(u), TOO_SHORT)
+    with pytest.raises(RuntimeError, match="at least 3 s"):
+        pipeline.request_upload(c["id"], {"platform": "instagram", "account_id": acc["id"], "title": "t"})
+    _qa(c, LOUD)  # warnings never block: the dialog shows them with "Post anyway"
+    assert pipeline.request_upload(c["id"], {"platform": "instagram", "account_id": acc["id"], "title": "t"})["status"]
+
+
+def test_a_qa_error_for_one_chosen_account_refuses_the_whole_publish(post):
+    from fastapi import HTTPException
+
+    from reelwright import server
+    ig, u = post("instagram")
+    tt, _ = post("tiktok")
+    c = _qa(pipeline._target(u), TOO_SHORT)
+    before = len(store.find("upload"))
+    with pytest.raises(HTTPException) as ex:
+        server.upload_clip(c["id"], {"accounts": [tt["id"], ig["id"]], "title": "t"})
+    assert ex.value.status_code == 400 and "at least 3 s" in ex.value.detail
+    assert len(store.find("upload")) == before  # not even the TikTok post went into the queue

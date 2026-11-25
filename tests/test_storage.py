@@ -596,3 +596,32 @@ def test_a_redownload_of_a_different_video_is_refused(monkeypatch):
 def test_a_folder_inside_reelwrights_data_is_refused():
     with pytest.raises(ValueError, match="(?i)reelwright's own data"):
         storage.validate(str(config.DATA / "assets" / "videos"))
+
+
+def test_a_removed_source_takes_its_preview_proxy_along():
+    policy(unfinished=False, uploaded=False, longform=False)
+    p = project(age_days=20, proxy="proxy.mp4")
+    (pipeline.pdir(p["id"]) / "proxy.mp4").write_bytes(b"p" * 300)
+    assert [i["bytes"] for i in storage.preview(now=NOW)["items"]] == [1300]
+    storage.cleanup(now=NOW)
+    assert not has_source(p) and not (pipeline.pdir(p["id"]) / "proxy.mp4").exists()
+    assert not store.get("project", p["id"]).get("proxy")  # the players fall back instead of asking for a gone file
+
+
+def test_chat_logs_are_pruned_by_the_retention_days_and_shown_in_usage(tmp_path, monkeypatch):
+    from reelwright import chatlog
+    monkeypatch.setattr(chatlog, "DIR", tmp_path / "chatlogs")
+    d = tmp_path / "chatlogs" / "nightowl"
+    d.mkdir(parents=True)
+    utc = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d")  # noqa: E731
+    old, new, other = d / f"{utc(NOW - 30 * DAY)}.jsonl", d / f"{utc(NOW - 2 * DAY)}.jsonl", d / "notes.txt"
+    old.write_text("o" * 10)
+    new.write_text("n" * 20)
+    other.write_text("keep")
+    u = storage.usage()
+    assert u["chatlogs"] == 34 and u["total"] == sum(u[k] for k in ("sources", "renders", "other"))  # not moved with projects
+    storage.cleanup(now=NOW)  # space saver off: nothing goes
+    assert old.exists()
+    policy("archive")  # logs are deleted in either mode (no archive folder needed for them)
+    storage.cleanup(now=NOW)
+    assert not old.exists() and new.exists() and other.exists()

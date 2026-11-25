@@ -1,4 +1,6 @@
 """Paths and user settings (a JSON file next to the data)."""
+import contextvars
+import copy
 import json
 import os
 import sys
@@ -139,10 +141,34 @@ def _write(d: dict) -> None:
     tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
     tmp.write_text(json.dumps(d, indent=2), "utf-8")
     os.replace(tmp, SETTINGS_FILE)
+    if memo := _request.get():
+        memo.clear()
+
+
+# One HTTP request reads the settings once (server's middleware opens a scope): /api/settings alone asked ~10 times, the
+# Pipeline board once per card. Keyed on the file's mtime and size, and dropped on every _write, so a save is seen at once.
+_request: contextvars.ContextVar[dict | None] = contextvars.ContextVar("settings_memo", default=None)
 
 
 def load() -> dict:
     """Settings with every secret opened (vault.py); one that can't be opened on this PC reads as its default."""
+    memo = _request.get()
+    return _load() if memo is None else copy.deepcopy(_memo(memo))
+
+
+def _memo(memo: dict) -> dict:
+    """The request's settings (shared: read, never change them)."""
+    try:
+        st = SETTINGS_FILE.stat()
+        key = (str(SETTINGS_FILE), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (str(SETTINGS_FILE), None)
+    if memo.get("key") != key:
+        memo.update(key=key, s=_load())
+    return memo["s"]
+
+
+def _load() -> dict:
     saved = _raw()
     s = {**DEFAULTS, **{k: v for k, v in saved.items() if k in DEFAULTS}}
     for k in SEALED:
@@ -215,7 +241,8 @@ def public() -> dict:
 def projects_dir() -> Path:
     """The folder holding every project folder: the one chosen in Settings › Storage, else DATA/projects. Everything that
     touches project files resolves it through here (pipeline.pdir, the /files route, the LAN receiver, the doctor)."""
-    d = load()["storage_dir"]
+    memo = _request.get()
+    d = (_load() if memo is None else _memo(memo))["storage_dir"]  # every pdir() asks: no copy of all the settings
     return Path(d).resolve() if d else DEFAULT_PROJECTS
 
 

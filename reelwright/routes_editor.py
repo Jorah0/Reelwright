@@ -7,7 +7,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response
 
-from . import nle, pipeline, store
+from . import media, nle, pipeline, store
 
 router = APIRouter()
 
@@ -47,6 +47,16 @@ def _download(tl: dict, fmt: str) -> Response:
     ascii_name = re.sub(r"[^\w .-]+", "_", name, flags=re.ASCII).strip() or "timeline"  # headers are latin-1: UTF-8 rides in filename*
     return Response(body, media_type=f"{ctype}; charset=utf-8",
                     headers={"Content-Disposition": f"attachment; filename=\"{ascii_name}.{ext}\"; filename*=UTF-8''{quote(name)}.{ext}"})
+
+
+@router.get("/api/clips/{cid}/keeps")
+def clip_keep_spans(cid: str):
+    """The source spans the render keeps (silence, filler and text cuts applied): Clip Studio's Cuts track."""
+    clip = store.get("clip", cid)
+    if not clip or clip.get("parts"):
+        raise HTTPException(404, "Clip not found.")
+    e = {**media.DEFAULT_EDIT, **clip["edit"]}
+    return {"keeps": pipeline.clip_keeps(clip, e, nle._words(clip["project_id"])) or [[clip["start"], clip["end"]]]}
 
 
 @router.get("/api/clips/{cid}/nle/{fmt}")

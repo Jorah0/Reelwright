@@ -73,6 +73,7 @@ def main():
         "--collect-all", "faster_whisper", "--collect-all", "ctranslate2", "--collect-all", "webview",
         "--collect-data", "googleapiclient", "--collect-submodules", "uvicorn", "--collect-submodules", "yt_dlp",
         "--collect-submodules", "websockets",  # OBS link: websockets loads its sync client lazily
+        "--collect-submodules", "reelwright",  # every app module, incl. models/ and training/ sub-packages
         "--collect-submodules", "mcp",  # Claude Desktop link (Reelwright.exe --mcp): FastMCP loads parts lazily
         "--collect-submodules", "segno",  # phone remote: the pairing QR (imported only while pairing)
         "--collect-all", "sherpa_onnx",  # audio events: its .pyd + its own onnxruntime.dll in sherpa_onnx/lib (~29 MB)

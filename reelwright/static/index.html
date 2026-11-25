@@ -10,6 +10,8 @@
 <body>
   <aside class="side">
     <a class="brand" href="#/library" title="Reelwright"><img src="logo.svg" alt=""><span>Reel<b>wright</b></span></a>
+    <div class="act" id="act"><button class="act-btn" id="act-btn" aria-haspopup="dialog" aria-expanded="false" aria-controls="act-pop"
+        title="What Reelwright is doing — click for details"><i class="act-dot" aria-hidden="true"></i><span class="act-label" id="act-label" role="status" aria-live="polite">Ready</span><b class="act-n" id="act-n" hidden></b></button></div>
     <nav>
       <div class="grp" title="Step 1: Import"><b>①</b><span>Import</span></div>
       <a href="#/library" data-nav="library" title="Library"><i>▦</i><span>Library</span></a>
@@ -37,9 +39,11 @@
     <div class="side-foot" id="side-status"></div>
   </aside>
   <main id="view"></main>
+  <div class="act-pop" id="act-pop" role="dialog" aria-label="Running and queued tasks" hidden></div>
   <div id="modal-root"></div>
   <div id="toasts"></div>
   <script src="undo.js"></script>
+  <script src="timeline.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
